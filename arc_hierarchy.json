@@ -1,0 +1,41 @@
+{
+  "members": {
+    "306935804054208523": {
+      "rank": "director",
+      "director_id": 306935804054208523,
+      "supervisor_id": null
+    },
+    "1219672223418417203": {
+      "rank": "director",
+      "director_id": 1219672223418417203,
+      "supervisor_id": null
+    },
+    "415519873972699147": {
+      "rank": "director",
+      "director_id": 415519873972699147,
+      "supervisor_id": null
+    },
+    "443221026692923392": {
+      "rank": "officer",
+      "director_id": 415519873972699147,
+      "supervisor_id": null
+    }
+  },
+  "units": {
+    "306935804054208523": {
+      "unit_name": "HMCS",
+      "unit_role_id": 1451977357022855231,
+      "category_id": 1451977358373421066
+    },
+    "415519873972699147": {
+      "unit_name": "AINU run test",
+      "unit_role_id": 1452047195669794856,
+      "category_id": 1452047196949319721
+    },
+    "1219672223418417203": {
+      "unit_name": "ARC Security Defense Fleet",
+      "unit_role_id": 1452328529399382298,
+      "category_id": 1452328530435375284
+    }
+  }
+}

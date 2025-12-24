@@ -1,0 +1,14 @@
+# Secrets
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Discord data (optional — see note below)
+data/*.json
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,117 @@
+---
+
+## 1. Member (Line Pilot)
+
+**Role:** Operational personnel
+**Reports to:** Officer
+**Ratio:** Up to 10 Members per Officer
+
+### Responsibilities
+
+* Participate in assigned operations (PvP, PvE, Industry, Logistics)
+* Follow fleet commands and corporate doctrine
+* Maintain operational readiness
+* Escalate issues or requests through their Officer
+
+---
+
+## 2. Officer (Squad Leader)
+
+**Role:** First-line leadership
+**Reports to:** Commander
+**Ratio:** Up to 10 Officers per Commander
+**Manages:** Up to 100 Members indirectly
+
+### Responsibilities
+
+* Lead and mentor Members
+* Execute small-scale operations
+* Enforce standards and discipline
+* Report readiness and issues upward
+
+---
+
+## 3. Commander (Company Leader)
+
+**Role:** Operational command
+**Reports to:** General
+**Ratio:** Up to 10 Commanders per General
+**Manages:** Up to 1,000 Members indirectly
+
+### Responsibilities
+
+* Coordinate multiple Officers
+* Plan and execute large-scale operations
+* Maintain cohesion across squads
+* Provide operational feedback to Generals
+
+---
+
+## 4. General (Theater Command)
+
+**Role:** Strategic oversight
+**Reports to:** Director
+**Ratio:** Up to 10 Generals per Director
+**Manages:** Up to 10,000 Members indirectly
+
+### Responsibilities
+
+* Oversee multiple operational domains
+* Set strategic objectives and priorities
+* Allocate resources and manpower
+* Advise Directors on strategic risks and opportunities
+
+---
+
+## 5. Director (Executive Command)
+
+**Role:** Corporate executive leadership
+**Reports to:** Corporation Leader / CEO
+**Number:** **Exactly 5 Directors**
+
+### Responsibilities
+
+* Oversee entire operational branches (e.g., PvP, Industry, Logistics, Intelligence, Training)
+* Appoint and remove Generals within their branch
+* Translate corporate strategy into executable objectives
+* Ensure cross-branch coordination
+
+### Purpose
+
+Directors act as **executive commanders**, bridging strategy and execution while preventing micromanagement from the CEO.
+
+---
+
+## 6. Corporation Leader / CEO
+
+**Role:** Supreme authority
+**Reports to:** None
+**Direct Reports:** 5 Directors
+
+### Responsibilities
+
+* Define corporate vision, culture, and long-term goals
+* Appoint and remove Directors
+* Approve wars, alliances, mergers, and major economic decisions
+* Represent the corporation diplomatically at alliance and coalition levels
+
+### Purpose
+
+The CEO ensures **unity of command**, strategic consistency, and long-term corporate survival.
+
+---
+
+## Full Command Hierarchy (Summary)
+
+```
+Corporation Leader / CEO
+└── 5 Directors
+    └── Up to 10 Generals each
+        └── Up to 10 Commanders each
+            └── Up to 10 Officers each
+                └── Up to 10 Members each
+```
+
+---
+
+

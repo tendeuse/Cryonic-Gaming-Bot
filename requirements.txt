@@ -1,0 +1,5 @@
+discord.py>=2.4.0
+aiohttp
+isodate
+google-api-python-client
+google-auth

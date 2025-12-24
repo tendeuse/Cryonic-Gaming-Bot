@@ -1,0 +1,310 @@
+
+---
+
+# EVE Online Corporation Military Structure
+
+**Roles, Promotions, Branches, and Fleet Alignment**
+
+---
+
+## 1. Rank → EVE Role & Permission Mapping
+
+> Principle: **Least privilege required**, authority increases by tier, wallet access only where operationally necessary.
+
+### Member (Line Pilot)
+
+**EVE Permissions**
+
+* Member role only
+* Access to:
+
+  * Corp chat
+  * Designated hangars (read / limited take)
+  * Corp bookmarks (view)
+* No wallet access
+* No structure management
+
+**Purpose**
+
+* Fly, learn, participate
+* Zero administrative risk
+
+---
+
+### Officer (Squad Leader)
+
+**EVE Permissions**
+
+* Junior Accountant *(optional, branch-dependent)*
+* Hangar: take from squad-level hangars
+* Access to:
+
+  * Fleet creation
+  * Corp bookmarks (create, limited)
+* No structure or wallet division control
+
+**Purpose**
+
+* Lead squads
+* Handle daily operations
+* Act as first escalation layer
+
+---
+
+### Commander (Company Leader)
+
+**EVE Permissions**
+
+* Accountant (limited wallet division)
+* Hangar: full access to operational hangars
+* Structure access (use only, no config)
+* Can create corp contracts (branch-relevant)
+* Can assign Officers (out of game policy)
+
+**Purpose**
+
+* Coordinate multiple squads
+* Run medium-to-large ops
+* Control operational assets
+
+---
+
+### General (Theater Command)
+
+**EVE Permissions**
+
+* Senior Accountant (multiple wallet divisions)
+* Hangar: full access
+* Structure management (fueling, anchoring delegated)
+* Contract management
+* POS / Structure defense access
+
+**Purpose**
+
+* Strategic coordination
+* Resource prioritization
+* Campaign oversight
+
+---
+
+### Director (Branch Executive)
+
+**EVE Permissions**
+
+* Director role (restricted to branch scope via policy)
+* Full hangar access (branch-specific)
+* Full wallet access (branch divisions)
+* Structure configuration (branch-owned)
+* Contract creation and acceptance
+* Ability to appoint Generals (policy-based)
+
+**Purpose**
+
+* Execute CEO strategy within a domain
+* Maintain operational readiness
+* Prevent CEO micromanagement
+
+---
+
+### Corporation Leader / CEO
+
+**EVE Permissions**
+
+* CEO role
+* Full access to all corp systems
+* Alliance-level authority
+
+**Purpose**
+
+* Vision, diplomacy, war declarations
+* Final authority and accountability
+
+---
+
+## 2. Promotion Requirements (Merit-Based)
+
+### Member → Officer
+
+**Requirements**
+
+* Minimum activity period (e.g. 30–60 days)
+* Demonstrated reliability and comms discipline
+* Basic doctrine proficiency
+* Recommendation from Commander
+
+---
+
+### Officer → Commander
+
+**Requirements**
+
+* Successfully led squads
+* Proven conflict resolution ability
+* Consistent participation
+* Understanding of corp SOPs
+* Director approval (branch)
+
+---
+
+### Commander → General
+
+**Requirements**
+
+* Multi-squad coordination experience
+* Campaign planning capability
+* Trusted with assets
+* Strategic thinking
+* CEO or Director council approval
+
+---
+
+### General → Director
+
+**Requirements**
+
+* Exceptional leadership record
+* Long-term availability
+* Trusted with corp assets
+* CEO appointment only
+
+---
+
+## 3. Branch-Specific Director Roles
+
+Each Director controls **their own Generals, Commanders, Officers, and Members**.
+
+---
+
+### Director of Industry
+
+**Scope**
+
+* Mining
+* Manufacturing
+* Reactions
+* PI
+
+**Permissions**
+
+* Industry wallet divisions
+* Structure services (refineries, engineering)
+* Blueprint libraries
+
+**Fleet Alignment**
+
+* Mining Foreman
+* Boost fleet commander
+* Industrial operation FC
+
+---
+
+### Director of Transport & Logistics
+
+**Scope**
+
+* Hauling
+* Supply chains
+* Asset movement
+
+**Permissions**
+
+* Transport wallet
+* Contract authority
+* Freighter / JF hangars
+
+**Fleet Alignment**
+
+* Logistics Wing Commander
+* Hauling fleet FC
+* Cyno coordination
+
+---
+
+### Director of Exploration
+
+**Scope**
+
+* Scanning
+* Intel gathering
+* WH mapping
+
+**Permissions**
+
+* Bookmark management
+* Intel channels
+* Scanner tool oversight
+
+**Fleet Alignment**
+
+* Scout Lead
+* Recon Wing Commander
+* Pathfinder coordinator
+
+---
+
+### Director of Onboarding & Training
+
+**Scope**
+
+* Recruitment
+* Newbro training
+* Mentorship
+
+**Permissions**
+
+* Limited hangar grants
+* Training wallet
+* Corp welcome assets
+
+**Fleet Alignment**
+
+* Training FC
+* Rookie fleet commander
+* Doctrine instructor
+
+---
+
+### Director of Combat & Wormhole Defense
+
+**Scope**
+
+* PvP
+* Home defense
+* Wormhole control
+
+**Permissions**
+
+* Combat wallet
+* Defense structures
+* Doctrine hangars
+
+**Fleet Alignment**
+
+* Fleet Commander (FC)
+* Defense FC
+* Rapid response commander
+
+---
+
+## 4. Alignment with Fleet Command Structure
+
+This hierarchy maps **perfectly** to EVE’s fleet system.
+
+| Corp Rank | Fleet Role                        |
+| --------- | --------------------------------- |
+| Member    | Line Pilot                        |
+| Officer   | Squad Commander                   |
+| Commander | Wing Commander                    |
+| General   | Fleet Commander / Strategic FC    |
+| Director  | Theater FC / Doctrine Authority   |
+| CEO       | Strategic Command / War Authority |
+
+### Fleet Example
+
+```
+Fleet Commander (General / Director)
+└── Wing Commanders (Commanders)
+    └── Squad Commanders (Officers)
+        └── Line Pilots (Members)
+```
+
