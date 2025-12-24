@@ -5,6 +5,8 @@ from discord.ext import commands
 from discord import app_commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is not set in environment variables.")
 
 intents = discord.Intents.all()
 
