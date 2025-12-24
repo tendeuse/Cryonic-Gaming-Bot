@@ -16,7 +16,9 @@ VIDEO_FILE = Path("data/video_submissions.json")
 AP_FILE = Path("data/ap_data.json")
 AUDIT_FILE = Path("data/video_audit_log.json")
 
-YOUTUBE_API_KEY = "PUT_YOUR_YOUTUBE_API_KEY_HERE"
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+if not YOUTUBE_API_KEY:
+    raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
 GOOGLE_SERVICE_ACCOUNT_FILE = "service_account.json"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
