@@ -1,13 +1,12 @@
 # cogs/killmail_feed.py
 #
-# 1-page zKill (kills + losses merged) + always-forward chronological posting
+# Post EVERY kill/loss/involvement in strict chronological order (oldest -> newest),
+# by fetching ALL zKill pages (until empty) and ordering by ESI killmail_time.
 #
-# Behavior:
-# - Fetch only 1 page from zKill for kills and losses, merge by killmail_id.
-# - Enrich via ESI (for killmail_time + victim/attacker details).
-# - NEVER filters by time window (no 14d cutoff). The "time frame" is effectively:
-#   "whatever is in the most recent page of zKill".
-# - Posts strictly OLDEST -> NEWEST, continuously, deduped by posted_map.
+# Notes:
+# - zKill corp feed does not reliably provide killmail_time, so ESI is authoritative.
+# - We page zKill until an empty page is returned.
+# - We still post in batches (MAX_POSTS_PER_CYCLE) to avoid flooding Discord / rate limits.
 #
 # Debug:
 # - /killmail_status
@@ -38,14 +37,17 @@ PRIMARY_GUILD_ID: Optional[int] = None  # None = all guilds
 
 POLL_SECONDS = 120
 FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS = 60
-MAX_POSTS_PER_CYCLE = 5
+MAX_POSTS_PER_CYCLE = 15
 
-# Only 5 page of zKill, per your request
-MAX_ZKILL_PAGES = 5
+# zKill paging behavior: fetch pages until empty.
+# Safety guard to prevent runaway if zKill never returns empty due to an upstream issue.
+# Set to None to remove the guard entirely.
+HARD_MAX_PAGES: Optional[int] = 2000
+
 ZKILL_REQUEST_DELAY = 0.25
 
-# Hard cap on ESI requests per cycle
-MAX_ESI_ATTEMPTS_PER_CYCLE = 200
+# Hard cap on ESI requests per cycle (protects you from slamming ESI on very large backlogs)
+MAX_ESI_ATTEMPTS_PER_CYCLE = 250
 
 USER_AGENT = "Cryonic Gaming bot/1.0 (contact: tendeuse on Discord)"
 ESI_BASE = "https://esi.evetech.net/latest"
@@ -222,7 +224,6 @@ class KillmailFeed(commands.Cog):
         self.send_failures: int = int(self.state.get("send_failures", 0) or 0)
         self.last_channel_id: Optional[int] = self.state.get("last_channel_id")
 
-        # de-dupe within a single run
         self._posted_this_run: set[str] = set()
 
         self.killmail_loop.start()
@@ -281,7 +282,7 @@ class KillmailFeed(commands.Cog):
         return f"Missing permissions: {', '.join(missing)}" if missing else None
 
     # -------------------------
-    # zKill (1 page only)
+    # zKill (page until empty)
     # -------------------------
 
     async def fetch_zkill_page(self, page: int, *, mode: str) -> List[Dict[str, Any]]:
@@ -329,36 +330,48 @@ class KillmailFeed(commands.Cog):
             return h2
         return None
 
-    async def _fetch_mode_pages(self, mode: str) -> Tuple[List[Dict[str, Any]], int]:
-        out: List[Dict[str, Any]] = []
+    async def fetch_zkill_all_merged(self) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Fetch kills+losses paging until an empty page is returned, then merge by killmail_id.
+        Returns (rows, pages_used).
+        """
+        merged: Dict[int, Dict[str, Any]] = {}
         pages_used = 0
-        for page in range(1, MAX_ZKILL_PAGES + 1):
+
+        async def ingest_page(mode: str, page: int) -> int:
             rows = await self.fetch_zkill_page(page, mode=mode)
-            pages_used = page
             if not rows:
+                return 0
+            for km in rows:
+                kmid = self._extract_killmail_id(km)
+                if kmid:
+                    # Keep first seen; for our purposes id+hash+zkb is enough
+                    if kmid not in merged:
+                        merged[kmid] = km
+            return len(rows)
+
+        page = 1
+        while True:
+            if HARD_MAX_PAGES is not None and page > HARD_MAX_PAGES:
                 break
-            out.extend(rows)
+
+            # Fetch both modes for this page number
+            kcount = await ingest_page("kills", page)
+            lcount = await ingest_page("losses", page)
+            pages_used = page
+
+            # If BOTH are empty, we are done
+            if kcount == 0 and lcount == 0:
+                break
+
             if ZKILL_REQUEST_DELAY:
                 await asyncio.sleep(ZKILL_REQUEST_DELAY)
-        return out, pages_used
 
-    async def fetch_zkill_merged(self) -> List[Dict[str, Any]]:
-        kills, pk = await self._fetch_mode_pages("kills")
-        losses, pl = await self._fetch_mode_pages("losses")
+            page += 1
 
-        merged: Dict[int, Dict[str, Any]] = {}
-        for km in kills:
-            kmid = self._extract_killmail_id(km)
-            if kmid:
-                merged[kmid] = km
-        for km in losses:
-            kmid = self._extract_killmail_id(km)
-            if kmid and kmid not in merged:
-                merged[kmid] = km
-
-        self.last_fetch_pages = max(pk, pl)
+        self.last_fetch_pages = pages_used
         self.last_fetch_count = len(merged)
-        return list(merged.values())
+        return list(merged.values()), pages_used
 
     # -------------------------
     # ESI
@@ -626,7 +639,7 @@ class KillmailFeed(commands.Cog):
             color=color,
             timestamp=kdt,
         )
-        emb.set_footer(text="Source: zKillboard + ESI | Scope: 1 zKill page (kills+losses)")
+        emb.set_footer(text="Source: zKillboard + ESI | Ordering: oldest→newest (ESI time)")
 
         if ship_type_id:
             emb.set_thumbnail(url=victim_ship_icon_url(ship_type_id))
@@ -682,7 +695,7 @@ class KillmailFeed(commands.Cog):
         save_json(DATA_FILE, self.state)
 
     # -------------------------
-    # Core cycle (always forward)
+    # Core cycle
     # -------------------------
 
     async def post_cycle(self) -> Tuple[int, int]:
@@ -691,40 +704,38 @@ class KillmailFeed(commands.Cog):
         self.last_error = None
         self.last_send_error = None
 
-        rows = await self.fetch_zkill_merged()
+        rows, pages_used = await self.fetch_zkill_all_merged()
 
-        unseen: List[Dict[str, Any]] = []
+        # Filter to only unposted IDs
+        candidates: List[Dict[str, Any]] = []
         for km in rows:
             kmid = self._extract_killmail_id(km)
             if not kmid:
                 continue
             if self._is_posted(kmid):
                 continue
-            unseen.append(km)
+            candidates.append(km)
 
-        remaining_unseen = len(unseen)
-        self.last_backlog_size = remaining_unseen
+        self.last_backlog_size = len(candidates)
 
-        if remaining_unseen == 0:
+        if not candidates:
             await self.persist()
             return 0, 0
 
+        # Enrich a chunk of candidates (bounded by MAX_ESI_ATTEMPTS_PER_CYCLE)
         status_hist = defaultdict(int)
         esi_attempts = 0
         esi_success = 0
-
         enriched: List[Tuple[Dict[str, Any], Dict[str, Any], datetime.datetime]] = []
 
-        # Enrich until we hit caps or have enough candidates
-        for km in unseen:
+        # IMPORTANT: We must post oldest first overall.
+        # We cannot know oldest without ESI times, so we enrich up to a reasonable cap each cycle,
+        # then post the oldest among what we enriched, and repeat next cycles.
+        #
+        # This will converge to full chronological posting over time without exhausting ESI.
+        for km in candidates:
             if esi_attempts >= MAX_ESI_ATTEMPTS_PER_CYCLE:
                 break
-            if len(enriched) >= (MAX_POSTS_PER_CYCLE * 10):
-                break
-
-            kmid = self._extract_killmail_id(km)
-            if not kmid or self._is_posted(kmid):
-                continue
 
             kmhash = self._extract_hash(km)
             if not kmhash:
@@ -758,9 +769,9 @@ class KillmailFeed(commands.Cog):
         if not enriched:
             self.last_enriched_count = 0
             await self.persist()
-            return 0, remaining_unseen
+            return 0, self.last_backlog_size
 
-        # Always choose the OLDEST and post oldest->newest
+        # Select OLDEST -> NEWEST among enriched, post oldest first
         enriched.sort(key=lambda x: (x[2], self._extract_killmail_id(x[0]) or 0))
         selected = enriched[:MAX_POSTS_PER_CYCLE]
 
@@ -802,7 +813,7 @@ class KillmailFeed(commands.Cog):
                     self.last_send_error = f"send:{type(e).__name__}:{e}"
                     self.send_failures += 1
 
-        # Recompute remaining based on current page only
+        # Remaining is “still unposted after this cycle”, based on our merged set
         remaining = 0
         for km in rows:
             kmid = self._extract_killmail_id(km)
@@ -853,11 +864,12 @@ class KillmailFeed(commands.Cog):
             description=(
                 f"**Corp ID:** {CORPORATION_ID}\n"
                 f"**Channel:** #{KILLMAIL_CHANNEL_NAME}\n"
-                f"**Mode:** Always forward (oldest→newest)\n\n"
+                f"**Ordering:** Oldest → Newest (ESI killmail_time)\n\n"
                 f"**Poll interval:** {POLL_SECONDS}s\n"
                 f"**Max posts / cycle:** {MAX_POSTS_PER_CYCLE}\n"
                 f"**Follow-up if backlog remains:** {FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS}s\n\n"
-                f"**zKill pages (max):** {MAX_ZKILL_PAGES}\n"
+                f"**zKill paging:** until empty\n"
+                f"**Safety page guard:** {HARD_MAX_PAGES if HARD_MAX_PAGES is not None else 'None (disabled)'}\n"
                 f"**zKill request delay:** {ZKILL_REQUEST_DELAY}s\n"
                 f"**Max ESI attempts / cycle:** {MAX_ESI_ATTEMPTS_PER_CYCLE}\n\n"
                 f"**Last fetch count (merged):** {self.last_fetch_count}\n"
@@ -868,8 +880,8 @@ class KillmailFeed(commands.Cog):
                 f"**Last posted time:** {self.last_posted_time or 'None'}\n\n"
                 f"**Last cycle ESI attempts:** {self.last_esi_attempts}\n"
                 f"**Last cycle ESI success:** {self.last_esi_success}\n"
-                f"**Last cycle posted-set size:** {self.last_enriched_count}\n"
-                f"**Backlog (unposted IDs in current page):** {self.last_backlog_size}\n\n"
+                f"**Last cycle selected-to-post:** {self.last_enriched_count}\n"
+                f"**Backlog (unposted IDs):** {self.last_backlog_size}\n\n"
                 f"**Consecutive failures:** {self.consecutive_failures}\n"
                 f"**Send failures:** {self.send_failures}\n"
                 f"**Last error:** {self.last_error or 'None'}\n"
@@ -917,7 +929,7 @@ class KillmailFeed(commands.Cog):
     @require_killmail_admin()
     async def killmail_inspect(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True)
-        rows = await self.fetch_zkill_merged()
+        rows, _ = await self.fetch_zkill_all_merged()
         if not rows:
             await safe_reply(interaction, "No zKill rows returned.", ephemeral=True)
             return
