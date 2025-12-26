@@ -1,12 +1,14 @@
 # cogs/killmail_feed.py
 #
-# FIXED: stopped posting after adding losses
-# - Reduce zKill load (lower MAX_ZKILL_PAGES, add request delay)
-# - Fail-open: if kills fetch fails, still process losses (and vice-versa)
-# - Keep strict global chronological order (oldest -> newest; most recent last)
-# - 5 per 120s, one extra pass after 60s if backlog remains, no duplicates
+# Diagnosable + strict-order killmail feed (kills + losses + involvement)
+# - Strict chronological order (oldest -> newest; most recent LAST)
+# - 5 posts per cycle every 120s
+# - If backlog remains, ONE follow-up after 60s
+# - No duplicates (posted_map persisted + in-process)
 # - Hard cutoff: last 14 days
-# - /killmail_reload restricted
+# - Pulls BOTH zKill endpoints: /kills/ and /losses/
+# - Adds robust Discord permission checks + status diagnostics
+# - Optional: post only to ONE guild (PRIMARY_GUILD_ID)
 
 import discord
 from discord.ext import commands, tasks
@@ -25,19 +27,22 @@ from typing import Dict, Any, List, Optional, Tuple
 KILLMAIL_CHANNEL_NAME = "kill-mail"
 CORPORATION_ID = 98743131
 
+# If your bot is in multiple Discord servers, set this to the one server ID you want to post into.
+# Example: PRIMARY_GUILD_ID = 123456789012345678
+# If None: it will attempt to post to ALL guilds (can mask failures).
+PRIMARY_GUILD_ID: Optional[int] = None
+
 POLL_SECONDS = 120
 FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS = 60
 MAX_POSTS_PER_CYCLE = 5
 
 WINDOW_DAYS = 14
 
-# IMPORTANT: lowering this prevents zKill 429 when you fetch kills+losses
+# zKill requests: keep conservative to avoid 429
 MAX_ZKILL_PAGES = 8
-
-# small delay between zKill requests to be polite and reduce 429s
 ZKILL_REQUEST_DELAY = 0.25
 
-# we enrich only the OLDEST unseen candidates per cycle to preserve global order
+# We enrich only the OLDEST unseen candidates per cycle to preserve global order
 CANDIDATE_ENRICH_LIMIT = 60
 
 USER_AGENT = "Cryonic Gaming bot/1.0 (contact: tendeuse on Discord)"
@@ -106,6 +111,9 @@ def get_killmail_hash(km: Dict[str, Any]) -> Optional[str]:
     return None
 
 def parse_killmail_time(value: Any) -> Optional[datetime.datetime]:
+    """
+    Accepts zKill/ESI ISO strings. Returns UTC-naive datetime.
+    """
     if not isinstance(value, str) or not value:
         return None
     v = value.strip()
@@ -205,6 +213,10 @@ async def safe_reply(
         pass
 
 
+# =====================
+# COG
+# =====================
+
 class KillmailFeed(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -212,12 +224,14 @@ class KillmailFeed(commands.Cog):
         self.lock = asyncio.Lock()
 
         self.state = load_json(DATA_FILE)
+
         self.posted_map: Dict[str, str] = self.state.get("posted_map", {}) or {}
 
         self.name_cache: Dict[str, str] = self.state.get("name_cache", {}) or {}
         self.system_cache: Dict[str, Dict[str, Any]] = self.state.get("system_cache", {}) or {}
         self.type_cache: Dict[str, str] = self.state.get("type_cache", {}) or {}
 
+        # Metrics / diagnostics
         self.consecutive_failures: int = int(self.state.get("consecutive_failures", 0) or 0)
         self.last_poll_utc: Optional[str] = self.state.get("last_poll_utc")
         self.last_posted_id: Optional[str] = self.state.get("last_posted_id")
@@ -225,8 +239,14 @@ class KillmailFeed(commands.Cog):
         self.last_backlog_size: int = int(self.state.get("last_backlog_size", 0) or 0)
         self.last_fetch_pages: int = int(self.state.get("last_fetch_pages", 0) or 0)
         self.last_fetch_count: int = int(self.state.get("last_fetch_count", 0) or 0)
-        self.last_error: Optional[str] = self.state.get("last_error")
 
+        self.last_error: Optional[str] = self.state.get("last_error")
+        self.last_send_error: Optional[str] = self.state.get("last_send_error")
+        self.last_send_attempt_utc: Optional[str] = self.state.get("last_send_attempt_utc")
+        self.send_failures: int = int(self.state.get("send_failures", 0) or 0)
+        self.last_channel_id: Optional[int] = self.state.get("last_channel_id")
+
+        # in-process de-dupe
         self._posted_this_run: set[str] = set()
 
         self.killmail_loop.start()
@@ -240,6 +260,12 @@ class KillmailFeed(commands.Cog):
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=35)
             self.session = aiohttp.ClientSession(timeout=timeout)
+
+    def target_guilds(self) -> List[discord.Guild]:
+        if PRIMARY_GUILD_ID is None:
+            return list(self.bot.guilds)
+        g = self.bot.get_guild(PRIMARY_GUILD_ID)
+        return [g] if g else []
 
     async def ensure_channel(self, guild: discord.Guild) -> discord.TextChannel:
         ch = discord.utils.get(guild.text_channels, name=KILLMAIL_CHANNEL_NAME)
@@ -262,8 +288,28 @@ class KillmailFeed(commands.Cog):
             reason="Killmail feed channel"
         )
 
+    def _check_channel_perms(self, guild: discord.Guild, channel: discord.TextChannel) -> Optional[str]:
+        me = guild.me
+        if me is None and self.bot.user is not None:
+            me = guild.get_member(self.bot.user.id)
+        if me is None:
+            return "Could not resolve bot member in guild (guild.me is None)."
+
+        perms = channel.permissions_for(me)
+        missing: List[str] = []
+        if not perms.view_channel:
+            missing.append("view_channel")
+        if not perms.send_messages:
+            missing.append("send_messages")
+        if not perms.embed_links:
+            missing.append("embed_links")
+
+        if missing:
+            return f"Missing permissions in #{channel.name}: {', '.join(missing)}"
+        return None
+
     # -------------------------
-    # zKill
+    # zKill (kills + losses)
     # -------------------------
 
     async def fetch_zkill_page(self, page: int, *, mode: str) -> List[Dict[str, Any]]:
@@ -307,7 +353,6 @@ class KillmailFeed(commands.Cog):
 
             out.extend(rows)
 
-            # stop early once this page contains entries older than cutoff
             times = [parse_killmail_time(km.get("killmail_time")) for km in rows]
             times = [t for t in times if t is not None]
             if times and min(times) < cut:
@@ -325,14 +370,10 @@ class KillmailFeed(commands.Cog):
         return filtered, pages_used
 
     async def fetch_zkill_last_window(self) -> List[Dict[str, Any]]:
-        """
-        Fail-open fetch: if kills fails, still use losses; if losses fails, still use kills.
-        """
         kills: List[Dict[str, Any]] = []
         losses: List[Dict[str, Any]] = []
         pages_k = 0
         pages_l = 0
-
         err_parts: List[str] = []
 
         try:
@@ -345,10 +386,7 @@ class KillmailFeed(commands.Cog):
         except Exception as e:
             err_parts.append(f"losses:{type(e).__name__}:{e}")
 
-        if err_parts:
-            self.last_error = " | ".join(err_parts)
-        else:
-            self.last_error = None
+        self.last_error = " | ".join(err_parts) if err_parts else None
 
         merged: Dict[int, Dict[str, Any]] = {}
         for km in kills:
@@ -361,7 +399,6 @@ class KillmailFeed(commands.Cog):
                 merged[kmid] = km
 
         out = list(merged.values())
-
         self.last_fetch_pages = max(pages_k, pages_l)
         self.last_fetch_count = len(out)
         return out
@@ -651,9 +688,11 @@ class KillmailFeed(commands.Cog):
             timestamp=ktime_dt,
         )
         emb.set_footer(text=f"Source: zKillboard + ESI | Window: last {WINDOW_DAYS}d")
+
         if ship_type_id:
             emb.set_thumbnail(url=victim_ship_icon_url(ship_type_id))
             emb.set_image(url=type_render_url(ship_type_id))
+
         return emb
 
     # -------------------------
@@ -683,7 +722,12 @@ class KillmailFeed(commands.Cog):
         self.state["last_backlog_size"] = self.last_backlog_size
         self.state["last_fetch_pages"] = self.last_fetch_pages
         self.state["last_fetch_count"] = self.last_fetch_count
+
         self.state["last_error"] = self.last_error
+        self.state["last_send_error"] = self.last_send_error
+        self.state["last_send_attempt_utc"] = self.last_send_attempt_utc
+        self.state["send_failures"] = self.send_failures
+        self.state["last_channel_id"] = self.last_channel_id
 
         self.state["name_cache"] = self.name_cache
         self.state["system_cache"] = self.system_cache
@@ -708,7 +752,7 @@ class KillmailFeed(commands.Cog):
         return (t, int(kmid))
 
     # -------------------------
-    # Core posting
+    # Posting cycle
     # -------------------------
 
     async def post_cycle(self) -> Tuple[int, int]:
@@ -730,39 +774,51 @@ class KillmailFeed(commands.Cog):
             unseen.append(km)
 
         unseen.sort(key=self._ztime_key)
+        self.last_backlog_size = len(unseen)
+
         if not unseen:
-            self.last_backlog_size = 0
             await self.persist()
             return 0, 0
 
-        self.last_backlog_size = len(unseen)
-
+        # Take oldest candidates for enrichment
         candidates = unseen[:CANDIDATE_ENRICH_LIMIT]
 
-        enriched_with_time: List[Tuple[datetime.datetime, int, Dict[str, Any], Optional[Dict[str, Any]]]] = []
+        enriched: List[Tuple[datetime.datetime, int, Dict[str, Any], Optional[Dict[str, Any]]]] = []
         for zkm in candidates:
             kmid = get_killmail_id(zkm) or 0
             zkm2, esikm = await self.enrich_one(zkm)
-
             t_best = self.best_time_dt(zkm2, esikm)
             if t_best is None:
+                # We still allow posting; but keep it deterministic at end of queue
                 t_best = datetime.datetime.max
-
             if t_best is not datetime.datetime.max and t_best < cut:
                 self._mark_posted(int(kmid), (esikm or {}).get("killmail_time") or zkm2.get("killmail_time") or utcnow_iso())
                 continue
+            enriched.append((t_best, int(kmid), zkm2, esikm))
 
-            enriched_with_time.append((t_best, int(kmid), zkm2, esikm))
-
-        enriched_with_time.sort(key=lambda x: (x[0], x[1]))
-        to_post = enriched_with_time[:MAX_POSTS_PER_CYCLE]
+        # Strict chronological
+        enriched.sort(key=lambda x: (x[0], x[1]))
+        to_post = enriched[:MAX_POSTS_PER_CYCLE]
 
         posted_count = 0
-        for guild in self.bot.guilds:
+        self.last_send_attempt_utc = utcnow_iso()
+
+        for guild in self.target_guilds():
+            if guild is None:
+                continue
+
             try:
                 channel = await self.ensure_channel(guild)
+                self.last_channel_id = channel.id
             except Exception as e:
-                print(f"[killmail_feed] Failed to ensure channel in guild={guild.id}: {type(e).__name__}: {e}")
+                self.last_send_error = f"ensure_channel:{type(e).__name__}:{e}"
+                self.send_failures += 1
+                continue
+
+            perm_err = self._check_channel_perms(guild, channel)
+            if perm_err:
+                self.last_send_error = perm_err
+                self.send_failures += 1
                 continue
 
             for _, kmid, zkm2, esikm in to_post:
@@ -773,16 +829,22 @@ class KillmailFeed(commands.Cog):
 
                 try:
                     await channel.send(embed=self.build_embed(zkm2, esikm))
-                    posted_count += 1
                     best_time_iso = (esikm or {}).get("killmail_time") or zkm2.get("killmail_time") or utcnow_iso()
                     self._mark_posted(kmid, str(best_time_iso))
                     self.last_posted_id = str(kmid)
                     self.last_posted_time = str(best_time_iso)
+                    posted_count += 1
+
+                    # Clear last_send_error on success
+                    self.last_send_error = None
+
                 except Exception as e:
-                    print(f"[killmail_feed] Send failed guild={guild.id} kmid={kmid}: {type(e).__name__}: {e}")
+                    self.last_send_error = f"send:{type(e).__name__}:{e}"
+                    self.send_failures += 1
 
         await self.persist()
 
+        # Remaining backlog
         remaining = 0
         for km in unseen:
             kmid = get_killmail_id(km)
@@ -810,7 +872,6 @@ class KillmailFeed(commands.Cog):
         except Exception as e:
             self.consecutive_failures += 1
             self.last_error = f"{type(e).__name__}: {e}"
-            print(f"[killmail_feed] Cycle failed: {type(e).__name__}: {e}")
             await self.persist()
             delay = min(300, 20 * self.consecutive_failures)
             await asyncio.sleep(delay)
@@ -827,15 +888,17 @@ class KillmailFeed(commands.Cog):
     # SLASH COMMANDS
     # =====================
 
-    @app_commands.command(name="killmail_status", description="Show killmail feed status.")
+    @app_commands.command(name="killmail_status", description="Show killmail feed status and diagnostics.")
     async def killmail_status(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True)
+
         emb = discord.Embed(
             title="Killmail Feed Status",
             description=(
                 f"**Corp ID:** {CORPORATION_ID}\n"
                 f"**Window:** last {WINDOW_DAYS} days\n"
-                f"**Channel:** #{KILLMAIL_CHANNEL_NAME}\n\n"
+                f"**Channel:** #{KILLMAIL_CHANNEL_NAME}\n"
+                f"**Primary Guild ID:** {PRIMARY_GUILD_ID or 'None (all guilds)'}\n\n"
                 f"**Poll interval:** {POLL_SECONDS}s\n"
                 f"**Max posts / cycle:** {MAX_POSTS_PER_CYCLE}\n"
                 f"**Follow-up if backlog remains:** {FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS}s\n\n"
@@ -845,15 +908,51 @@ class KillmailFeed(commands.Cog):
                 f"**Last fetch count (merged):** {self.last_fetch_count}\n"
                 f"**Last fetch pages used:** {self.last_fetch_pages}\n"
                 f"**Last poll (UTC):** {self.last_poll_utc or 'Never'}\n"
+                f"**Last send attempt (UTC):** {self.last_send_attempt_utc or 'Never'}\n"
+                f"**Last channel ID:** {self.last_channel_id or 'None'}\n"
                 f"**Last posted ID:** {self.last_posted_id or 'None'}\n"
+                f"**Last posted time:** {self.last_posted_time or 'None'}\n"
                 f"**Backlog (unposted in window):** {self.last_backlog_size}\n"
                 f"**Consecutive failures:** {self.consecutive_failures}\n"
+                f"**Send failures:** {self.send_failures}\n"
                 f"**Last error:** {self.last_error or 'None'}\n"
+                f"**Last send error:** {self.last_send_error or 'None'}\n"
             ),
             timestamp=utcnow(),
         )
         emb.set_footer(text="Cryonic Gaming bot — Killmail Feed")
         await safe_reply(interaction, embed=emb, ephemeral=True)
+
+    @app_commands.command(
+        name="killmail_post_test",
+        description="Admin only: post a simple test message in #kill-mail (checks permissions)."
+    )
+    @require_killmail_admin()
+    async def killmail_post_test(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True)
+
+        if not interaction.guild:
+            await safe_reply(interaction, "❌ Must be used in a server.", ephemeral=True)
+            return
+
+        try:
+            ch = await self.ensure_channel(interaction.guild)
+        except Exception as e:
+            await safe_reply(interaction, f"❌ ensure_channel failed: {type(e).__name__}: {e}", ephemeral=True)
+            return
+
+        perm_err = self._check_channel_perms(interaction.guild, ch)
+        if perm_err:
+            await safe_reply(interaction, f"❌ {perm_err}", ephemeral=True)
+            return
+
+        try:
+            await ch.send("Killmail feed test: bot can post here and embed permissions are OK.")
+        except Exception as e:
+            await safe_reply(interaction, f"❌ Send failed: {type(e).__name__}: {e}", ephemeral=True)
+            return
+
+        await safe_reply(interaction, f"✅ Posted test message in #{ch.name}.", ephemeral=True)
 
     @app_commands.command(
         name="killmail_clear_cache",
@@ -908,6 +1007,11 @@ class KillmailFeed(commands.Cog):
 
         try:
             channel = await self.ensure_channel(interaction.guild)
+            perm_err = self._check_channel_perms(interaction.guild, channel)
+            if perm_err:
+                await safe_reply(interaction, f"❌ {perm_err}", ephemeral=True)
+                return
+
             await channel.send(embed=self.build_embed(zkm, esikm))
         except Exception as e:
             await safe_reply(interaction, f"❌ Post failed: {type(e).__name__}: {e}", ephemeral=True)
