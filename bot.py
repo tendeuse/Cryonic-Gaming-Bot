@@ -3,6 +3,7 @@ import traceback
 import discord
 from discord.ext import commands
 from discord import app_commands
+from aiohttp import web  # <-- add
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
@@ -10,19 +11,14 @@ if not TOKEN:
 
 intents = discord.Intents.all()
 
-# Optional: allow non-admin roles to run /sync (leave empty to require Discord Administrator)
 ADMIN_SYNC_ROLE_NAMES = {
     # "ARC Security Corporation Leader",
     # "ARC Security Administration Council",
 }
 
-# IMPORTANT (cleanup):
-# If you previously ran DEV guild-sync, you may have guild-scoped commands lingering and causing duplicates.
-# Add guild IDs here temporarily to delete those guild commands on startup, then remove them once clean.
 CLEANUP_GUILD_IDS = [
     # 781978392894505020,
 ]
-
 
 def is_admin_or_allowed_role(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
@@ -30,6 +26,24 @@ def is_admin_or_allowed_role(member: discord.Member) -> bool:
     if ADMIN_SYNC_ROLE_NAMES:
         return any(r.name in ADMIN_SYNC_ROLE_NAMES for r in getattr(member, "roles", []))
     return False
+
+# =====================
+# REPLIT KEEP-ALIVE (FREE REPL WORKAROUND)
+# =====================
+
+async def _handle_root(request):
+    return web.Response(text="OK")
+
+async def start_keepalive_server(bot: commands.Bot, host: str = "0.0.0.0", port: int = 8080):
+    app = web.Application()
+    app.router.add_get("/", _handle_root)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+
+    print(f"Keepalive web server running on http://{host}:{port}/")
 
 
 class SyncCog(commands.Cog):
@@ -60,7 +74,6 @@ class SyncCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        # If no guild_id provided: GLOBAL sync
         if not guild_id:
             try:
                 synced = await self.bot.tree.sync()
@@ -70,7 +83,6 @@ class SyncCog(commands.Cog):
                 await interaction.followup.send("Global sync failed. Check bot logs.", ephemeral=True)
             return
 
-        # Guild sync by ID (optional utility)
         try:
             gid = int(str(guild_id).strip())
         except ValueError:
@@ -81,7 +93,6 @@ class SyncCog(commands.Cog):
 
         try:
             if clean_guild:
-                # This removes old guild-scoped commands (useful to eliminate duplicates from dev guild sync)
                 self.bot.tree.clear_commands(guild=guild)
 
             synced = await self.bot.tree.sync(guild=guild)
@@ -97,6 +108,13 @@ class SyncCog(commands.Cog):
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
+        # ---- Start keepalive HTTP server for uptime pingers (Replit free) ----
+        try:
+            self.loop.create_task(start_keepalive_server(self))
+        except Exception as e:
+            print(f"Failed to start keepalive server: {e}")
+            traceback.print_exception(type(e), e, e.__traceback__)
+
         # ---- Load cogs from /cogs ----
         cogs_folder = "cogs"
         if not os.path.isdir(cogs_folder):
@@ -125,7 +143,7 @@ class MyBot(commands.Bot):
             print(f"Failed to add SyncCog: {e}")
             traceback.print_exception(type(e), e, e.__traceback__)
 
-        # ---- Resolve correct application_id (prevents 10002 Unknown Application) ----
+        # ---- Resolve correct application_id ----
         try:
             app_info = await self.application_info()
             self._connection.application_id = app_info.id
@@ -135,8 +153,7 @@ class MyBot(commands.Bot):
             traceback.print_exception(type(e), e, e.__traceback__)
             return
 
-        # ---- OPTIONAL CLEANUP: remove old guild commands from previous dev sync ----
-        # Run once with your guild IDs in CLEANUP_GUILD_IDS, then clear the list.
+        # ---- OPTIONAL CLEANUP: remove old guild commands ----
         for gid in CLEANUP_GUILD_IDS:
             try:
                 guild = discord.Object(id=int(gid))
@@ -147,7 +164,7 @@ class MyBot(commands.Bot):
                 print(f"Cleanup failed for guild {gid}: {e}")
                 traceback.print_exception(type(e), e, e.__traceback__)
 
-        # ---- GLOBAL SYNC (production) ----
+        # ---- GLOBAL SYNC ----
         try:
             synced = await self.tree.sync()
             print(f"Synced {len(synced)} global slash commands.")
@@ -158,12 +175,10 @@ class MyBot(commands.Bot):
 
 bot = MyBot(command_prefix="!", intents=intents)
 
-
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("Bot is ready.")
-
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
@@ -186,6 +201,5 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
             )
     except Exception:
         pass
-
 
 bot.run(TOKEN)
