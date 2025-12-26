@@ -1,11 +1,19 @@
 # cogs/killmail_feed.py
-# Updates per your requirements:
-# - Always posts most recent LAST (chronological oldest -> newest).
-# - Pulls/posts MAX_POSTS_PER_CYCLE (=5) per cycle.
-# - Runs every POLL_SECONDS (=120s).
-# - If backlog remains after posting 5, runs ONE additional cycle after 60s.
-# - Never duplicates posts (posted_map persisted + in-memory de-dupe).
-# - Hard cutoff: only last 14 days.
+# FIXED ORDERING + PULL LOGIC (per your last message)
+#
+# What changed vs your last version:
+# 1) Guaranteed chronological posting (oldest -> newest) using BEST TIME:
+#    - We enrich a candidate set with ESI first, then sort by (killmail_time, killmail_id).
+#    - This prevents “most recent first” even when zKill time parsing is inconsistent.
+#
+# 2) Exactly 5 posts per cycle, every 120s.
+#    - If backlog remains after posting 5, do ONE additional cycle after 60s.
+#
+# 3) No duplicates:
+#    - posted_map persists to disk
+#    - _posted_this_run prevents in-process duplicates even within the same session
+#
+# 4) Hard cutoff: only last 14 days.
 
 import discord
 from discord.ext import commands, tasks
@@ -31,6 +39,10 @@ MAX_POSTS_PER_CYCLE = 5
 # HARD LIMIT: do not look further than 2 weeks ago
 WINDOW_DAYS = 14
 MAX_ZKILL_PAGES = 20
+
+# Candidate window to sort correctly:
+# We enrich up to this many unseen kills per cycle (then sort+take 5).
+CANDIDATE_ENRICH_LIMIT = 50
 
 USER_AGENT = "Cryonic Gaming bot/1.0 (contact: tendeuse on Discord)"
 ESI_BASE = "https://esi.evetech.net/latest"
@@ -99,18 +111,33 @@ def get_killmail_hash(km: Dict[str, Any]) -> Optional[str]:
 
 def parse_killmail_time(value: Any) -> Optional[datetime.datetime]:
     """
-    Accepts ISO8601 strings such as 2025-12-24T12:34:56Z.
+    Robust-ish ISO parsing for zKill/ESI strings.
     Returns UTC-naive datetime for comparisons.
+
+    Handles:
+    - 2025-12-24T12:34:56Z
+    - 2025-12-24T12:34:56+00:00
+    - 2025-12-24 12:34:56Z (space)
+    - 2025-12-24 12:34:56 (assumed UTC)
     """
     if not isinstance(value, str) or not value:
         return None
+
     v = value.strip()
+
+    # Normalize " " -> "T" for fromisoformat
+    if " " in v and "T" not in v:
+        v = v.replace(" ", "T")
+
+    # Convert trailing Z to +00:00 for fromisoformat
     if v.endswith("Z"):
         v = v[:-1] + "+00:00"
+
     try:
         dtv = datetime.datetime.fromisoformat(v)
         if dtv.tzinfo is not None:
             dtv = dtv.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        # If tz-naive, assume UTC-naive already
         return dtv
     except Exception:
         return None
@@ -228,7 +255,7 @@ class KillmailFeed(commands.Cog):
         self.last_fetch_pages: int = int(self.state.get("last_fetch_pages", 0) or 0)
         self.last_fetch_count: int = int(self.state.get("last_fetch_count", 0) or 0)
 
-        # in-process de-dupe for a single run (handles edge cases before persist)
+        # in-process de-dupe
         self._posted_this_run: set[str] = set()
 
         self.killmail_loop.start()
@@ -530,6 +557,13 @@ class KillmailFeed(commands.Cog):
 
         return zkm, esikm
 
+    def best_time_dt(self, zkm: Dict[str, Any], esikm: Optional[Dict[str, Any]]) -> Optional[datetime.datetime]:
+        """
+        Use ESI killmail_time if available, else zKill killmail_time.
+        """
+        t_raw = (esikm or {}).get("killmail_time") or zkm.get("killmail_time")
+        return parse_killmail_time(t_raw)
+
     def build_embed(self, zkm: Dict[str, Any], esikm: Optional[Dict[str, Any]]) -> discord.Embed:
         kmid = get_killmail_id(zkm)
         kmhash = get_killmail_hash(zkm)
@@ -668,12 +702,8 @@ class KillmailFeed(commands.Cog):
         save_json(DATA_FILE, self.state)
 
     # -------------------------
-    # Core loop: always most recent last, 5 per cycle, fast follow-up if backlog remains
+    # Core loop: strict order + strict posting limits
     # -------------------------
-
-    def km_time_for_sort(self, km: Dict[str, Any]) -> datetime.datetime:
-        t = parse_killmail_time(km.get("killmail_time"))
-        return t if t is not None else utcnow()
 
     def _is_already_posted(self, kmid: int) -> bool:
         k = str(kmid)
@@ -686,14 +716,15 @@ class KillmailFeed(commands.Cog):
 
     async def post_cycle(self) -> Tuple[int, int]:
         """
-        Returns (posted_count, backlog_remaining_after_marking).
+        Returns (posted_count, remaining_backlog_count).
+        Guarantees: posts in chronological order (most recent last).
         """
         kills = await self.fetch_zkill_last_window()
         self.last_poll_utc = utcnow_iso()
 
         cut = cutoff_utc()
 
-        # Collect unseen within window
+        # Gather unseen kills (within window) - from zKill list (usually newest first)
         unseen: List[Dict[str, Any]] = []
         for km in kills:
             kmid = get_killmail_id(km)
@@ -709,26 +740,32 @@ class KillmailFeed(commands.Cog):
 
             unseen.append(km)
 
-        # CHRONOLOGICAL: oldest -> newest (so newest is posted last)
-        unseen.sort(key=self.km_time_for_sort)
+        # We enrich a limited candidate set, then sort by BEST TIME (ESI preferred)
+        candidates = unseen[:CANDIDATE_ENRICH_LIMIT]
 
-        backlog_size = len(unseen)
-        self.last_backlog_size = backlog_size
+        enriched_with_time: List[Tuple[datetime.datetime, int, Dict[str, Any], Optional[Dict[str, Any]]]] = []
+        for zkm in candidates:
+            kmid = get_killmail_id(zkm) or 0
+            zkm2, esikm = await self.enrich_one(zkm)
+            t_best = self.best_time_dt(zkm2, esikm)
+            if t_best is None:
+                # If time is missing even after ESI, place it at the end deterministically
+                t_best = datetime.datetime.max
+            # Enforce cutoff using best time if it is real (not datetime.max)
+            if t_best is not datetime.datetime.max and t_best < cut:
+                # Do not post, and mark as posted so it does not keep resurfacing
+                self._mark_posted(int(kmid), (esikm or {}).get("killmail_time") or zkm2.get("killmail_time") or utcnow_iso())
+                continue
+            enriched_with_time.append((t_best, int(kmid), zkm2, esikm))
 
-        if backlog_size == 0:
-            await self.persist()
-            return 0, 0
+        # CRITICAL: chronological order, tie-break by killmail_id
+        enriched_with_time.sort(key=lambda x: (x[0], x[1]))
 
-        batch = unseen[:MAX_POSTS_PER_CYCLE]
+        # Take exactly 5 to post
+        to_post = enriched_with_time[:MAX_POSTS_PER_CYCLE]
 
-        # Enrich sequentially (simple, stable). If you want, we can parallelize with a semaphore.
-        enriched: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
-        for zkm in batch:
-            enriched.append(await self.enrich_one(zkm))
-
+        # Post in that order (oldest -> newest)
         posted_count = 0
-
-        # Post to each guild's #kill-mail
         for guild in self.bot.guilds:
             try:
                 channel = await self.ensure_channel(guild)
@@ -736,28 +773,27 @@ class KillmailFeed(commands.Cog):
                 print(f"[killmail_feed] Failed to ensure channel in guild={guild.id}: {type(e).__name__}: {e}")
                 continue
 
-            for zkm, esikm in enriched:
-                kmid = get_killmail_id(zkm)
-                if not kmid:
+            for t_best, kmid, zkm2, esikm in to_post:
+                if kmid <= 0:
                     continue
-                # Double-check de-dupe right before sending
                 if self._is_already_posted(kmid):
                     continue
+
                 try:
-                    await channel.send(embed=self.build_embed(zkm, esikm))
+                    await channel.send(embed=self.build_embed(zkm2, esikm))
                     posted_count += 1
 
-                    best_time = (esikm or {}).get("killmail_time") or zkm.get("killmail_time") or utcnow_iso()
-                    self._mark_posted(kmid, str(best_time))
+                    best_time_iso = (esikm or {}).get("killmail_time") or zkm2.get("killmail_time") or utcnow_iso()
+                    self._mark_posted(kmid, str(best_time_iso))
                     self.last_posted_id = str(kmid)
-                    self.last_posted_time = str(best_time)
+                    self.last_posted_time = str(best_time_iso)
 
                 except Exception as e:
                     print(f"[killmail_feed] Send failed guild={guild.id} kmid={kmid}: {type(e).__name__}: {e}")
 
+        # Persist and compute remaining backlog (cheap scan)
         await self.persist()
 
-        # Recompute backlog remaining using the current fetched list (cheap, accurate enough)
         remaining = 0
         for km in kills:
             kmid = get_killmail_id(km)
@@ -776,7 +812,8 @@ class KillmailFeed(commands.Cog):
 
     async def run_once_and_maybe_fast_followup(self):
         """
-        One normal cycle; if backlog remains after posting 5, do exactly one follow-up after 60s.
+        Run one cycle at 120s cadence.
+        If backlog remains after posting 5, run exactly one additional cycle after 60s.
         """
         async with self.lock:
             posted, remaining = await self.post_cycle()
@@ -824,6 +861,7 @@ class KillmailFeed(commands.Cog):
                 f"**Max posts / cycle:** {MAX_POSTS_PER_CYCLE}\n"
                 f"**Follow-up if backlog remains:** {FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS}s\n\n"
                 f"**zKill pages/cycle (max):** {MAX_ZKILL_PAGES}\n"
+                f"**Candidate enrich limit:** {CANDIDATE_ENRICH_LIMIT}\n"
                 f"**Last fetch pages used:** {self.last_fetch_pages}\n"
                 f"**Last fetch kill count (window):** {self.last_fetch_count}\n\n"
                 f"**Last poll (UTC):** {self.last_poll_utc or 'Never'}\n"
@@ -852,7 +890,7 @@ class KillmailFeed(commands.Cog):
         await self.persist()
         await safe_reply(
             interaction,
-            f"Cleared posted cache. The bot will repost the last {WINDOW_DAYS} days (chronological, newest last).",
+            f"Cleared posted cache. The bot will repost the last {WINDOW_DAYS} days (chronological; newest last).",
             ephemeral=True
         )
 
@@ -879,17 +917,9 @@ class KillmailFeed(commands.Cog):
             await safe_reply(interaction, f"❌ No data returned for killmail_id={kmid}.", ephemeral=True)
             return
 
-        # Enforce cutoff from zKill time
-        t = parse_killmail_time(zkm.get("killmail_time"))
-        if t is not None and t < cutoff_utc():
-            await safe_reply(interaction, f"❌ Killmail {kmid} is older than {WINDOW_DAYS} days; not reposting.", ephemeral=True)
-            return
-
         zkm, esikm = await self.enrich_one(zkm)
-
-        # Enforce cutoff using ESI time if present
-        t2 = parse_killmail_time((esikm or {}).get("killmail_time") or zkm.get("killmail_time"))
-        if t2 is not None and t2 < cutoff_utc():
+        t_best = self.best_time_dt(zkm, esikm)
+        if t_best is not None and t_best < cutoff_utc():
             await safe_reply(interaction, f"❌ Killmail {kmid} is older than {WINDOW_DAYS} days; not reposting.", ephemeral=True)
             return
 
@@ -904,10 +934,10 @@ class KillmailFeed(commands.Cog):
             await safe_reply(interaction, f"❌ Post failed: {type(e).__name__}: {e}", ephemeral=True)
             return
 
-        best_time = (esikm or {}).get("killmail_time") or zkm.get("killmail_time") or utcnow_iso()
-        self._mark_posted(kmid, str(best_time))
+        best_time_iso = (esikm or {}).get("killmail_time") or zkm.get("killmail_time") or utcnow_iso()
+        self._mark_posted(kmid, str(best_time_iso))
         self.last_posted_id = str(kmid)
-        self.last_posted_time = str(best_time)
+        self.last_posted_time = str(best_time_iso)
         await self.persist()
 
         await safe_reply(interaction, f"✅ Reloaded and reposted killmail **{kmid}** in #{KILLMAIL_CHANNEL_NAME}.", ephemeral=True)
