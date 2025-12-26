@@ -37,7 +37,7 @@ PRIMARY_GUILD_ID: Optional[int] = None  # None = all guilds
 
 POLL_SECONDS = 120
 FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS = 60
-MAX_POSTS_PER_CYCLE = 15
+MAX_POSTS_PER_CYCLE = 10
 
 # zKill paging behavior: fetch pages until empty.
 # Safety guard to prevent runaway if zKill never returns empty due to an upstream issue.
