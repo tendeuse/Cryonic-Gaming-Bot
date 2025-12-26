@@ -1,14 +1,17 @@
 # cogs/killmail_feed.py
 #
-# Post ALL kills/losses in chronological order (oldest -> newest),
-# without reposts, using ESI killmail_time as authoritative.
+# Stable chronological killmail feed (oldest -> newest), no reposts, ESI-time authoritative.
 #
-# Key design:
-# - Fetch ALL pages from zKill (kills + losses) until empty.
-# - Maintain a persistent killmail_time cache (km_time_cache) keyed by killmail_id,
-#   so we can sort globally across cycles without re-fetching the same killmails.
-# - Enrich (ESI fetch) in deterministic oldest-first order (by killmail_id ascending).
-# - Post up to MAX_POSTS_PER_CYCLE, oldest->newest by cached ESI time.
+# Key behaviors:
+# - Fetch ALL pages from zKill for kills + losses (until empty).
+# - Deduplicate by killmail_id.
+# - Use ESI killmail_time as the only ordering authority.
+# - Maintain persistent km_time_cache so ordering is consistent across cycles.
+# - Post at most 5 per cycle, strictly oldest -> newest.
+# - Robust ESI rate-limit handling (420/429):
+#     * throttle each ESI request
+#     * honor Retry-After when provided
+#     * abort cycle immediately on 420/429 so backoff can engage
 #
 # Debug:
 # - /killmail_status
@@ -41,14 +44,18 @@ POLL_SECONDS = 120
 FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS = 60
 
 # Per your request
-MAX_POSTS_PER_CYCLE = 15
+MAX_POSTS_PER_CYCLE = 5
 
-# Fetch zKill pages until empty. Guard prevents runaway if upstream misbehaves.
+# zKill: page until empty; guard avoids runaway if upstream misbehaves
 HARD_MAX_PAGES: Optional[int] = 2000
 ZKILL_REQUEST_DELAY = 0.25
 
-# ESI protection. Increase to catch up faster.
-MAX_ESI_ATTEMPTS_PER_CYCLE = 300
+# ESI protection / throughput
+MAX_ESI_ATTEMPTS_PER_CYCLE = 120
+
+# Throttle ESI calls to reduce 429s
+ESI_REQUEST_DELAY = 0.25  # seconds between ESI calls
+ESI_RETRY_FLOOR_SECONDS = 30  # fallback wait when Retry-After missing
 
 USER_AGENT = "Cryonic Gaming bot/1.0 (contact: tendeuse on Discord)"
 ESI_BASE = "https://esi.evetech.net/latest"
@@ -181,9 +188,10 @@ async def safe_reply(
 
 
 class ESIHTTPError(RuntimeError):
-    def __init__(self, status: int, msg: str):
+    def __init__(self, status: int, msg: str, retry_after: Optional[int] = None):
         super().__init__(msg)
         self.status = status
+        self.retry_after = retry_after
 
 
 # =====================
@@ -201,7 +209,7 @@ class KillmailFeed(commands.Cog):
         # posted_map: { "killmail_id": "killmail_time_iso" }
         self.posted_map: Dict[str, str] = self.state.get("posted_map", {}) or {}
 
-        # killmail_time cache: { "killmail_id": "killmail_time_iso" } from ESI
+        # killmail_time cache: { "killmail_id": "killmail_time_iso" }
         self.km_time_cache: Dict[str, str] = self.state.get("km_time_cache", {}) or {}
 
         # caches
@@ -380,13 +388,22 @@ class KillmailFeed(commands.Cog):
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json", "Accept-Encoding": "gzip"}
         async with self.session.get(url, headers=headers) as resp:
             status = resp.status
+            ra = resp.headers.get("Retry-After")
+            retry_after = safe_int(ra) if ra else None
+
             if status in (420, 429):
                 txt = await resp.text()
-                raise ESIHTTPError(status, f"ESI rate/err limit {status}: {txt[:200]}")
+                raise ESIHTTPError(status, f"ESI rate/err limit {status}: {txt[:200]}", retry_after=retry_after)
             if status >= 400:
                 txt = await resp.text()
-                raise ESIHTTPError(status, f"ESI HTTP {status}: {txt[:200]}")
-            return await resp.json(content_type=None)
+                raise ESIHTTPError(status, f"ESI HTTP {status}: {txt[:200]}", retry_after=retry_after)
+
+            data = await resp.json(content_type=None)
+
+        if ESI_REQUEST_DELAY:
+            await asyncio.sleep(ESI_REQUEST_DELAY)
+
+        return data
 
     async def esi_post_json(self, url: str, payload: Any) -> Any:
         await self.ensure_session()
@@ -398,13 +415,22 @@ class KillmailFeed(commands.Cog):
         }
         async with self.session.post(url, headers=headers, json=payload) as resp:
             status = resp.status
+            ra = resp.headers.get("Retry-After")
+            retry_after = safe_int(ra) if ra else None
+
             if status in (420, 429):
                 txt = await resp.text()
-                raise ESIHTTPError(status, f"ESI rate/err limit {status}: {txt[:200]}")
+                raise ESIHTTPError(status, f"ESI rate/err limit {status}: {txt[:200]}", retry_after=retry_after)
             if status >= 400:
                 txt = await resp.text()
-                raise ESIHTTPError(status, f"ESI HTTP {status}: {txt[:200]}")
-            return await resp.json(content_type=None)
+                raise ESIHTTPError(status, f"ESI HTTP {status}: {txt[:200]}", retry_after=retry_after)
+
+            data = await resp.json(content_type=None)
+
+        if ESI_REQUEST_DELAY:
+            await asyncio.sleep(ESI_REQUEST_DELAY)
+
+        return data
 
     async def fetch_esi_killmail(self, km_id: int, km_hash: str) -> Dict[str, Any]:
         data = await self.esi_get_json(f"{ESI_BASE}/killmails/{km_id}/{km_hash}/")
@@ -502,19 +528,30 @@ class KillmailFeed(commands.Cog):
                 return "KILL"
         return "INVOLVEMENT"
 
-    async def enrich_one(self, zkm: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[datetime.datetime]]:
+    async def enrich_time_only(self, zkm: Dict[str, Any]) -> Optional[str]:
+        """
+        Fetch ESI killmail_time and store in km_time_cache. Returns ISO time or None.
+        (This is the minimum we need for correct global ordering.)
+        """
         kmid = self._extract_killmail_id(zkm)
         kmhash = self._extract_hash(zkm)
         if not kmid or not kmhash:
-            return None, None, None
+            return None
 
         esikm = await self.fetch_esi_killmail(kmid, kmhash)
-        ktime = parse_killmail_time(esikm.get("killmail_time"))
-        if not ktime:
-            return None, None, None
+        ktime = esikm.get("killmail_time")
+        if isinstance(ktime, str) and ktime:
+            self.km_time_cache[str(kmid)] = ktime
+            return ktime
+        return None
 
-        # Cache time for global ordering
-        self.km_time_cache[str(kmid)] = str(esikm.get("killmail_time"))
+    async def enrich_supporting_caches(self, esikm: Dict[str, Any]) -> None:
+        """
+        Optional enrichment: names/system/type caches for nicer embeds.
+        This runs only for the items we are actually going to post, keeping ESI load low.
+        """
+        if not isinstance(esikm, dict):
+            return
 
         ids: List[int] = []
         victim = (esikm.get("victim") or {})
@@ -542,8 +579,6 @@ class KillmailFeed(commands.Cog):
         fb_ship_id = safe_int(fb.get("ship_type_id"))
         if fb_ship_id:
             await self.resolve_type_name(fb_ship_id)
-
-        return zkm, esikm, ktime
 
     # -------------------------
     # Embed
@@ -662,7 +697,6 @@ class KillmailFeed(commands.Cog):
         self._posted_this_run.add(k)
 
     def _prune_time_cache(self) -> None:
-        # Keep cache bounded (most recent entries)
         self.km_time_cache = clamp_dict(self.km_time_cache, MAX_KM_TIME_CACHE)
 
     async def persist(self):
@@ -713,7 +747,7 @@ class KillmailFeed(commands.Cog):
 
         rows = await self.fetch_zkill_all_merged()
 
-        # Build unposted set
+        # Unposted list, deterministic by killmail_id
         unposted: List[Tuple[int, Dict[str, Any]]] = []
         for km in rows:
             kmid = self._extract_killmail_id(km)
@@ -723,7 +757,6 @@ class KillmailFeed(commands.Cog):
                 continue
             unposted.append((kmid, km))
 
-        # Deterministic oldest-first scan by killmail_id
         unposted.sort(key=lambda t: t[0])
         self.last_backlog_size = len(unposted)
 
@@ -731,15 +764,15 @@ class KillmailFeed(commands.Cog):
             await self.persist()
             return 0, 0
 
+        # 1) Fill missing times (oldest IDs first), bounded by MAX_ESI_ATTEMPTS_PER_CYCLE
         status_hist = defaultdict(int)
         esi_attempts = 0
         esi_success = 0
 
-        # 1) Fill time cache for oldest unposted IDs first (bounded)
         for kmid, km in unposted:
             if esi_attempts >= MAX_ESI_ATTEMPTS_PER_CYCLE:
                 break
-            # Skip if we already have time cached
+
             cached_iso = self.km_time_cache.get(str(kmid))
             if cached_iso and parse_killmail_time(cached_iso):
                 continue
@@ -751,17 +784,19 @@ class KillmailFeed(commands.Cog):
 
             try:
                 esi_attempts += 1
-                z2, e2, kdt = await self.enrich_one(km)
-                if not z2 or not e2 or not kdt:
+                iso = await self.enrich_time_only(km)
+                if not iso:
                     status_hist["no_time"] += 1
                     continue
                 esi_success += 1
                 status_hist["200"] += 1
+
             except ESIHTTPError as ee:
                 status_hist[str(ee.status)] += 1
                 self.last_esi_error = str(ee)
+                # Abort immediately on rate limit
                 if ee.status in (420, 429):
-                    break
+                    raise
             except Exception as e:
                 status_hist["exception"] += 1
                 self.last_esi_error = f"{type(e).__name__}: {e}"
@@ -770,7 +805,7 @@ class KillmailFeed(commands.Cog):
         self.last_esi_success = esi_success
         self.last_esi_status_hist = dict(status_hist)
 
-        # 2) From all unposted, select those with known times and pick global oldest 15
+        # 2) Select the global oldest items among those with known time
         timed: List[Tuple[datetime.datetime, int, Dict[str, Any]]] = []
         for kmid, km in unposted:
             iso = self.km_time_cache.get(str(kmid))
@@ -784,7 +819,6 @@ class KillmailFeed(commands.Cog):
         self.last_enriched_count = len(selected)
 
         if not selected:
-            # We have unposted IDs but none have time cached yet (or all cache entries invalid)
             await self.persist()
             return 0, self.last_backlog_size
 
@@ -824,6 +858,9 @@ class KillmailFeed(commands.Cog):
                     if not isinstance(esikm, dict) or not esikm.get("killmail_time"):
                         continue
 
+                    # Optional: make embeds nicer without blowing up ESI load
+                    await self.enrich_supporting_caches(esikm)
+
                     await channel.send(embed=self.build_embed(km, esikm))
 
                     iso_time = str(esikm.get("killmail_time") or utcnow_iso())
@@ -834,11 +871,16 @@ class KillmailFeed(commands.Cog):
                     self.last_posted_time = iso_time
                     posted_count += 1
 
+                except ESIHTTPError as ee:
+                    self.last_send_error = f"send:ESIHTTPError:{ee}"
+                    self.last_esi_error = str(ee)
+                    # Abort immediately on rate limit so backoff can engage
+                    if ee.status in (420, 429):
+                        raise
                 except Exception as e:
                     self.last_send_error = f"send:{type(e).__name__}:{e}"
                     self.send_failures += 1
 
-        # Recompute remaining
         remaining = 0
         for kmid, _ in unposted:
             if not self._is_posted(kmid):
@@ -861,10 +903,18 @@ class KillmailFeed(commands.Cog):
                 self.consecutive_failures = 0
                 self.last_error = None
                 await self.persist()
+
             except Exception as e:
                 self.consecutive_failures += 1
                 self.last_error = f"{type(e).__name__}: {e}"
                 await self.persist()
+
+                # ESI 420/429 backoff with Retry-After if available
+                if isinstance(e, ESIHTTPError) and e.status in (420, 429):
+                    wait_s = e.retry_after if (e.retry_after and e.retry_after > 0) else ESI_RETRY_FLOOR_SECONDS
+                    await asyncio.sleep(min(600, wait_s))
+                    return
+
                 await asyncio.sleep(min(300, 20 * self.consecutive_failures))
 
     @tasks.loop(seconds=POLL_SECONDS)
@@ -888,12 +938,15 @@ class KillmailFeed(commands.Cog):
             description=(
                 f"**Corp ID:** {CORPORATION_ID}\n"
                 f"**Channel:** #{KILLMAIL_CHANNEL_NAME}\n"
-                f"**Ordering:** Oldest → Newest (ESI killmail_time)\n"
-                f"**Max posts / cycle:** {MAX_POSTS_PER_CYCLE}\n\n"
+                f"**Ordering:** Oldest → Newest (ESI killmail_time)\n\n"
+                f"**Poll interval:** {POLL_SECONDS}s\n"
+                f"**Max posts / cycle:** {MAX_POSTS_PER_CYCLE}\n"
+                f"**Follow-up if backlog remains:** {FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS}s\n\n"
                 f"**zKill paging:** until empty\n"
                 f"**Safety page guard:** {HARD_MAX_PAGES if HARD_MAX_PAGES is not None else 'None (disabled)'}\n"
-                f"**zKill request delay:** {ZKILL_REQUEST_DELAY}s\n"
-                f"**Max ESI attempts / cycle:** {MAX_ESI_ATTEMPTS_PER_CYCLE}\n\n"
+                f"**zKill request delay:** {ZKILL_REQUEST_DELAY}s\n\n"
+                f"**Max ESI attempts / cycle:** {MAX_ESI_ATTEMPTS_PER_CYCLE}\n"
+                f"**ESI request delay:** {ESI_REQUEST_DELAY}s\n\n"
                 f"**Last fetch count (merged):** {self.last_fetch_count}\n"
                 f"**Last fetch pages used:** {self.last_fetch_pages}\n\n"
                 f"**Last poll (UTC):** {self.last_poll_utc or 'Never'}\n"
@@ -1003,6 +1056,7 @@ class KillmailFeed(commands.Cog):
             await safe_reply(interaction, f"❌ {perm_err}", ephemeral=True)
             return
 
+        await self.enrich_supporting_caches(esikm)
         await ch.send(embed=self.build_embed(zkm, esikm))
 
         iso_time = str(esikm.get("killmail_time") or utcnow_iso())
