@@ -1,21 +1,17 @@
 # cogs/killmail_feed.py
 #
-# FIX: Losses / Involved not posting
-# Root cause: zKillboard has separate feeds:
-#   - /api/kills/corporationID/<id>/...   (kills where corp appears on the killmail as attacker side)
-#   - /api/losses/corporationID/<id>/...  (losses where corp is the victim side)
-#
-# Your previous version only pulled /kills/, so you would miss most (or all) LOSSES.
-# This version pulls BOTH /kills/ and /losses/, merges + de-dupes by killmail_id,
-# then classifies each mail as LOSS/KILL/INVOLVEMENT based on ESI data.
-#
-# Requirements retained:
-# - Post oldest -> newest (most recent LAST).
-# - 5 posts per cycle, every 120s.
-# - If backlog remains, one follow-up after 60s.
-# - No duplicates (posted_map persisted + in-process de-dupe).
-# - Hard cutoff: last 14 days.
-# - Keep USER_AGENT and slash-command style as you already had.
+# FULL COPY/PASTE VERSION (kills + losses + involvement) with strict ordering:
+# - Pulls BOTH zKill endpoints:
+#     /api/kills/corporationID/<id>/page/<n>/
+#     /api/losses/corporationID/<id>/page/<n>/
+# - Merges + de-dupes by killmail_id
+# - STRICT chronological posting (oldest -> newest; most recent LAST) across kills AND losses
+# - Posts 5 per cycle every 120s
+# - If backlog remains after posting 5, does ONE follow-up cycle after 60s
+# - No duplicates (posted_map persisted + in-process de-dupe)
+# - Hard cutoff: only last 14 days
+# - Keeps your User-Agent and slash-command style; adds /killmail_reload restricted to:
+#     "ARC Security Administration Council", "ARC Security Corporation Leader", "Lycan King"
 
 import discord
 from discord.ext import commands, tasks
@@ -38,10 +34,12 @@ POLL_SECONDS = 120
 FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS = 60
 MAX_POSTS_PER_CYCLE = 5
 
+# HARD LIMIT: do not look further than 2 weeks ago
 WINDOW_DAYS = 14
 MAX_ZKILL_PAGES = 20
 
-# We enrich a candidate set per cycle so ordering uses ESI time (consistent)
+# We enrich a candidate set per cycle so ordering uses ESI time (consistent).
+# IMPORTANT: candidates are chosen from the OLDEST unseen first (strict global ordering).
 CANDIDATE_ENRICH_LIMIT = 50
 
 USER_AGENT = "Cryonic Gaming bot/1.0 (contact: tendeuse on Discord)"
@@ -119,9 +117,11 @@ def parse_killmail_time(value: Any) -> Optional[datetime.datetime]:
 
     v = value.strip()
 
+    # Normalize " " -> "T"
     if " " in v and "T" not in v:
         v = v.replace(" ", "T")
 
+    # Convert trailing Z -> +00:00
     if v.endswith("Z"):
         v = v[:-1] + "+00:00"
 
@@ -339,7 +339,6 @@ class KillmailFeed(commands.Cog):
 
             out.extend(rows)
 
-            # Stop early if the OLDEST item in this page is older than cutoff
             times = []
             for km in rows:
                 t = parse_killmail_time(km.get("killmail_time"))
@@ -350,7 +349,6 @@ class KillmailFeed(commands.Cog):
                 if oldest < cut:
                     break
 
-        # Filter to window when killmail_time is present; keep time-missing rows (rare)
         filtered: List[Dict[str, Any]] = []
         for km in out:
             t = parse_killmail_time(km.get("killmail_time"))
@@ -379,7 +377,6 @@ class KillmailFeed(commands.Cog):
 
         out = list(merged.values())
 
-        # metrics
         self.last_fetch_pages = max(pages_k, pages_l)
         self.last_fetch_count = len(out)
 
@@ -733,7 +730,7 @@ class KillmailFeed(commands.Cog):
         save_json(DATA_FILE, self.state)
 
     # -------------------------
-    # Core loop: strict order + strict posting limits
+    # Core loop: strict global order + strict posting limits
     # -------------------------
 
     def _is_already_posted(self, kmid: int) -> bool:
@@ -745,17 +742,27 @@ class KillmailFeed(commands.Cog):
         self.posted_map[k] = iso_time
         self._posted_this_run.add(k)
 
+    def _ztime_key(self, km: Dict[str, Any]) -> Tuple[datetime.datetime, int]:
+        """
+        Cheap pre-sort key using zKill time to ensure we take OLDEST unseen first.
+        """
+        t = parse_killmail_time(km.get("killmail_time"))
+        if t is None:
+            t = datetime.datetime.max
+        kmid = get_killmail_id(km) or 0
+        return (t, int(kmid))
+
     async def post_cycle(self) -> Tuple[int, int]:
         """
         Returns (posted_count, remaining_backlog_count).
-        Posts in chronological order (oldest -> newest), most recent LAST.
+        Posts in strict chronological order (oldest -> newest), most recent LAST,
+        across BOTH kills and losses.
         """
         items = await self.fetch_zkill_last_window()
         self.last_poll_utc = utcnow_iso()
 
         cut = cutoff_utc()
 
-        # Gather unseen within window (merged kills+losses)
         unseen: List[Dict[str, Any]] = []
         for km in items:
             kmid = get_killmail_id(km)
@@ -771,7 +778,15 @@ class KillmailFeed(commands.Cog):
 
             unseen.append(km)
 
-        # Enrich a limited candidate set to sort by ESI time
+        # CRITICAL: pre-sort ALL unseen by zKill time before slicing candidates
+        unseen.sort(key=self._ztime_key)
+
+        self.last_backlog_size = len(unseen)
+
+        if not unseen:
+            await self.persist()
+            return 0, 0
+
         candidates = unseen[:CANDIDATE_ENRICH_LIMIT]
 
         enriched_with_time: List[Tuple[datetime.datetime, int, Dict[str, Any], Optional[Dict[str, Any]]]] = []
@@ -783,16 +798,17 @@ class KillmailFeed(commands.Cog):
             if t_best is None:
                 t_best = datetime.datetime.max  # deterministic fallback
 
+            # Enforce cutoff based on best time if known
             if t_best is not datetime.datetime.max and t_best < cut:
                 self._mark_posted(int(kmid), (esikm or {}).get("killmail_time") or zkm2.get("killmail_time") or utcnow_iso())
                 continue
 
             enriched_with_time.append((t_best, int(kmid), zkm2, esikm))
 
-        # Sort oldest -> newest; tie-break by killmail_id
+        # Final strict ordering: oldest -> newest by BEST time; tie-break by killmail_id
         enriched_with_time.sort(key=lambda x: (x[0], x[1]))
 
-        # Take exactly 5
+        # Exactly 5 to post
         to_post = enriched_with_time[:MAX_POSTS_PER_CYCLE]
 
         posted_count = 0
@@ -823,14 +839,11 @@ class KillmailFeed(commands.Cog):
 
         await self.persist()
 
-        # Remaining backlog count (based on merged list)
+        # Remaining backlog (based on unseen, minus what we posted/marked)
         remaining = 0
-        for km in items:
+        for km in unseen:
             kmid = get_killmail_id(km)
             if not kmid:
-                continue
-            t = parse_killmail_time(km.get("killmail_time"))
-            if t is not None and t < cut:
                 continue
             if self._is_already_posted(kmid):
                 continue
@@ -842,7 +855,7 @@ class KillmailFeed(commands.Cog):
 
     async def run_once_and_maybe_fast_followup(self):
         async with self.lock:
-            posted, remaining = await self.post_cycle()
+            _, remaining = await self.post_cycle()
 
         if remaining > 0:
             await asyncio.sleep(FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS)
