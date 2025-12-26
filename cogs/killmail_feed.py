@@ -21,23 +21,20 @@ POLL_SECONDS = 120
 FAST_POLL_SECONDS_WHEN_LIMIT_REACHED = 60
 MAX_POSTS_PER_CYCLE = 5
 
-# On first bootstrap, post the newest N killmails (true newest by ESI killmail_time)
-BOOTSTRAP_POST_LAST = 2
+# "Last 2 months" (approx). Change if you want exact 2 calendar months.
+WINDOW_DAYS = 60
 
-# How many "recent candidates" we evaluate during bootstrap (by killmail_id desc)
-# We resolve ESI killmail_time for these and pick newest N.
-BOOTSTRAP_CANDIDATE_WINDOW = 50
+# How many zKill pages to pull per cycle to reconstruct the last ~2 months
+# Increase if your corp is very active; decrease if you hit rate limits.
+MAX_ZKILL_PAGES = 20
 
-ZKILL_URL = f"https://zkillboard.com/api/kills/corporationID/{CORPORATION_ID}/"
 USER_AGENT = "Cryonic Gaming bot/1.0 (contact: tendeuse on Discord)"
-
 ESI_BASE = "https://esi.evetech.net/latest"
 IMAGE_BASE = "https://images.evetech.net"
 
 DATA_FILE = Path("data/killmail_feed.json")
 DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-MAX_STORED_IDS = 3000
 MAX_NAME_CACHE = 10000
 MAX_SYSTEM_CACHE = 5000
 MAX_TYPE_CACHE = 10000
@@ -54,6 +51,9 @@ def utcnow() -> datetime.datetime:
 
 def utcnow_iso() -> str:
     return utcnow().isoformat()
+
+def cutoff_utc() -> datetime.datetime:
+    return utcnow() - datetime.timedelta(days=WINDOW_DAYS)
 
 def load_json(path: Path) -> Dict[str, Any]:
     if not path.exists():
@@ -72,6 +72,12 @@ def safe_int(x) -> Optional[int]:
     except Exception:
         return None
 
+def clamp_dict(d: Dict[str, Any], max_items: int) -> Dict[str, Any]:
+    if len(d) <= max_items:
+        return d
+    keys = list(d.keys())[-max_items:]
+    return {k: d[k] for k in keys}
+
 def get_killmail_id(km: Dict[str, Any]) -> Optional[int]:
     return safe_int(km.get("killmail_id"))
 
@@ -85,28 +91,40 @@ def get_killmail_hash(km: Dict[str, Any]) -> Optional[str]:
         return h2
     return None
 
+def parse_killmail_time(value: Any) -> Optional[datetime.datetime]:
+    """
+    Accepts ISO8601 strings such as 2025-12-24T12:34:56Z.
+    Returns UTC-naive datetime for comparisons.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(v)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
 def zkill_link(km_id: int) -> str:
     return f"https://zkillboard.com/kill/{km_id}/"
 
 def esi_killmail_link(km_id: int, km_hash: str) -> str:
     return f"{ESI_BASE}/killmails/{km_id}/{km_hash}/"
 
+def victim_ship_icon_url(type_id: int) -> str:
+    return f"{IMAGE_BASE}/types/{type_id}/icon?size=64"
+
+def type_render_url(type_id: int) -> str:
+    return f"{IMAGE_BASE}/types/{type_id}/render?size=512"
+
 def format_sec_status(sec: Optional[float]) -> str:
     if sec is None:
         return "Unknown"
     return f"{sec:.1f}"
-
-def clamp_dict(d: Dict[str, Any], max_items: int) -> Dict[str, Any]:
-    if len(d) <= max_items:
-        return d
-    keys = list(d.keys())[-max_items:]
-    return {k: d[k] for k in keys}
-
-def clamp_set_as_list(s: set, max_items: int) -> set:
-    if len(s) <= max_items:
-        return s
-    items = list(s)[-max_items:]
-    return set(items)
 
 def isk_value(zkm: Dict[str, Any]) -> Optional[float]:
     zkb = zkm.get("zkb") or {}
@@ -115,12 +133,6 @@ def isk_value(zkm: Dict[str, Any]) -> Optional[float]:
         return float(val) if val is not None else None
     except Exception:
         return None
-
-def victim_ship_icon_url(type_id: int) -> str:
-    return f"{IMAGE_BASE}/types/{type_id}/icon?size=64"
-
-def type_render_url(type_id: int) -> str:
-    return f"{IMAGE_BASE}/types/{type_id}/render?size=512"
 
 def member_has_role(member: discord.Member, role_name: str) -> bool:
     return any(r.name == role_name for r in getattr(member, "roles", []))
@@ -160,24 +172,6 @@ async def safe_reply(
     except Exception:
         pass
 
-def parse_killmail_time(value: Any) -> Optional[datetime.datetime]:
-    """
-    Accepts ISO8601 strings such as 2025-12-24T12:34:56Z.
-    Returns UTC-naive datetime for comparisons.
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    v = value.strip()
-    if v.endswith("Z"):
-        v = v[:-1] + "+00:00"
-    try:
-        dt = datetime.datetime.fromisoformat(v)
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-        return dt
-    except Exception:
-        return None
-
 
 # =====================
 # COG
@@ -191,10 +185,10 @@ class KillmailFeed(commands.Cog):
 
         self.state = load_json(DATA_FILE)
 
-        self.posted_ids = set(str(x) for x in self.state.get("posted_ids", []))
-        self.bootstrapped: bool = bool(self.state.get("bootstrapped", False))
+        # posted_map: { "killmail_id": "iso_time" }
+        self.posted_map: Dict[str, str] = self.state.get("posted_map", {}) or {}
 
-        # Caches
+        # caches
         self.name_cache: Dict[str, str] = self.state.get("name_cache", {}) or {}
         self.system_cache: Dict[str, Dict[str, Any]] = self.state.get("system_cache", {}) or {}
         self.type_cache: Dict[str, str] = self.state.get("type_cache", {}) or {}
@@ -205,7 +199,8 @@ class KillmailFeed(commands.Cog):
         self.last_posted_id: Optional[str] = self.state.get("last_posted_id")
         self.last_posted_time: Optional[str] = self.state.get("last_posted_time")
         self.last_backlog_size: int = int(self.state.get("last_backlog_size", 0) or 0)
-        self.last_bootstrap_seeded: int = int(self.state.get("last_bootstrap_seeded", 0) or 0)
+        self.last_fetch_pages: int = int(self.state.get("last_fetch_pages", 0) or 0)
+        self.last_fetch_count: int = int(self.state.get("last_fetch_count", 0) or 0)
 
         self.killmail_loop.start()
 
@@ -216,7 +211,7 @@ class KillmailFeed(commands.Cog):
 
     async def ensure_session(self):
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=25)
+            timeout = aiohttp.ClientTimeout(total=35)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
     async def ensure_channel(self, guild: discord.Guild) -> discord.TextChannel:
@@ -241,13 +236,17 @@ class KillmailFeed(commands.Cog):
         )
 
     # -------------------------
-    # HTTP: zKill
+    # HTTP: zKill (paged)
     # -------------------------
 
-    async def fetch_zkill(self) -> List[Dict[str, Any]]:
+    async def fetch_zkill_page(self, page: int) -> List[Dict[str, Any]]:
+        """
+        zKill corporation feed supports paging using /page/<n>/.
+        """
         await self.ensure_session()
+        url = f"https://zkillboard.com/api/kills/corporationID/{CORPORATION_ID}/page/{page}/"
         headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"}
-        async with self.session.get(ZKILL_URL, headers=headers) as resp:
+        async with self.session.get(url, headers=headers) as resp:
             if resp.status == 429:
                 raise RuntimeError("Rate limited by zKill (429).")
             if resp.status >= 400:
@@ -257,6 +256,9 @@ class KillmailFeed(commands.Cog):
             return data if isinstance(data, list) else []
 
     async def fetch_zkill_one(self, killmail_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Used only for manual reload if needed.
+        """
         await self.ensure_session()
         url = f"https://zkillboard.com/api/killID/{killmail_id}/"
         headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"}
@@ -267,10 +269,48 @@ class KillmailFeed(commands.Cog):
                 txt = await resp.text()
                 raise RuntimeError(f"zKill HTTP {resp.status}: {txt[:200]}")
             data = await resp.json(content_type=None)
-            if isinstance(data, list) and data:
-                row = data[0]
-                return row if isinstance(row, dict) else None
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                return data[0]
             return None
+
+    async def fetch_zkill_last_window(self) -> List[Dict[str, Any]]:
+        """
+        Fetch pages until we reach the cutoff (WINDOW_DAYS) or MAX_ZKILL_PAGES.
+        Returns only killmails with killmail_time >= cutoff if available.
+        """
+        cut = cutoff_utc()
+        out: List[Dict[str, Any]] = []
+        pages_used = 0
+
+        for page in range(1, MAX_ZKILL_PAGES + 1):
+            rows = await self.fetch_zkill_page(page)
+            pages_used = page
+            if not rows:
+                break
+
+            out.extend(rows)
+
+            # Stop early if the OLDEST item in this page is older than cutoff
+            times = []
+            for km in rows:
+                t = parse_killmail_time(km.get("killmail_time"))
+                if t is not None:
+                    times.append(t)
+            if times:
+                oldest = min(times)
+                if oldest < cut:
+                    break
+
+        # Filter to window when killmail_time is present; keep time-missing rows (rare)
+        filtered: List[Dict[str, Any]] = []
+        for km in out:
+            t = parse_killmail_time(km.get("killmail_time"))
+            if t is None or t >= cut:
+                filtered.append(km)
+
+        self.last_fetch_pages = pages_used
+        self.last_fetch_count = len(filtered)
+        return filtered
 
     # -------------------------
     # HTTP: ESI
@@ -307,10 +347,6 @@ class KillmailFeed(commands.Cog):
         url = f"{ESI_BASE}/killmails/{km_id}/{km_hash}/"
         data = await self.esi_get_json(url)
         return data if isinstance(data, dict) else {}
-
-    # -------------------------
-    # Name/system/type enrichment (unchanged)
-    # -------------------------
 
     async def resolve_universe_names(self, ids: List[int]) -> None:
         seen: set[int] = set()
@@ -395,9 +431,12 @@ class KillmailFeed(commands.Cog):
     # Enrichment helpers
     # -------------------------
 
-    def infer_kill_or_loss(self, esikm: Optional[Dict[str, Any]]) -> Optional[str]:
+    def infer_kill_or_loss(self, esikm: Optional[Dict[str, Any]]) -> str:
+        """
+        No filtering, only labeling.
+        """
         if not isinstance(esikm, dict):
-            return None
+            return "UNKNOWN"
 
         victim = esikm.get("victim") or {}
         v_corp = safe_int(victim.get("corporation_id"))
@@ -408,6 +447,7 @@ class KillmailFeed(commands.Cog):
             a_corp = safe_int(a.get("corporation_id"))
             if a_corp == CORPORATION_ID:
                 return "KILL"
+
         return "INVOLVED"
 
     def pick_final_blow_attacker(self, esikm: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -452,15 +492,15 @@ class KillmailFeed(commands.Cog):
                     if v:
                         ids_to_resolve.append(v)
 
-                # Deduplicate
+                # Dedupe
                 seen2: set[int] = set()
-                ids_to_resolve_uniq: List[int] = []
+                uniq: List[int] = []
                 for _id in ids_to_resolve:
-                    if isinstance(_id, int) and _id > 0 and _id not in seen2:
+                    if _id not in seen2:
                         seen2.add(_id)
-                        ids_to_resolve_uniq.append(_id)
+                        uniq.append(_id)
 
-                await self.resolve_universe_names(ids_to_resolve_uniq)
+                await self.resolve_universe_names(uniq)
 
                 system_id = safe_int(esikm.get("solar_system_id"))
                 if system_id:
@@ -478,52 +518,6 @@ class KillmailFeed(commands.Cog):
                 esikm = None
 
         return zkm, esikm
-
-    # -------------------------
-    # Ordering helpers (THE IMPORTANT BIT)
-    # -------------------------
-
-    def zkill_time_or_none(self, km: Dict[str, Any]) -> Optional[datetime.datetime]:
-        return parse_killmail_time(km.get("killmail_time"))
-
-    def unseen_sort_key(self, km: Dict[str, Any]) -> Tuple[int, int]:
-        """
-        Sort newest-first:
-          - primary: killmail_time if present (converted to epoch-ish int)
-          - fallback: killmail_id
-        We return ints for easy reverse sorting.
-        """
-        kmid = get_killmail_id(km) or 0
-        t = self.zkill_time_or_none(km)
-        if t is None:
-            # time unknown: use 0 (so it sorts behind any known-time kills)
-            return (0, kmid)
-        # convert to comparable integer seconds
-        ts = int(t.timestamp())
-        return (ts, kmid)
-
-    async def resolve_hash_if_missing(self, kmid: int) -> Optional[str]:
-        """
-        If zKill corp feed doesn't include hash for some kills, resolve it via killID endpoint.
-        """
-        try:
-            one = await self.fetch_zkill_one(kmid)
-            if not one:
-                return None
-            return get_killmail_hash(one)
-        except Exception:
-            return None
-
-    async def esi_kill_time_for_id(self, kmid: int, kmhash: str) -> Optional[datetime.datetime]:
-        try:
-            esikm = await self.fetch_esi_killmail(kmid, kmhash)
-            return parse_killmail_time((esikm or {}).get("killmail_time"))
-        except Exception:
-            return None
-
-    # -------------------------
-    # Embed
-    # -------------------------
 
     def build_embed(self, zkm: Dict[str, Any], esikm: Optional[Dict[str, Any]]) -> discord.Embed:
         kmid = get_killmail_id(zkm)
@@ -570,7 +564,7 @@ class KillmailFeed(commands.Cog):
         ktime = (esikm or {}).get("killmail_time") or zkm.get("killmail_time")
 
         tag = self.infer_kill_or_loss(esikm)
-        title = f"{tag} — Killmail #{kmid}" if (tag and kmid) else (f"Killmail #{kmid}" if kmid else "Killmail")
+        title = f"{tag} — Killmail #{kmid}" if kmid else f"{tag} — Killmail"
 
         lines = [
             f"**Victim:** {v_char_name}",
@@ -606,7 +600,7 @@ class KillmailFeed(commands.Cog):
             description="\n".join(lines),
             timestamp=utcnow(),
         )
-        emb.set_footer(text="Source: zKillboard + ESI")
+        emb.set_footer(text=f"Source: zKillboard + ESI | Window: last {WINDOW_DAYS}d")
 
         if ship_type_id:
             emb.set_thumbnail(url=victim_ship_icon_url(ship_type_id))
@@ -615,23 +609,34 @@ class KillmailFeed(commands.Cog):
         return emb
 
     # -------------------------
-    # Persistence
+    # Persistence / pruning
     # -------------------------
 
+    def prune_posted_map(self):
+        cut = cutoff_utc()
+        keep: Dict[str, str] = {}
+        for kmid, iso in self.posted_map.items():
+            dt = parse_killmail_time(iso)
+            # If parsing fails, keep it (conservative). Otherwise keep only within window.
+            if dt is None or dt >= cut:
+                keep[kmid] = iso
+        self.posted_map = keep
+
     async def persist(self):
-        self.posted_ids = clamp_set_as_list(self.posted_ids, MAX_STORED_IDS)
+        self.prune_posted_map()
+
         self.name_cache = clamp_dict(self.name_cache, MAX_NAME_CACHE)
         self.type_cache = clamp_dict(self.type_cache, MAX_TYPE_CACHE)
 
-        self.state["posted_ids"] = list(self.posted_ids)
-        self.state["bootstrapped"] = self.bootstrapped
+        self.state["posted_map"] = self.posted_map
         self.state["updated_utc"] = utcnow_iso()
         self.state["consecutive_failures"] = self.consecutive_failures
         self.state["last_poll_utc"] = self.last_poll_utc
         self.state["last_posted_id"] = self.last_posted_id
         self.state["last_posted_time"] = self.last_posted_time
         self.state["last_backlog_size"] = self.last_backlog_size
-        self.state["last_bootstrap_seeded"] = self.last_bootstrap_seeded
+        self.state["last_fetch_pages"] = self.last_fetch_pages
+        self.state["last_fetch_count"] = self.last_fetch_count
 
         self.state["name_cache"] = self.name_cache
         self.state["system_cache"] = self.system_cache
@@ -640,88 +645,37 @@ class KillmailFeed(commands.Cog):
         save_json(DATA_FILE, self.state)
 
     # -------------------------
-    # Core loop
+    # Core loop (chronological, within window)
     # -------------------------
 
-    async def bootstrap_seed_and_leave_newest_unseen(self, kills: List[Dict[str, Any]]) -> None:
+    def km_time_for_sort(self, km: Dict[str, Any]) -> datetime.datetime:
         """
-        Seeds posted_ids for all current kills EXCEPT the newest N by TRUE ESI killmail_time.
-        This avoids posting old/backfilled kills when zKill is messy.
+        For chronological order we prefer zKill killmail_time.
+        If missing, we fallback to "now" (so it won't block the backlog).
         """
-        if BOOTSTRAP_POST_LAST <= 0:
-            # Seed all, post nothing
-            seeded = 0
-            for km in kills:
-                kmid = get_killmail_id(km)
-                if kmid:
-                    self.posted_ids.add(str(kmid))
-                    seeded += 1
-            self.last_bootstrap_seeded = seeded
-            return
-
-        # Step 1: pick candidate window by killmail_id desc
-        kmids = []
-        km_by_id: Dict[int, Dict[str, Any]] = {}
-        for km in kills:
-            kmid = get_killmail_id(km)
-            if not kmid:
-                continue
-            kmids.append(kmid)
-            km_by_id[kmid] = km
-
-        kmids = sorted(set(kmids), reverse=True)
-        candidates = kmids[:max(BOOTSTRAP_CANDIDATE_WINDOW, BOOTSTRAP_POST_LAST)]
-
-        # Step 2: resolve true times via ESI (needs hash)
-        scored: List[Tuple[datetime.datetime, int]] = []
-        for kmid in candidates:
-            km = km_by_id.get(kmid) or {}
-            kmhash = get_killmail_hash(km)
-            if not kmhash:
-                kmhash = await self.resolve_hash_if_missing(kmid)
-            if not kmhash:
-                continue
-            t = await self.esi_kill_time_for_id(kmid, kmhash)
-            if t is not None:
-                scored.append((t, kmid))
-
-        # If ESI resolution fails entirely, fall back to "newest by id"
-        if not scored:
-            newest_ids = set(candidates[:BOOTSTRAP_POST_LAST])
-        else:
-            scored.sort(key=lambda x: x[0], reverse=True)  # newest first
-            newest_ids = set(kmid for _, kmid in scored[:BOOTSTRAP_POST_LAST])
-
-        # Step 3: seed everything except newest_ids
-        seeded = 0
-        for kmid in kmids:
-            if kmid in newest_ids:
-                continue
-            self.posted_ids.add(str(kmid))
-            seeded += 1
-
-        self.last_bootstrap_seeded = seeded
+        t = parse_killmail_time(km.get("killmail_time"))
+        return t if t is not None else utcnow()
 
     async def post_cycle(self) -> Tuple[int, int]:
-        kills = await self.fetch_zkill()
+        kills = await self.fetch_zkill_last_window()
         self.last_poll_utc = utcnow_iso()
 
-        # BOOTSTRAP: seed everything except newest N (by TRUE ESI time)
-        if not self.bootstrapped:
-            await self.bootstrap_seed_and_leave_newest_unseen(kills)
-            self.bootstrapped = True
-            self.last_backlog_size = 0
-            await self.persist()
-            # Continue; newest N remain unseen and will be posted below.
-
-        # Build unseen list
+        # Unseen within window and not posted
         unseen: List[Dict[str, Any]] = []
+        cut = cutoff_utc()
+
         for km in kills:
             kmid = get_killmail_id(km)
             if not kmid:
                 continue
-            if str(kmid) in self.posted_ids:
+
+            t = parse_killmail_time(km.get("killmail_time"))
+            if t is not None and t < cut:
                 continue
+
+            if str(kmid) in self.posted_map:
+                continue
+
             unseen.append(km)
 
         backlog_size = len(unseen)
@@ -731,10 +685,11 @@ class KillmailFeed(commands.Cog):
             await self.persist()
             return 0, 0
 
-        # IMPORTANT: NEWEST FIRST (this is what you want)
-        unseen.sort(key=self.unseen_sort_key, reverse=True)
+        # CHRONOLOGICAL: oldest -> newest
+        unseen.sort(key=self.km_time_for_sort)
         to_post = unseen[:MAX_POSTS_PER_CYCLE]
 
+        # Enrich and post
         enriched: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
         for zkm in to_post:
             enriched.append(await self.enrich_one(zkm))
@@ -756,21 +711,17 @@ class KillmailFeed(commands.Cog):
                     await channel.send(embed=self.build_embed(zkm, esikm))
                     posted_count += 1
                 except Exception as e:
-                    print(
-                        f"[killmail_feed] Failed to send in guild={guild.id} channel=#{channel.name} "
-                        f"killmail_id={kmid}: {type(e).__name__}: {e}"
-                    )
-                    continue
+                    print(f"[killmail_feed] Send failed guild={guild.id} kmid={kmid}: {type(e).__name__}: {e}")
 
-        # Mark posted
+        # Mark posted (prefer ESI time, fallback to zKill time)
         for zkm, esikm in enriched:
             kmid = get_killmail_id(zkm)
-            if kmid:
-                self.posted_ids.add(str(kmid))
-                self.last_posted_id = str(kmid)
-                # store best-known time for status/debug
-                ktime = (esikm or {}).get("killmail_time") or zkm.get("killmail_time")
-                self.last_posted_time = str(ktime) if ktime else None
+            if not kmid:
+                continue
+            best_time = (esikm or {}).get("killmail_time") or zkm.get("killmail_time") or utcnow_iso()
+            self.posted_map[str(kmid)] = str(best_time)
+            self.last_posted_id = str(kmid)
+            self.last_posted_time = str(best_time)
 
         await self.persist()
         return posted_count, backlog_size
@@ -806,99 +757,46 @@ class KillmailFeed(commands.Cog):
     # SLASH COMMANDS
     # =====================
 
-    @app_commands.command(name="killmail_status", description="Show killmail feed status (polling, backlog, failures).")
+    @app_commands.command(name="killmail_status", description="Show killmail feed status (window, backlog, failures).")
     async def killmail_status(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True)
-
-        last_poll = self.last_poll_utc or "Never"
-        last_post = self.last_posted_id or "None"
-        last_post_time = self.last_posted_time or "None"
-        backlog = self.last_backlog_size
-        fails = self.consecutive_failures
-        boot = "Yes" if self.bootstrapped else "No"
-        seeded = self.last_bootstrap_seeded
 
         emb = discord.Embed(
             title="Killmail Feed Status",
             description=(
                 f"**Corp ID:** {CORPORATION_ID}\n"
-                f"**zKill URL:** {ZKILL_URL}\n"
+                f"**Window:** last {WINDOW_DAYS} days\n"
                 f"**Channel:** #{KILLMAIL_CHANNEL_NAME}\n\n"
                 f"**Poll interval:** {POLL_SECONDS}s\n"
                 f"**Max posts / cycle:** {MAX_POSTS_PER_CYCLE}\n"
                 f"**Fast follow-up if capped:** {FAST_POLL_SECONDS_WHEN_LIMIT_REACHED}s\n\n"
-                f"**Bootstrapped:** {boot}\n"
-                f"**Bootstrap seeded IDs:** {seeded}\n"
-                f"**Bootstrap posts newest:** {BOOTSTRAP_POST_LAST}\n"
-                f"**Bootstrap candidate window:** {BOOTSTRAP_CANDIDATE_WINDOW}\n\n"
-                f"**Last poll (UTC):** {last_poll}\n"
-                f"**Last posted ID:** {last_post}\n"
-                f"**Last posted time:** {last_post_time}\n"
-                f"**Backlog (unseen at last poll):** {backlog}\n"
-                f"**Consecutive failures:** {fails}\n"
+                f"**zKill pages/cycle (max):** {MAX_ZKILL_PAGES}\n"
+                f"**Last fetch pages used:** {self.last_fetch_pages}\n"
+                f"**Last fetch kill count (window):** {self.last_fetch_count}\n\n"
+                f"**Last poll (UTC):** {self.last_poll_utc or 'Never'}\n"
+                f"**Last posted ID:** {self.last_posted_id or 'None'}\n"
+                f"**Last posted time:** {self.last_posted_time or 'None'}\n"
+                f"**Backlog (unposted in window):** {self.last_backlog_size}\n"
+                f"**Consecutive failures:** {self.consecutive_failures}\n"
+                f"**Remembered posted IDs (in window):** {len(self.posted_map)}\n"
             ),
             timestamp=utcnow(),
         )
-        emb.set_footer(text="Cryonic Gaming bot — Version 1.0")
+        emb.set_footer(text="Cryonic Gaming bot — Killmail Feed")
         await safe_reply(interaction, embed=emb, ephemeral=True)
 
     @app_commands.command(
-        name="killmail_reload",
-        description="Reload and repost a killmail by its killmail number (CEO only)."
+        name="killmail_clear_cache",
+        description="CEO only: clear posted cache (will repost the last window again)."
     )
-    @app_commands.describe(killmail_id="The killmail ID number from zKill (e.g. 123456789)")
     @require_ceo()
-    async def killmail_reload(self, interaction: discord.Interaction, killmail_id: int):
+    async def killmail_clear_cache(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True)
-
-        if not interaction.guild:
-            await safe_reply(interaction, "This command must be used in a server.", ephemeral=True)
-            return
-
-        try:
-            channel = await self.ensure_channel(interaction.guild)
-        except Exception:
-            await safe_reply(interaction, "I could not find or create the kill-mail channel.", ephemeral=True)
-            return
-
-        kmid = safe_int(killmail_id)
-        if not kmid or kmid <= 0:
-            await safe_reply(interaction, "Invalid killmail ID.", ephemeral=True)
-            return
-
-        try:
-            zkm = await self.fetch_zkill_one(kmid)
-        except Exception as e:
-            await safe_reply(interaction, f"Failed to fetch killmail from zKill. ({type(e).__name__})", ephemeral=True)
-            return
-
-        if not zkm:
-            await safe_reply(interaction, "Killmail not found on zKillboard.", ephemeral=True)
-            return
-
-        kmhash = get_killmail_hash(zkm)
-        if not kmhash:
-            await safe_reply(interaction, "Killmail hash not available from zKillboard yet.", ephemeral=True)
-            return
-
-        try:
-            zkm_enriched, esikm = await self.enrich_one(zkm)
-            emb = self.build_embed(zkm_enriched, esikm)
-        except Exception as e:
-            await safe_reply(interaction, f"Failed to enrich/build embed. ({type(e).__name__})", ephemeral=True)
-            return
-
-        try:
-            await channel.send(embed=emb)
-        except Exception as e:
-            await safe_reply(interaction, f"Failed to post the killmail embed. ({type(e).__name__})", ephemeral=True)
-            return
-
-        await safe_reply(
-            interaction,
-            f"Reposted killmail `{kmid}` to #{KILLMAIL_CHANNEL_NAME}.",
-            ephemeral=True
-        )
+        self.posted_map = {}
+        self.last_posted_id = None
+        self.last_posted_time = None
+        await self.persist()
+        await safe_reply(interaction, "Cleared posted cache. The bot will repost the last window in chronological order.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
