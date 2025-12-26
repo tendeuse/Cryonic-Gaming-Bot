@@ -1,25 +1,20 @@
 # cogs/killmail_feed.py
 #
-# ESI-time authoritative ordering + robust scanning + ESI diagnostics
+# ESI-time authoritative ordering + backfill-from-oldest then realtime
 #
-# Key behavior:
-# - zKill corp feed can return no killmail_time (confirmed by your inspect earlier).
-# - We therefore select/order/window strictly using ESI killmail_time.
+# BACKFILL behavior:
+# - When starting fresh (no last_posted_time) OR backfill=True, the bot starts from the OLDEST end
+#   of the zKill list and posts oldest->newest to catch up from ~14 days ago.
 #
-# Posting logic:
-# - Always aims to post the next 5 NEWEST (by ESI time), but sends OLDEST->NEWEST within that batch,
-#   so the most recent appears last in Discord.
-#
-# Performance logic:
-# - Scans through zKill IDs using a persistent scan_cursor to avoid rechecking the same IDs repeatedly.
-# - Attempts up to MAX_ESI_ATTEMPTS_PER_CYCLE ESI calls per cycle.
-# - If ESI returns 420/429, aborts so backoff can kick in.
+# REALTIME behavior:
+# - Once near-caught-up, the bot switches to realtime and posts newest batches (but sends within-batch
+#   oldest->newest so newest is last in Discord).
 #
 # Debug:
 # - /killmail_status
-# - /killmail_inspect
 # - /killmail_debug_next
-# - /killmail_debug_esi (shows ESI status histogram)
+# - /killmail_debug_esi
+# - /killmail_inspect
 # - /killmail_reload (restricted roles)
 
 import discord
@@ -50,8 +45,11 @@ WINDOW_DAYS = 14
 MAX_ZKILL_PAGES = 8
 ZKILL_REQUEST_DELAY = 0.25
 
-# Hard cap on ESI requests per cycle (increase if needed, but watch ESI error limit)
+# Hard cap on ESI requests per cycle
 MAX_ESI_ATTEMPTS_PER_CYCLE = 200
+
+# Heuristic: when we post items newer than NOW - this many hours, we switch to realtime mode
+SWITCH_TO_REALTIME_IF_NEWER_THAN_HOURS = 24
 
 USER_AGENT = "Cryonic Gaming bot/1.0 (contact: tendeuse on Discord)"
 ESI_BASE = "https://esi.evetech.net/latest"
@@ -206,8 +204,14 @@ class KillmailFeed(commands.Cog):
         # posted_map: { "killmail_id": "killmail_time_iso" } (ESI time)
         self.posted_map: Dict[str, str] = self.state.get("posted_map", {}) or {}
 
-        # scan cursor so we don't keep enriching the same first N IDs
+        # scan cursor so we don't keep enriching the same IDs repeatedly
         self.scan_cursor: int = int(self.state.get("scan_cursor", 0) or 0)
+
+        # backfill mode: start from 14d ago and move forward until near-caught-up
+        self.backfill: bool = bool(self.state.get("backfill", True))
+        # If we already had posted_time stored, default to realtime unless explicitly left in backfill
+        if self.state.get("last_posted_time") and "backfill" not in self.state:
+            self.backfill = False
 
         # caches
         self.name_cache: Dict[str, str] = self.state.get("name_cache", {}) or {}
@@ -484,7 +488,6 @@ class KillmailFeed(commands.Cog):
         for a in attackers:
             if a.get("final_blow") is True:
                 return a
-        # fallback: top damage
         best = None
         best_dmg = -1
         for a in attackers:
@@ -516,7 +519,6 @@ class KillmailFeed(commands.Cog):
         if not ktime:
             return None, None, None
 
-        # Resolve names for victim + final blow
         ids: List[int] = []
         victim = (esikm.get("victim") or {})
         for k in ("character_id", "corporation_id", "alliance_id"):
@@ -679,6 +681,7 @@ class KillmailFeed(commands.Cog):
         self.state.update({
             "posted_map": self.posted_map,
             "scan_cursor": self.scan_cursor,
+            "backfill": self.backfill,
 
             "name_cache": self.name_cache,
             "system_cache": self.system_cache,
@@ -718,11 +721,10 @@ class KillmailFeed(commands.Cog):
         self.last_send_error = None
 
         cut = cutoff_utc()
+        near_now_cut = utcnow() - datetime.timedelta(hours=SWITCH_TO_REALTIME_IF_NEWER_THAN_HOURS)
 
-        # Fetch merged IDs (kills+losses). Ordering from zKill cannot be trusted; we use ESI times later.
         rows = await self.fetch_zkill_merged()
 
-        # Build unseen list by ID
         unseen: List[Dict[str, Any]] = []
         for km in rows:
             kmid = self._extract_killmail_id(km)
@@ -739,35 +741,47 @@ class KillmailFeed(commands.Cog):
             await self.persist()
             return 0, 0
 
-        # Use persistent scan cursor to avoid re-checking the same IDs repeatedly
         n = len(unseen)
         if n == 0:
             await self.persist()
             return 0, 0
+
+        # Cursor init based on mode:
+        # - BACKFILL: start from end (oldest side) and move backward
+        # - REALTIME: start from cursor and move forward
         if self.scan_cursor >= n:
             self.scan_cursor = 0
 
-        # Scan until we have enough enriched items or hit ESI attempt cap
+        if self.backfill and self.last_posted_time is None:
+            # Fresh start: force tail start
+            self.scan_cursor = n - 1
+
+        # Scan until we have enough items to choose from or hit ESI attempt cap
         status_hist = defaultdict(int)
         esi_attempts = 0
         esi_success = 0
 
         enriched: List[Tuple[Dict[str, Any], Dict[str, Any], datetime.datetime]] = []
 
-        start = self.scan_cursor
-        i = 0
-        while i < n and esi_attempts < MAX_ESI_ATTEMPTS_PER_CYCLE and len(enriched) < (MAX_POSTS_PER_CYCLE * 4):
-            idx = (start + i) % n
+        # Determine scan direction
+        step = -1 if self.backfill else 1
+
+        idx = self.scan_cursor
+        scanned = 0
+
+        while scanned < n and esi_attempts < MAX_ESI_ATTEMPTS_PER_CYCLE and len(enriched) < (MAX_POSTS_PER_CYCLE * 6):
             zkm = unseen[idx]
             kmid = self._extract_killmail_id(zkm)
             if not kmid or self._is_posted(kmid):
-                i += 1
+                idx = (idx + step) % n
+                scanned += 1
                 continue
 
             kmhash = self._extract_hash(zkm)
             if not kmhash:
                 status_hist["no_hash"] += 1
-                i += 1
+                idx = (idx + step) % n
+                scanned += 1
                 continue
 
             try:
@@ -775,59 +789,65 @@ class KillmailFeed(commands.Cog):
                 z2, e2, kdt = await self.enrich_one(zkm)
                 if not z2 or not e2 or not kdt:
                     status_hist["no_time"] += 1
-                    i += 1
+                    idx = (idx + step) % n
+                    scanned += 1
                     continue
+
                 esi_success += 1
                 status_hist["200"] += 1
 
-                # Window check (ESI time)
                 if kdt < cut:
                     status_hist["out_of_window"] += 1
-                    i += 1
+                    idx = (idx + step) % n
+                    scanned += 1
                     continue
 
                 enriched.append((z2, e2, kdt))
-                i += 1
+
+                idx = (idx + step) % n
+                scanned += 1
 
             except ESIHTTPError as ee:
                 status_hist[str(ee.status)] += 1
                 self.last_esi_error = str(ee)
-
-                # If rate/err limited, abort cycle so outer backoff can kick in
                 if ee.status in (420, 429):
                     break
-
-                i += 1
+                idx = (idx + step) % n
+                scanned += 1
             except Exception as e:
                 status_hist["exception"] += 1
                 self.last_esi_error = f"{type(e).__name__}: {e}"
-                i += 1
+                idx = (idx + step) % n
+                scanned += 1
 
-        # Move cursor forward by how far we scanned, so next cycle continues
-        self.scan_cursor = (start + i) % n
+        # Persist cursor as "next index to start"
+        self.scan_cursor = idx
 
         self.last_esi_attempts = esi_attempts
         self.last_esi_success = esi_success
         self.last_esi_status_hist = dict(status_hist)
 
-        # If we have nothing enriched, do not mark posted; just persist and return
         if not enriched:
             self.last_enriched_count = 0
             await self.persist()
             return 0, remaining_unseen
 
-        # Choose NEXT 5 NEWEST by ESI time
-        # sort newest->oldest for selection
-        enriched.sort(key=lambda x: (x[2], self._extract_killmail_id(x[0]) or 0), reverse=True)
-        selected = enriched[:MAX_POSTS_PER_CYCLE]
-
-        # Post OLDEST->NEWEST so most recent shows last
-        selected.sort(key=lambda x: (x[2], self._extract_killmail_id(x[0]) or 0))
+        # Selection depends on mode:
+        # - BACKFILL: choose OLDEST 5 and send oldest->newest
+        # - REALTIME: choose NEWEST 5 but still send oldest->newest within batch
+        if self.backfill:
+            enriched.sort(key=lambda x: (x[2], self._extract_killmail_id(x[0]) or 0))
+            selected = enriched[:MAX_POSTS_PER_CYCLE]
+        else:
+            enriched.sort(key=lambda x: (x[2], self._extract_killmail_id(x[0]) or 0), reverse=True)
+            selected = enriched[:MAX_POSTS_PER_CYCLE]
+            selected.sort(key=lambda x: (x[2], self._extract_killmail_id(x[0]) or 0))
 
         self.last_enriched_count = len(selected)
         self.last_send_attempt_utc = utcnow_iso()
 
         posted_count = 0
+        newest_posted_dt: Optional[datetime.datetime] = None
 
         for guild in self.target_guilds():
             if guild is None:
@@ -858,11 +878,16 @@ class KillmailFeed(commands.Cog):
                     self.last_posted_id = str(kmid)
                     self.last_posted_time = iso_time
                     posted_count += 1
+                    if newest_posted_dt is None or kdt > newest_posted_dt:
+                        newest_posted_dt = kdt
                 except Exception as e:
                     self.last_send_error = f"send:{type(e).__name__}:{e}"
                     self.send_failures += 1
 
-        # Approx remaining (IDs only)
+        # Switch to realtime once we are posting very recent mails
+        if self.backfill and newest_posted_dt is not None and newest_posted_dt >= near_now_cut:
+            self.backfill = False
+
         remaining = 0
         for km in unseen:
             kmid = self._extract_killmail_id(km)
@@ -914,24 +939,23 @@ class KillmailFeed(commands.Cog):
                 f"**Corp ID:** {CORPORATION_ID}\n"
                 f"**Window:** last {WINDOW_DAYS} days (ESI killmail_time)\n"
                 f"**Channel:** #{KILLMAIL_CHANNEL_NAME}\n"
-                f"**Primary Guild ID:** {PRIMARY_GUILD_ID or 'None (all guilds)'}\n\n"
+                f"**Mode:** {'BACKFILL (oldest→newest)' if self.backfill else 'REALTIME (newest batches)'}\n"
+                f"**Scan cursor:** {self.scan_cursor}\n\n"
                 f"**Poll interval:** {POLL_SECONDS}s\n"
                 f"**Max posts / cycle:** {MAX_POSTS_PER_CYCLE}\n"
                 f"**Follow-up if backlog remains:** {FAST_POLL_SECONDS_WHEN_BACKLOG_REMAINS}s\n\n"
                 f"**zKill pages (max):** {MAX_ZKILL_PAGES}\n"
                 f"**zKill request delay:** {ZKILL_REQUEST_DELAY}s\n"
-                f"**Max ESI attempts / cycle:** {MAX_ESI_ATTEMPTS_PER_CYCLE}\n"
-                f"**Scan cursor:** {self.scan_cursor}\n\n"
+                f"**Max ESI attempts / cycle:** {MAX_ESI_ATTEMPTS_PER_CYCLE}\n\n"
                 f"**Last fetch count (merged):** {self.last_fetch_count}\n"
                 f"**Last fetch pages used:** {self.last_fetch_pages}\n\n"
                 f"**Last poll (UTC):** {self.last_poll_utc or 'Never'}\n"
                 f"**Last send attempt (UTC):** {self.last_send_attempt_utc or 'Never'}\n"
-                f"**Last channel ID:** {self.last_channel_id or 'None'}\n"
                 f"**Last posted ID:** {self.last_posted_id or 'None'}\n"
                 f"**Last posted time:** {self.last_posted_time or 'None'}\n\n"
                 f"**Last cycle ESI attempts:** {self.last_esi_attempts}\n"
                 f"**Last cycle ESI success:** {self.last_esi_success}\n"
-                f"**Last cycle enriched posted-set:** {self.last_enriched_count}\n"
+                f"**Last cycle posted-set size:** {self.last_enriched_count}\n"
                 f"**Backlog (unposted IDs):** {self.last_backlog_size}\n\n"
                 f"**Consecutive failures:** {self.consecutive_failures}\n"
                 f"**Send failures:** {self.send_failures}\n"
@@ -961,54 +985,6 @@ class KillmailFeed(commands.Cog):
         )
         await safe_reply(interaction, msg, ephemeral=True)
 
-    @app_commands.command(name="killmail_inspect", description="Admin only: inspect zKill row structure.")
-    @require_killmail_admin()
-    async def killmail_inspect(self, interaction: discord.Interaction):
-        await safe_defer(interaction, ephemeral=True)
-
-        rows = await self.fetch_zkill_merged()
-
-        missing_id = 0
-        missing_time = 0
-        missing_hash = 0
-
-        sample = rows[0] if rows else None
-        for km in rows:
-            kmid = self._extract_killmail_id(km)
-            if not kmid:
-                missing_id += 1
-            if km.get("killmail_time") is None:
-                missing_time += 1
-            if not self._extract_hash(km):
-                missing_hash += 1
-
-        if not sample:
-            await safe_reply(interaction, "No zKill rows returned.", ephemeral=True)
-            return
-
-        keys = sorted(list(sample.keys()))
-        kmid = self._extract_killmail_id(sample)
-        ktime = sample.get("killmail_time")
-        zkb = sample.get("zkb") or {}
-        h = self._extract_hash(sample)
-        tv = isk_value(sample)
-
-        msg = (
-            f"**zKill structure check:**\n"
-            f"- rows fetched (merged): {len(rows)}\n"
-            f"- missing id: {missing_id}\n"
-            f"- missing time: {missing_time}\n"
-            f"- missing hash: {missing_hash}\n\n"
-            f"**Sample row:**\n"
-            f"- keys: {', '.join(keys)}\n"
-            f"- extracted killmail_id: {kmid}\n"
-            f"- killmail_time: {ktime} (type={type(ktime).__name__})\n"
-            f"- zkb keys: {', '.join(sorted(list(zkb.keys())))}\n"
-            f"- zkb.hash: {h}\n"
-            f"- zkb.totalValue: {tv}\n"
-        )
-        await safe_reply(interaction, msg, ephemeral=True)
-
     @app_commands.command(name="killmail_debug_next", description="Admin only: run one post cycle immediately.")
     @require_killmail_admin()
     async def killmail_debug_next(self, interaction: discord.Interaction):
@@ -1018,12 +994,31 @@ class KillmailFeed(commands.Cog):
             interaction,
             (
                 f"post_cycle done. posted={posted} remaining={remaining}\n"
+                f"mode={'BACKFILL' if self.backfill else 'REALTIME'} scan_cursor={self.scan_cursor}\n"
                 f"esi_attempts={self.last_esi_attempts} esi_success={self.last_esi_success}\n"
-                f"scan_cursor={self.scan_cursor}\n"
                 f"last_send_error={self.last_send_error or 'None'} last_esi_error={self.last_esi_error or 'None'}"
             ),
             ephemeral=True
         )
+
+    @app_commands.command(name="killmail_inspect", description="Admin only: inspect zKill row structure.")
+    @require_killmail_admin()
+    async def killmail_inspect(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True)
+        rows = await self.fetch_zkill_merged()
+        if not rows:
+            await safe_reply(interaction, "No zKill rows returned.", ephemeral=True)
+            return
+        sample = rows[0]
+        zkb = sample.get("zkb") or {}
+        msg = (
+            f"Sample keys: {', '.join(sorted(sample.keys()))}\n"
+            f"killmail_id: {self._extract_killmail_id(sample)}\n"
+            f"killmail_time field: {sample.get('killmail_time')} (type={type(sample.get('killmail_time')).__name__})\n"
+            f"zkb keys: {', '.join(sorted(zkb.keys()))}\n"
+            f"zkb.hash: {self._extract_hash(sample)}\n"
+        )
+        await safe_reply(interaction, msg, ephemeral=True)
 
     @app_commands.command(name="killmail_reload", description="Reload a killmail by kill ID and repost it (admin only).")
     @require_killmail_admin()
@@ -1054,35 +1049,6 @@ class KillmailFeed(commands.Cog):
             await safe_reply(interaction, "❌ ESI did not return a valid killmail.", ephemeral=True)
             return
 
-        # Warm caches for display
-        try:
-            victim = (esikm.get("victim") or {})
-            ids: List[int] = []
-            for k in ("character_id", "corporation_id", "alliance_id"):
-                v = safe_int(victim.get(k))
-                if v:
-                    ids.append(v)
-            fb = self.pick_final_blow_attacker(esikm)
-            for k in ("character_id", "corporation_id", "alliance_id"):
-                v = safe_int(fb.get(k))
-                if v:
-                    ids.append(v)
-            await self.resolve_universe_names(ids)
-
-            sys_id = safe_int(esikm.get("solar_system_id"))
-            if sys_id:
-                await self.resolve_system_info(sys_id)
-
-            ship_id = safe_int(victim.get("ship_type_id"))
-            if ship_id:
-                await self.resolve_type_name(ship_id)
-
-            fb_ship_id = safe_int(fb.get("ship_type_id"))
-            if fb_ship_id:
-                await self.resolve_type_name(fb_ship_id)
-        except Exception:
-            pass
-
         if not interaction.guild:
             await safe_reply(interaction, "❌ Must be used in a server.", ephemeral=True)
             return
@@ -1099,6 +1065,8 @@ class KillmailFeed(commands.Cog):
         self._mark_posted(kmid, iso_time)
         self.last_posted_id = str(kmid)
         self.last_posted_time = iso_time
+
+        # If you are reloading history, keep backfill on; if you want, flip to realtime manually by editing state.
         await self.persist()
 
         await safe_reply(interaction, f"✅ Reloaded and reposted killmail {kmid}.", ephemeral=True)
