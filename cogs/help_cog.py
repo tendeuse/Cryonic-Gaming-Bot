@@ -11,7 +11,7 @@ RECRUITMENT_CANDIDATE_ROLE = "Recruitment Candidate"
 RECRUITMENT_NOTIFY_CHANNEL = "support-staff-recruitment"
 
 DONOR_ROLE_NAMES = {"1", "2", "3", "4", "5", "6"}
-DONOR_NOTIFY_CHANNEL = "support-staff-recruitment"  # Change if you want a different channel
+DONOR_NOTIFY_CHANNEL = "support-staff-donors"  # Change if you want a different channel
 
 RECRUITER_LOG_CHANNEL = "recruiter-log"
 
