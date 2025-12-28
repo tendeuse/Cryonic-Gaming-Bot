@@ -1,6 +1,6 @@
 import os
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from discord.ui import View
 import json
@@ -10,12 +10,14 @@ import datetime
 import isodate
 import asyncio
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
 VIDEO_FILE = Path("data/video_submissions.json")
 AP_FILE = Path("data/ap_data.json")
 AUDIT_FILE = Path("data/video_audit_log.json")
+REPORT_STATE_FILE = Path("data/video_report_state.json")
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 if not YOUTUBE_API_KEY:
@@ -29,7 +31,14 @@ CEO_ROLE = "ARC Security Corporation Leader"
 DIRECTOR_ROLE = "ARC Security Administration Council"
 SECURITY_ROLE = "ARC Security"
 
+# Report command / automation restrictions
+LYCAN_ROLE = "Lycan King"
+REPORT_DM_USER_ID = 559041382573015060
+
 AP_DISTRIBUTION_LOG_CH = "member-join-logs-points-distribute"
+
+# Your local timezone (per your environment requirement)
+LOCAL_TZ = ZoneInfo("America/Moncton")
 
 file_lock = asyncio.Lock()
 
@@ -60,6 +69,15 @@ async def save(p: Path, d):
 def now_iso():
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
+def iso_to_dt_utc(iso_str: str) -> datetime.datetime | None:
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
 def iso_to_discord_ts(iso_str: str) -> str:
     try:
         dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
@@ -71,6 +89,9 @@ def iso_to_discord_ts(iso_str: str) -> str:
 
 def is_manager(member: discord.Member) -> bool:
     return any(r.name in (CEO_ROLE, DIRECTOR_ROLE) for r in member.roles)
+
+def can_run_video_report(member: discord.Member) -> bool:
+    return any(r.name in (CEO_ROLE, LYCAN_ROLE) for r in member.roles)
 
 def corp_ceos(guild: discord.Guild):
     return [m for m in guild.members if any(r.name == CEO_ROLE for r in m.roles)]
@@ -139,6 +160,92 @@ def disable_view(view: View) -> View:
             pass
     return view
 
+def fmt_hms(total_seconds: float) -> str:
+    s = int(round(total_seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h}h {m:02d}m {sec:02d}s"
+
+def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.datetime, datetime.datetime] | None:
+    """
+    Accepts YYYY-MM-DD strings interpreted in LOCAL_TZ.
+    Returns (start_utc, end_utc) inclusive boundaries.
+    """
+    try:
+        df = datetime.date.fromisoformat(date_from)
+        dt = datetime.date.fromisoformat(date_to)
+    except Exception:
+        return None
+    if dt < df:
+        return None
+
+    start_local = datetime.datetime(df.year, df.month, df.day, 0, 0, 0, tzinfo=LOCAL_TZ)
+    end_local = datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59, tzinfo=LOCAL_TZ)
+
+    return (start_local.astimezone(datetime.timezone.utc), end_local.astimezone(datetime.timezone.utc))
+
+async def build_video_length_report_embed(
+    *,
+    guild: discord.Guild | None,
+    start_utc: datetime.datetime,
+    end_utc: datetime.datetime,
+    title_prefix: str
+) -> discord.Embed:
+    videos = await load(VIDEO_FILE)
+    if not isinstance(videos, dict):
+        videos = {}
+
+    totals: dict[int, float] = {}
+    counts: dict[int, int] = {}
+
+    for _key, v in videos.items():
+        if not isinstance(v, dict):
+            continue
+
+        submitted_at = v.get("submitted_at")
+        dt_utc = iso_to_dt_utc(submitted_at) if isinstance(submitted_at, str) else None
+        if not dt_utc:
+            # Older entries created before "submitted_at" existed will not be counted in date-based reports.
+            continue
+
+        if dt_utc < start_utc or dt_utc > end_utc:
+            continue
+
+        sid = int(v.get("submitter", 0) or 0)
+        dur = float(v.get("duration", 0) or 0)
+        if sid <= 0 or dur <= 0:
+            continue
+
+        totals[sid] = totals.get(sid, 0.0) + dur
+        counts[sid] = counts.get(sid, 0) + 1
+
+    # Sort: most time first
+    sorted_rows = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+
+    # Build description lines
+    lines: list[str] = []
+    for sid, total_sec in sorted_rows:
+        member_name = f"<@{sid}>"
+        if guild:
+            m = guild.get_member(sid)
+            if m:
+                member_name = f"{m.display_name} ({m.mention})"
+        lines.append(f"• **{member_name}** — **{fmt_hms(total_sec)}** ({counts.get(sid, 0)} videos)")
+
+    # Range label in local time for readability
+    start_local = start_utc.astimezone(LOCAL_TZ)
+    end_local = end_utc.astimezone(LOCAL_TZ)
+    range_label = f"{start_local.date().isoformat()} to {end_local.date().isoformat()} ({LOCAL_TZ.key})"
+
+    e = discord.Embed(
+        title=f"{title_prefix} — Video Length Report",
+        description=f"**Range:** {range_label}\n\n" + ("\n".join(lines) if lines else "_No submissions found in this date range._"),
+        timestamp=datetime.datetime.utcnow()
+    )
+    e.set_footer(text="Totals are based on submitted_at timestamps recorded at submission time.")
+    return e
+
 async def post_points_distribution_confirmation(
     guild: discord.Guild,
     *,
@@ -180,6 +287,58 @@ async def post_points_distribution_confirmation(
         await ch.send(embed=e)
     except (discord.Forbidden, discord.HTTPException):
         pass
+
+# =====================
+# MODAL: REPORT DATES
+# =====================
+
+class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
+    date_from = discord.ui.TextInput(
+        label="From date (YYYY-MM-DD)",
+        placeholder="2025-12-02",
+        required=True,
+        max_length=10
+    )
+    date_to = discord.ui.TextInput(
+        label="To date (YYYY-MM-DD)",
+        placeholder="2025-12-15",
+        required=True,
+        max_length=10
+    )
+
+    def __init__(self, cog: "VideoSubmission"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True)
+
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await safe_send(interaction, "❌ This must be used in a server.", ephemeral=True)
+            return
+
+        if not can_run_video_report(interaction.user):
+            await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
+            return
+
+        rng = date_str_to_local_range(str(self.date_from).strip(), str(self.date_to).strip())
+        if not rng:
+            await safe_send(interaction, "❌ Invalid dates. Use YYYY-MM-DD, and ensure To ≥ From.", ephemeral=True)
+            return
+
+        start_utc, end_utc = rng
+        embed = await build_video_length_report_embed(
+            guild=interaction.guild,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            title_prefix="Manual"
+        )
+
+        await safe_send(interaction, "✅ Report generated:", ephemeral=True)
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 # =====================
 # APPROVAL VIEW (SAFE)
@@ -230,8 +389,16 @@ class VideoSubmission(commands.Cog):
         )
         self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
+        self.video_report_scheduler.start()
+
     async def cog_load(self):
         await self._restore_pending_views()
+
+    def cog_unload(self):
+        try:
+            self.video_report_scheduler.cancel()
+        except Exception:
+            pass
 
     async def _restore_pending_views(self):
         videos = await load(VIDEO_FILE)
@@ -265,6 +432,115 @@ class VideoSubmission(commands.Cog):
             raise ValueError("Drive file has no video duration metadata (not a video or not accessible).")
         sec = int(ms) / 1000
         return float(sec), str(f.get("name", "Untitled"))
+
+    # =====================
+    # NEW: MANUAL REPORT COMMAND
+    # =====================
+
+    @app_commands.command(
+        name="video_length_report",
+        description="Report total submitted video length per member for a date range (YYYY-MM-DD)."
+    )
+    async def video_length_report(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await safe_send(interaction, "❌ This command must be used in a server.", ephemeral=True)
+            return
+
+        if not can_run_video_report(interaction.user):
+            await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
+            return
+
+        try:
+            await interaction.response.send_modal(VideoLengthReportModal(self))
+        except (discord.HTTPException, discord.NotFound):
+            # Fallback if modal fails for any reason
+            await safe_send(interaction, "❌ Could not open the report modal. Please try again.", ephemeral=True)
+
+    # =====================
+    # AUTO REPORT SCHEDULER
+    # =====================
+
+    @tasks.loop(minutes=15)
+    async def video_report_scheduler(self):
+        """
+        Runs frequently, but only sends reports on:
+          - Local day 16: range 2..15 of current month
+          - Local day 2 : range 16..1 spanning previous->current month
+        DMs the report to REPORT_DM_USER_ID.
+        Uses REPORT_STATE_FILE to prevent duplicates.
+        """
+        try:
+            state = await load(REPORT_STATE_FILE)
+            if not isinstance(state, dict):
+                state = {}
+
+            now_local = datetime.datetime.now(tz=LOCAL_TZ)
+            day = now_local.day
+
+            # Only act on the 2nd and 16th (local date)
+            if day not in (2, 16):
+                return
+
+            # De-dupe key by local date + type
+            run_key = f"{now_local.date().isoformat()}-day{day}"
+            if state.get(run_key) is True:
+                return
+
+            # Compute local date ranges
+            if day == 16:
+                # 2nd -> 15th of current month
+                y = now_local.year
+                m = now_local.month
+                date_from = datetime.date(y, m, 2)
+                date_to = datetime.date(y, m, 15)
+                title_prefix = "Auto (2nd–15th)"
+            else:
+                # day == 2: 16th of previous month -> 1st of current month
+                y = now_local.year
+                m = now_local.month
+                first_of_month = datetime.date(y, m, 1)
+                prev_month_last = first_of_month - datetime.timedelta(days=1)
+                date_from = datetime.date(prev_month_last.year, prev_month_last.month, 16)
+                date_to = datetime.date(y, m, 1)
+                title_prefix = "Auto (16th–1st)"
+
+            start_local = datetime.datetime(date_from.year, date_from.month, date_from.day, 0, 0, 0, tzinfo=LOCAL_TZ)
+            end_local = datetime.datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=LOCAL_TZ)
+            start_utc = start_local.astimezone(datetime.timezone.utc)
+            end_utc = end_local.astimezone(datetime.timezone.utc)
+
+            embed = await build_video_length_report_embed(
+                guild=None,  # DM context: use mentions, not guild display names
+                start_utc=start_utc,
+                end_utc=end_utc,
+                title_prefix=title_prefix
+            )
+
+            # DM target user
+            user = await self.bot.fetch_user(REPORT_DM_USER_ID)
+            if not user:
+                return
+
+            await user.send(embed=embed)
+
+            # mark sent
+            state[run_key] = True
+            await save(REPORT_STATE_FILE, state)
+
+        except discord.Forbidden:
+            # Cannot DM the user
+            return
+        except Exception:
+            # Avoid crashing the loop
+            return
+
+    @video_report_scheduler.before_loop
+    async def before_video_report_scheduler(self):
+        await self.bot.wait_until_ready()
+
+    # =====================
+    # EXISTING: SUBMISSION / APPROVAL FLOW
+    # =====================
 
     @app_commands.command(name="submit_video", description="Submit a YouTube or Google Drive video for AP approval")
     @app_commands.describe(url="YouTube or Google Drive video URL")
@@ -312,7 +588,9 @@ class VideoSubmission(commands.Cog):
             "title": title,
             "ap": ap_reward,
             "fingerprint": fp,
-            "approved": None
+            "approved": None,
+            # NEW: required for date-based reports
+            "submitted_at": now_iso()
         }
 
         await save(VIDEO_FILE, videos)
