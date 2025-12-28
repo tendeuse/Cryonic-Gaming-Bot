@@ -484,6 +484,66 @@ class APCheckView(discord.ui.View):
         await interaction.response.send_message(f"You have **{ap} AP**.", ephemeral=True)
 
 # -------------------------
+# AP Claim Flow (Buttons -> Modal)
+# -------------------------
+class APClaimIGNModal(discord.ui.Modal):
+    def __init__(self, *, game_value: str):
+        super().__init__(title="Claim AP - Enter IGN")
+        self.game_value = game_value
+
+        self.ign_input = discord.ui.TextInput(
+            label="In-Game Name (IGN)",
+            placeholder="Type the character name you want AP claimed on",
+            min_length=1,
+            max_length=64,
+            required=True
+        )
+        self.add_item(self.ign_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
+            return
+
+        ign = str(self.ign_input.value).strip()
+        if not ign:
+            await interaction.response.send_message("IGN cannot be empty.", ephemeral=True)
+            return
+
+        data = await load()
+        rec = data.setdefault(str(interaction.user.id), {"ap": 0, "last_chat": None})
+        rec[CLAIM_GAME_KEY] = self.game_value
+        rec[CLAIM_IGN_KEY] = ign
+        await save(data)
+
+        embed = discord.Embed(
+            title="AP Claim Saved",
+            description=f"Saved your claim:\n**Game:** {self.game_value}\n**IGN:** {ign}",
+            timestamp=datetime.datetime.utcnow()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class APClaimGameView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Only the user who ran /apclaim can use these buttons
+        if interaction.user and interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("This claim menu isn't for you.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label=GAME_EVE, style=discord.ButtonStyle.primary, custom_id="apclaim:game:eve")
+    async def pick_eve(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.send_modal(APClaimIGNModal(game_value=GAME_EVE))
+
+    @discord.ui.button(label=GAME_WOW, style=discord.ButtonStyle.primary, custom_id="apclaim:game:wow")
+    async def pick_wow(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.send_modal(APClaimIGNModal(game_value=GAME_WOW))
+
+# -------------------------
 # Cog
 # -------------------------
 class APTracking(commands.Cog):
@@ -549,7 +609,9 @@ class APTracking(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
+        # Persistent AP check view
         self.bot.add_view(APCheckView())
+
         for g in self.bot.guilds:
             await self.ensure_ap_check_message(g)
             await ensure_hierarchy_log_channel(g)
@@ -669,30 +731,18 @@ class APTracking(commands.Cog):
     # Slash Commands
     # -------------------------
     @app_commands.command(name="apclaim", description="Claim your IGN and game for AP exports.")
-    @app_commands.choices(game=[
-        app_commands.Choice(name=GAME_EVE, value=GAME_EVE),
-        app_commands.Choice(name=GAME_WOW, value=GAME_WOW),
-    ])
-    async def apclaim(
-        self,
-        interaction: discord.Interaction,
-        game: app_commands.Choice[str],
-        ign: app_commands.Range[str, 1, 64],
-    ):
+    async def apclaim(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
             return
 
-        data = await load()
-        rec = data.setdefault(str(interaction.user.id), {"ap": 0, "last_chat": None})
-        rec[CLAIM_GAME_KEY] = game.value
-        rec[CLAIM_IGN_KEY] = ign.strip()
-        await save(data)
-
-        await interaction.response.send_message(
-            f"Saved your claim: **{game.value}** — IGN: **{ign.strip()}**.",
-            ephemeral=True
+        embed = discord.Embed(
+            title="Claim Your AP Payout Game",
+            description="Select which game you want to claim AP on. You will be prompted for the IGN next.",
+            timestamp=datetime.datetime.utcnow()
         )
+        view = APClaimGameView(owner_id=interaction.user.id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="give_ap", description="Give AP to a member (Lycan King only).")
     async def give_ap(
