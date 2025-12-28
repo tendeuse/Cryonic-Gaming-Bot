@@ -3,6 +3,8 @@ import discord
 import json
 import asyncio
 import datetime
+import io
+import csv
 from discord.ext import commands, tasks
 from discord import app_commands
 from pathlib import Path
@@ -13,6 +15,9 @@ from typing import Optional, Dict, Any, List, Tuple
 # =====================
 DATA_FILE = Path("data/ap_data.json")
 DATA_FILE.parent.mkdir(exist_ok=True)
+
+EXPORT_DIR = Path("data/ap_exports")
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Hierarchy data (owned by arc_hierarchy.py)
 HIERARCHY_FILE = Path("arc_hierarchy.json")
@@ -34,8 +39,9 @@ AP_CHECK_BUTTON_LABEL = "Check Balance"
 
 META_KEY = "_meta"
 AP_CHECK_MESSAGE_ID_KEY = "ap_check_message_id"
+LAST_WIPE_KEY = "last_wipe_utc"
 
-# ARC roles (used for CEO bonus eligibility)
+# ARC roles (used for CEO bonus eligibility and permissions)
 CEO_ROLE = "ARC Security Corporation Leader"
 SECURITY_ROLE = "ARC Security"
 
@@ -43,8 +49,18 @@ SECURITY_ROLE = "ARC Security"
 JOIN_BONUS_AP = 100
 JOIN_BONUS_KEY = "join_bonus_awarded"
 
-# NEW: AP distribution log channel
+# AP distribution log channel
 AP_DISTRIBUTION_LOG_CH = "member-join-logs-points-distribute"
+
+# Claim keys
+CLAIM_IGN_KEY = "ign"
+CLAIM_GAME_KEY = "game"
+
+# Game rates
+GAME_EVE = "EVE Online"
+GAME_WOW = "World of Warcraft"
+EVE_ISK_PER_AP = 100_000
+WOW_GOLD_PER_AP = 10
 
 # ARC ranks (read from hierarchy file)
 RANK_SECURITY = "security"
@@ -109,6 +125,19 @@ def load_hierarchy() -> Dict[str, Any]:
     except Exception:
         return {"members": {}, "units": {}}
 
+def is_authorized_admin(member: discord.Member) -> bool:
+    return has_role_name(member, CEO_ROLE) or has_role_name(member, LYCAN_ROLE)
+
+def fmt_int(n: int) -> str:
+    return f"{n:,}"
+
+def payout_for(game: str, ap: int) -> Tuple[str, str]:
+    if game == GAME_EVE:
+        return (fmt_int(ap * EVE_ISK_PER_AP), "ISK")
+    if game == GAME_WOW:
+        return (fmt_int(ap * WOW_GOLD_PER_AP), "Gold")
+    return ("", "")
+
 async def ensure_hierarchy_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     ch = discord.utils.get(guild.text_channels, name=HIERARCHY_LOG_CH)
     if ch:
@@ -142,7 +171,7 @@ async def log_hierarchy_ap(
     await ch.send(prefix + message)
 
 # -------------------------
-# NEW: AP Distribution Log (embedded)
+# AP Distribution Log (embedded)
 # -------------------------
 async def ensure_ap_distribution_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     ch = discord.utils.get(guild.text_channels, name=AP_DISTRIBUTION_LOG_CH)
@@ -163,10 +192,6 @@ async def log_ap_distribution_embed(
     reason: Optional[str] = None,
     actor: Optional[discord.Member] = None,
 ) -> None:
-    """
-    Posts a single embed to #member-join-logs-points-distribute
-    for join bonus + manual /give_ap + video submission (or any other logged award).
-    """
     ch = await ensure_ap_distribution_channel(guild)
     if not ch:
         return
@@ -253,16 +278,6 @@ async def award_ap_with_bonuses(
     distribution_embed: bool = False,
     distribution_title: Optional[str] = None,
 ) -> None:
-    """
-    Adds base AP to earner, then distributes:
-      - Unit bonuses: for each higher tier in the same unit, 10% of base split equally among that tier
-      - CEO bonus: each CEO gets full 10% (NOT divided) when earner has ARC Security role (static role)
-    Bonuses do not cascade (they do not trigger further bonuses).
-
-    NEW:
-      - If distribution_embed=True, posts an embed to #member-join-logs-points-distribute
-        showing the base points given (not the downstream bonuses).
-    """
     if base_amount <= 0:
         return
 
@@ -307,7 +322,7 @@ async def award_ap_with_bonuses(
 
     await save(data)
 
-    # NEW: distribution embed (base award)
+    # Distribution embed (base award)
     if distribution_embed:
         await log_ap_distribution_embed(
             guild,
@@ -319,7 +334,7 @@ async def award_ap_with_bonuses(
             actor=actor,
         )
 
-    # 4) Logging (hierarchy log channel)
+    # Hierarchy log channel
     if log:
         lines = [
             f"AP base award: {earner.mention} **+{base_amount:.2f} AP** via **{source}**."
@@ -341,6 +356,111 @@ async def award_ap_with_bonuses(
             lines.append("CEO bonus: none (no CEO found).")
 
         await log_hierarchy_ap(guild, "\n".join(lines), mention_ids)
+
+# -------------------------
+# Reporting / Export Helpers
+# -------------------------
+def iter_member_records(data: Dict[str, Any]) -> List[Tuple[int, Dict[str, Any]]]:
+    """
+    Returns list of (member_id, record) for all non-meta records.
+    """
+    out: List[Tuple[int, Dict[str, Any]]] = []
+    for k, v in data.items():
+        if k == META_KEY:
+            continue
+        if not isinstance(v, dict):
+            continue
+        try:
+            uid = int(k)
+        except Exception:
+            continue
+        out.append((uid, v))
+    return out
+
+def build_ap_rows_by_game(
+    guild: discord.Guild,
+    data: Dict[str, Any],
+) -> Dict[str, List[List[str]]]:
+    """
+    Produces CSV rows grouped by game label.
+    Columns:
+      Discord Name, IGN, Game, AP, Payout Amount, Payout Currency
+    """
+    groups: Dict[str, List[List[str]]] = {
+        GAME_WOW: [],
+        GAME_EVE: [],
+        "Unclaimed / Unknown": []
+    }
+
+    for uid, rec in iter_member_records(data):
+        member = guild.get_member(uid)
+        if not member:
+            continue
+
+        ap_int = safe_int_ap(rec.get("ap", 0))
+        ign = (rec.get(CLAIM_IGN_KEY) or "").strip()
+        game = (rec.get(CLAIM_GAME_KEY) or "").strip()
+
+        if game not in (GAME_WOW, GAME_EVE):
+            game_label = "Unclaimed / Unknown"
+        else:
+            game_label = game
+
+        payout_amount, payout_currency = payout_for(game, ap_int)
+
+        groups[game_label].append([
+            member.display_name,
+            ign,
+            game if game else "",
+            str(ap_int),
+            payout_amount,
+            payout_currency
+        ])
+
+    # Sort each group: highest AP first, then name
+    for gname in list(groups.keys()):
+        groups[gname].sort(key=lambda r: (-safe_int_ap(r[3]), r[0].lower()))
+    return groups
+
+def render_grouped_csv(groups: Dict[str, List[List[str]]]) -> bytes:
+    """
+    CSV divided per game:
+      - World of Warcraft players
+      - blank line
+      - EVE Online players
+      - blank line
+      - Unclaimed / Unknown
+    """
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    header = ["Discord Name", "IGN (via /apclaim)", "Game", "AP", "Converted Amount", "Currency"]
+
+    def write_section(title: str, rows: List[List[str]]):
+        writer.writerow([title])
+        writer.writerow(header)
+        if rows:
+            writer.writerows(rows)
+        else:
+            writer.writerow(["(none)"])
+        writer.writerow([])  # blank line separator
+
+    write_section(GAME_WOW, groups.get(GAME_WOW, []))
+    write_section(GAME_EVE, groups.get(GAME_EVE, []))
+    write_section("Unclaimed / Unknown", groups.get("Unclaimed / Unknown", []))
+
+    return output.getvalue().encode("utf-8")
+
+async def wipe_ap_in_data(data: Dict[str, Any]) -> None:
+    """
+    Wipes AP balances for all users while preserving:
+      - join bonus flag (JOIN_BONUS_KEY)
+      - ign/game claim fields
+    Also clears last_chat timestamps to avoid immediate chat awards.
+    """
+    for _, rec in iter_member_records(data):
+        rec["ap"] = 0
+        rec["last_chat"] = None
 
 # -------------------------
 # Persistent View
@@ -404,6 +524,7 @@ class APTracking(commands.Cog):
         data = await load()
         meta = data.setdefault(META_KEY, {})
         gmeta = meta.setdefault(str(guild.id), {})
+        gmeta.setdefault(LAST_WIPE_KEY, gmeta.get(LAST_WIPE_KEY) or utcnow())
 
         embed = discord.Embed(
             title=AP_CHECK_EMBED_TITLE,
@@ -417,6 +538,7 @@ class APTracking(commands.Cog):
             try:
                 msg = await channel.fetch_message(int(msg_id))
                 await msg.edit(embed=embed, view=view)
+                await save(data)
                 return
             except Exception:
                 pass
@@ -431,18 +553,10 @@ class APTracking(commands.Cog):
         for g in self.bot.guilds:
             await self.ensure_ap_check_message(g)
             await ensure_hierarchy_log_channel(g)
-            # NEW: ensure distribution channel exists
             await ensure_ap_distribution_channel(g)
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
-        """
-        Awards a one-time 100 AP bonus when a member joins the server.
-        - Skips alt accounts under MIN_ACCOUNT_AGE_DAYS.
-        - Only awards once per user (even if they leave/rejoin).
-        - Does NOT trigger hierarchy/CEO bonuses (this is a join incentive, not an earn event).
-        Also posts an embed in #member-join-logs-points-distribute.
-        """
         if not isinstance(member, discord.Member) or member.bot:
             return
         if is_alt_account(member):
@@ -458,7 +572,6 @@ class APTracking(commands.Cog):
         rec[JOIN_BONUS_KEY] = True
         await save(data)
 
-        # NEW: distribution embed
         await log_ap_distribution_embed(
             member.guild,
             title="Join Bonus Awarded",
@@ -469,7 +582,6 @@ class APTracking(commands.Cog):
             actor=None
         )
 
-        # Optional: log to hierarchy log channel (public record)
         try:
             await log_hierarchy_ap(
                 member.guild,
@@ -556,6 +668,32 @@ class APTracking(commands.Cog):
     # -------------------------
     # Slash Commands
     # -------------------------
+    @app_commands.command(name="apclaim", description="Claim your IGN and game for AP exports.")
+    @app_commands.choices(game=[
+        app_commands.Choice(name=GAME_EVE, value=GAME_EVE),
+        app_commands.Choice(name=GAME_WOW, value=GAME_WOW),
+    ])
+    async def apclaim(
+        self,
+        interaction: discord.Interaction,
+        game: app_commands.Choice[str],
+        ign: app_commands.Range[str, 1, 64],
+    ):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
+            return
+
+        data = await load()
+        rec = data.setdefault(str(interaction.user.id), {"ap": 0, "last_chat": None})
+        rec[CLAIM_GAME_KEY] = game.value
+        rec[CLAIM_IGN_KEY] = ign.strip()
+        await save(data)
+
+        await interaction.response.send_message(
+            f"Saved your claim: **{game.value}** — IGN: **{ign.strip()}**.",
+            ephemeral=True
+        )
+
     @app_commands.command(name="give_ap", description="Give AP to a member (Lycan King only).")
     async def give_ap(
         self,
@@ -564,8 +702,8 @@ class APTracking(commands.Cog):
         amount: app_commands.Range[int, 1, 1_000_000],
         reason: str | None = None
     ):
-        if not has_role_name(interaction.user, LYCAN_ROLE):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member) or not has_role_name(interaction.user, LYCAN_ROLE):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
 
         await award_ap_with_bonuses(
@@ -593,8 +731,8 @@ class APTracking(commands.Cog):
         amount: app_commands.Range[int, 1, 1_000_000],
         reason: str | None = None
     ):
-        if not has_role_name(interaction.user, LYCAN_ROLE):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member) or not has_role_name(interaction.user, LYCAN_ROLE):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
 
         data = await load()
@@ -604,6 +742,178 @@ class APTracking(commands.Cog):
 
         await interaction.response.send_message(
             f"Removed **{amount} AP** from {member.mention}.",
+            ephemeral=True
+        )
+
+    @app_commands.command(name="transfer_ap", description="Transfer your own AP to another member (no bonuses).")
+    async def transfer_ap(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount: app_commands.Range[int, 1, 1_000_000],
+        reason: str | None = None
+    ):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
+            return
+
+        sender: discord.Member = interaction.user
+        recipient: discord.Member = member
+
+        if recipient.bot:
+            await interaction.response.send_message("You cannot transfer AP to a bot.", ephemeral=True)
+            return
+        if recipient.id == sender.id:
+            await interaction.response.send_message("You cannot transfer AP to yourself.", ephemeral=True)
+            return
+        if is_alt_account(sender):
+            await interaction.response.send_message("Transfers are not allowed from alt accounts.", ephemeral=True)
+            return
+
+        data = await load()
+        srec = data.setdefault(str(sender.id), {"ap": 0, "last_chat": None})
+        rrec = data.setdefault(str(recipient.id), {"ap": 0, "last_chat": None})
+
+        sender_ap = safe_float_ap(srec.get("ap", 0))
+        amt = float(amount)
+
+        if sender_ap < amt:
+            await interaction.response.send_message(
+                f"Insufficient AP. You have **{int(sender_ap)} AP**, tried to transfer **{amount} AP**.",
+                ephemeral=True
+            )
+            return
+
+        srec["ap"] = max(0.0, sender_ap - amt)
+        rrec["ap"] = safe_float_ap(rrec.get("ap", 0)) + amt
+        await save(data)
+
+        await log_ap_distribution_embed(
+            interaction.guild,
+            title="AP Transfer Received",
+            recipient=recipient,
+            amount=amt,
+            source="member transfer",
+            reason=(f"From {sender.display_name}" + (f" — {reason}" if reason else "")),
+            actor=sender
+        )
+
+        try:
+            msg_lines = [
+                f"AP transfer: {sender.mention} ➜ {recipient.mention} **{amt:.2f} AP**."
+            ]
+            if reason:
+                msg_lines.append(f"Reason: {reason}")
+            msg_lines.append(f"Sender new balance: **{safe_int_ap(srec.get('ap', 0))} AP**.")
+            msg_lines.append(f"Recipient new balance: **{safe_int_ap(rrec.get('ap', 0))} AP**.")
+            await log_hierarchy_ap(interaction.guild, "\n".join(msg_lines), [sender.id, recipient.id])
+        except Exception:
+            pass
+
+        await interaction.response.send_message(
+            f"{sender.mention} transferred **{amount} AP** to {recipient.mention}."
+            + (f" Reason: {reason}" if reason else "")
+        )
+
+    @app_commands.command(
+        name="ap_info",
+        description="Admin report: current AP per member since last wipe (CEO / Lycan King only)."
+    )
+    async def ap_info(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
+            return
+        if not is_authorized_admin(interaction.user):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        data = await load()
+        meta = data.get(META_KEY, {})
+        gmeta = meta.get(str(interaction.guild.id), {}) if isinstance(meta, dict) else {}
+        last_wipe = gmeta.get(LAST_WIPE_KEY) or "unknown"
+
+        groups = build_ap_rows_by_game(interaction.guild, data)
+        csv_bytes = render_grouped_csv(groups)
+
+        # Quick totals for the message
+        wow_total = sum(safe_int_ap(r[3]) for r in groups.get(GAME_WOW, []))
+        eve_total = sum(safe_int_ap(r[3]) for r in groups.get(GAME_EVE, []))
+        unk_total = sum(safe_int_ap(r[3]) for r in groups.get("Unclaimed / Unknown", []))
+        members_count = sum(len(v) for v in groups.values())
+
+        file = discord.File(io.BytesIO(csv_bytes), filename="ap_report.csv")
+
+        embed = discord.Embed(
+            title="AP Report (Since Last Wipe)",
+            description=(
+                f"Last wipe (UTC): **{last_wipe}**\n"
+                f"Members included: **{members_count}**\n\n"
+                f"{GAME_WOW}: **{wow_total} AP**\n"
+                f"{GAME_EVE}: **{eve_total} AP**\n"
+                f"Unclaimed / Unknown: **{unk_total} AP**"
+            ),
+            timestamp=datetime.datetime.utcnow()
+        )
+
+        await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+
+    @app_commands.command(
+        name="export_ap",
+        description="Backup AP, export report CSV, then wipe AP (CEO / Lycan King only)."
+    )
+    async def export_ap(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
+            return
+        if not is_authorized_admin(interaction.user):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        data = await load()
+
+        # Build CSV before wiping
+        groups = build_ap_rows_by_game(interaction.guild, data)
+        csv_bytes = render_grouped_csv(groups)
+
+        # Persist backup snapshot + csv to disk
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_json_path = EXPORT_DIR / f"ap_backup_{interaction.guild.id}_{ts}.json"
+        backup_csv_path = EXPORT_DIR / f"ap_export_{interaction.guild.id}_{ts}.csv"
+
+        try:
+            backup_json_path.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        except Exception:
+            pass
+
+        try:
+            backup_csv_path.write_bytes(csv_bytes)
+        except Exception:
+            pass
+
+        # Wipe AP
+        await wipe_ap_in_data(data)
+
+        # Update last wipe timestamp (per guild)
+        meta = data.setdefault(META_KEY, {})
+        gmeta = meta.setdefault(str(interaction.guild.id), {})
+        gmeta[LAST_WIPE_KEY] = utcnow()
+
+        await save(data)
+
+        # Log the wipe (hierarchy channel)
+        try:
+            await log_hierarchy_ap(
+                interaction.guild,
+                f"AP export + wipe executed by {interaction.user.mention}. Backup saved; AP balances reset to 0. Last wipe set to UTC {gmeta[LAST_WIPE_KEY]}.",
+                mention_ids=[interaction.user.id],
+            )
+        except Exception:
+            pass
+
+        file = discord.File(io.BytesIO(csv_bytes), filename=f"ap_export_{interaction.guild.id}_{ts}.csv")
+        await interaction.response.send_message(
+            content="Export complete. CSV attached. AP balances have been wiped.",
+            file=file,
             ephemeral=True
         )
 
