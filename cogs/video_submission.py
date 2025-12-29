@@ -26,7 +26,7 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 if not YOUTUBE_API_KEY:
     raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
 
-# Service account JSON from env (Railway/Replit variables)
+# Service account JSON from env (Railway Variables)
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -37,6 +37,7 @@ CEO_ROLE = "ARC Security Corporation Leader"
 DIRECTOR_ROLE = "ARC Security Administration Council"
 SECURITY_ROLE = "ARC Security"
 
+# Report command / automation restrictions
 LYCAN_ROLE = "Lycan King"
 REPORT_DM_USER_ID = 559041382573015060
 
@@ -288,21 +289,7 @@ async def post_points_distribution_confirmation(
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-
 def _parse_service_account_json(raw: str) -> dict:
-    """
-    Accepts:
-      1) Raw JSON text
-      2) A filesystem path to a JSON file
-      3) Base64 (standard or URL-safe) of the JSON (with or without padding)
-
-    Also normalizes literal '\\n' sequences into real newlines.
-    """
-    if not raw or not raw.strip():
-        raise RuntimeError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
-        )
-
     def _try_json(text: str) -> dict | None:
         try:
             return json.loads(text)
@@ -310,13 +297,14 @@ def _parse_service_account_json(raw: str) -> dict:
             return None
 
     normalized = raw.strip().replace("\\n", "\n")
+    parse_error = RuntimeError(
+        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
+    )
 
-    # 1) Raw JSON
     parsed = _try_json(normalized)
     if parsed is not None:
         return parsed
 
-    # 2) File path
     maybe_path = Path(normalized)
     if maybe_path.is_file():
         file_text = maybe_path.read_text(encoding="utf-8").replace("\\n", "\n")
@@ -324,43 +312,17 @@ def _parse_service_account_json(raw: str) -> dict:
         if parsed is not None:
             return parsed
 
-    # 3) Base64 (standard or URL-safe), tolerate missing padding
-    b64_candidate = normalized.strip()
-
-    # Remove common accidental wrappers
-    if (b64_candidate.startswith('"') and b64_candidate.endswith('"')) or (
-        b64_candidate.startswith("'") and b64_candidate.endswith("'")
-    ):
-        b64_candidate = b64_candidate[1:-1].strip()
-
-    def _decode_b64(s: str) -> str:
-        s2 = s.strip().replace("\n", "").replace("\r", "")
-        # Add padding if needed
-        pad = (-len(s2)) % 4
-        if pad:
-            s2 += "=" * pad
-        # Try URL-safe first, then standard
-        try:
-            return base64.urlsafe_b64decode(s2.encode("ascii")).decode("utf-8")
-        except Exception:
-            return base64.b64decode(s2.encode("ascii")).decode("utf-8")
-
     try:
-        decoded = _decode_b64(b64_candidate).replace("\\n", "\n")
+        decoded_bytes = base64.b64decode(normalized, validate=True)
+        decoded = decoded_bytes.decode("utf-8", errors="strict").replace("\\n", "\n")
     except Exception as e:
-        raise RuntimeError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. "
-            "Provide raw JSON text, a JSON file path, or base64-encoded JSON."
-        ) from e
+        raise parse_error from e
 
     parsed = _try_json(decoded)
     if parsed is not None:
         return parsed
 
-    raise RuntimeError(
-        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. "
-        "Provide raw JSON text, a JSON file path, or base64-encoded JSON."
-    )
+    raise parse_error
 
 # =====================
 # MODAL: REPORT DATES
@@ -380,7 +342,7 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
         max_length=10
     )
 
-    def __init__(self, cog: "VideoSubmission"):
+    def __init__(self, cog: "VideoSubmissionCog"):
         super().__init__()
         self.cog = cog
 
@@ -419,7 +381,7 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
 # =====================
 
 class ApprovalView(View):
-    def __init__(self, cog: "VideoSubmission", video_key: str):
+    def __init__(self, cog: "VideoSubmissionCog", video_key: str):
         super().__init__(timeout=None)
         self.cog = cog
         self.video_key = str(video_key)
@@ -444,11 +406,16 @@ class ApprovalView(View):
 # COG
 # =====================
 
-class VideoSubmission(commands.Cog):
+class VideoSubmissionCog(commands.Cog, name="VideoSubmissionCog"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
+
+        if not SERVICE_ACCOUNT_JSON:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
+            )
 
         creds_info = _parse_service_account_json(SERVICE_ACCOUNT_JSON)
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -523,10 +490,6 @@ class VideoSubmission(commands.Cog):
         sec = int(ms) / 1000
         return float(sec), title
 
-    # =====================
-    # MANUAL REPORT COMMAND
-    # =====================
-
     @app_commands.command(
         name="video_length_report",
         description="Report total submitted video length per member for a date range (YYYY-MM-DD)."
@@ -544,10 +507,6 @@ class VideoSubmission(commands.Cog):
             await interaction.response.send_modal(VideoLengthReportModal(self))
         except (discord.HTTPException, discord.NotFound):
             await safe_send(interaction, "❌ Could not open the report modal. Please try again.", ephemeral=True)
-
-    # =====================
-    # AUTO REPORT SCHEDULER
-    # =====================
 
     @tasks.loop(minutes=15)
     async def video_report_scheduler(self):
@@ -610,10 +569,6 @@ class VideoSubmission(commands.Cog):
     @video_report_scheduler.before_loop
     async def before_video_report_scheduler(self):
         await self.bot.wait_until_ready()
-
-    # =====================
-    # SUBMISSION / APPROVAL FLOW
-    # =====================
 
     @app_commands.command(name="submit_video", description="Submit a YouTube or Google Drive video for AP approval")
     @app_commands.describe(url="YouTube or Google Drive video URL")
@@ -782,7 +737,13 @@ class VideoSubmission(commands.Cog):
         )
 
 async def setup(bot: commands.Bot):
-    # Idempotent setup: prevents "Cog named ... already loaded"
-    if bot.get_cog("VideoSubmission") is not None:
-        return
-    await bot.add_cog(VideoSubmission(bot))
+    # HARD STOP: remove any old copies before adding (works even if something loads twice)
+    try:
+        if bot.get_cog("VideoSubmission"):
+            bot.remove_cog("VideoSubmission")
+        if bot.get_cog("VideoSubmissionCog"):
+            bot.remove_cog("VideoSubmissionCog")
+    except Exception:
+        pass
+
+    await bot.add_cog(VideoSubmissionCog(bot))
