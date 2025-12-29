@@ -364,10 +364,6 @@ def _parse_service_account_json(raw: str) -> dict:
     # Convert literal \n sequences to real newlines (private_key often stored this way)
     normalized = normalized.replace("\\n", "\n")
 
-    parse_error = RuntimeError(
-        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
-    )
-
     # 1) Raw JSON
     parsed = _try_json(normalized)
     if isinstance(parsed, dict):
@@ -391,27 +387,32 @@ def _parse_service_account_json(raw: str) -> dict:
             if isinstance(parsed2, dict):
                 return parsed2
 
-    # 3) Base64 JSON (allow whitespace/newlines)
+    # 3) Base64 JSON (whitespace/newlines allowed)
     b64_candidate = re.sub(r"\s+", "", normalized)
-    # base64 often includes = padding; allow it
+
+    # Quick sanity check: base64 charset only
     if re.fullmatch(r"[A-Za-z0-9+/=]+", b64_candidate or ""):
         try:
             decoded_bytes = base64.b64decode(b64_candidate, validate=False)
             decoded = decoded_bytes.decode("utf-8", errors="strict").replace("\\n", "\n")
+
             parsed = _try_json(decoded)
             if isinstance(parsed, dict):
                 return parsed
+
             if isinstance(parsed, str):
                 parsed2 = _try_json(parsed)
                 if isinstance(parsed2, dict):
                     return parsed2
         except Exception:
-            # fall through to final error
             pass
 
-    # Give a helpful snippet (won’t leak full key; just first few chars)
-    snippet = normalized[:40].replace("\n", "\\n")
-    raise RuntimeError(f"{parse_error} (value starts with: {snippet!r})")
+    snippet = normalized[:60].replace("\n", "\\n")
+    raise RuntimeError(
+        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. "
+        "Provide raw JSON text, a JSON file path, or base64-encoded JSON. "
+        f"(value starts with: {snippet!r})"
+    )
 
 
 # =====================
@@ -505,7 +506,7 @@ class VideoSubmissionCog(commands.Cog):
         # YouTube client
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
 
-        # Drive client from env JSON
+        # Drive client from env JSON (raw or base64 supported)
         creds_info = _parse_service_account_json(SERVICE_ACCOUNT_JSON)
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
