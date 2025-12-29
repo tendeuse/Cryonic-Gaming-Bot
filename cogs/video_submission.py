@@ -18,7 +18,7 @@ from discord.ui import View
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
-print("VIDEO_SUBMISSION LOADED VERSION: 2025-12-29-0445Z")
+print("VIDEO_SUBMISSION LOADED VERSION: 2025-12-29-2050Z")
 
 VIDEO_FILE = Path("data/video_submissions.json")
 AP_FILE = Path("data/ap_data.json")
@@ -59,7 +59,7 @@ async def maybe_await(result):
 
 async def safe_remove_cog(bot: commands.Bot, name: str) -> None:
     """
-    Discord.py variants differ: remove_cog may be sync or async.
+    discord.py variants differ: remove_cog may be sync or async.
     This helper works for both.
     """
     try:
@@ -338,8 +338,9 @@ def _parse_service_account_json(raw: str) -> dict:
     """
     Accepts:
       - Raw JSON object text
-      - JSON wrapped in quotes (common in env UIs)
-      - Double-encoded JSON (JSON string containing JSON)
+      - JSON with literal backslash escapes (e.g. '{\\n  "type": ... }')
+      - Double-encoded JSON (a JSON string that itself contains JSON)
+      - JSON wrapped in quotes
       - A file path to a JSON file
       - Base64-encoded JSON (whitespace/newlines allowed)
     """
@@ -350,64 +351,146 @@ def _parse_service_account_json(raw: str) -> dict:
         except Exception:
             return None
 
-    if not raw:
+    if not raw or not raw.strip():
         raise RuntimeError(
             "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
         )
 
+    s = raw.strip()
+
+    # 0) If it looks like base64, try it early (Railway often wraps long values)
+    b64_candidate = re.sub(r"\s+", "", s)
+    if re.fullmatch(r"[A-Za-z0-9+/=]+", b64_candidate or "") and len(b64_candidate) > 64:
+        try:
+            decoded = base64.b64decode(b64_candidate, validate=False).decode("utf-8", errors="strict")
+            j = _try_json(decoded)
+            if isinstance(j, dict):
+                return j
+            if isinstance(j, str):
+                j2 = _try_json(j)
+                if isinstance(j2, dict):
+                    return j2
+        except Exception:
+            pass  # fall through
+
+    # 1) Direct JSON
+    j = _try_json(s)
+    if isinstance(j, dict):
+        return j
+    if isinstance(j, str):
+        j2 = _try_json(j)
+        if isinstance(j2, dict):
+            return j2
+
+    # 2) Strip surrounding quotes (env UIs sometimes store it quoted)
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s2 = s[1:-1].strip()
+        j = _try_json(s2)
+        if isinstance(j, dict):
+            return j
+        if isinstance(j, str):
+            j2 = _try_json(j)
+            if isinstance(j2, dict):
+                return j2
+        s = s2  # keep going with unquoted
+
+    # 3) If it's a file path, read it
+    try:
+        p = Path(s)
+        if p.is_file():
+            file_text = p.read_text(encoding="utf-8").strip()
+            j = _try_json(file_text)
+            if isinstance(j, dict):
+                return j
+            if isinstance(j, str):
+                j2 = _try_json(j)
+                if isinstance(j2, dict):
+                    return j2
+            s = file_text  # continue attempts on file content
+    except Exception:
+        pass
+
+    # 4) Handle literal backslash escapes (your log shows '{\\n ...')
+    #    First pass: convert common sequences into real characters
+    s_esc = s.replace("\\r\\n", "\\n").replace("\\n", "\n").replace("\\r", "\r")
+
+    j = _try_json(s_esc)
+    if isinstance(j, dict):
+        return j
+    if isinstance(j, str):
+        j2 = _try_json(j)
+        if isinstance(j2, dict):
+            return j2
+
+    # 5) If it is STILL escaped, do a unicode-escape decode once (double-escaped case)
+    try:
+        # This turns sequences like \\n into \n, and \" into "
+        s_uni = s.encode("utf-8").decode("unicode_escape")
+        j = _try_json(s_uni)
+        if isinstance(j, dict):
+            return j
+        if isinstance(j, str):
+            j2 = _try_json(j)
+            if isinstance(j2, dict):
+                return j2
+    except Exception:
+        pass
+
+    snippet = s[:80].replace("\n", "\\n")
+    raise RuntimeError(
+        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text, a JSON file path, or base64-encoded JSON. "
+        f"(value starts with: {snippet!r})"
+    )
+
+
     normalized = raw.strip()
 
-    # If the env UI added surrounding quotes, strip them
+    # If the env UI added surrounding quotes, strip them (but keep internal escapes)
     if (normalized.startswith('"') and normalized.endswith('"')) or (normalized.startswith("'") and normalized.endswith("'")):
         normalized = normalized[1:-1].strip()
 
-    # Convert literal \n sequences to real newlines (private_key often stored this way)
-    normalized = normalized.replace("\\n", "\n")
-
-    # 1) Raw JSON
+    # 1) Raw JSON as-is
     parsed = _try_json(normalized)
     if isinstance(parsed, dict):
-        return parsed
+        return _postprocess(parsed)
 
     # 1b) Double-encoded: JSON string containing JSON
     if isinstance(parsed, str):
         parsed2 = _try_json(parsed)
         if isinstance(parsed2, dict):
-            return parsed2
+            return _postprocess(parsed2)
 
     # 2) File path to JSON
     maybe_path = Path(normalized)
     if maybe_path.is_file():
-        file_text = maybe_path.read_text(encoding="utf-8").strip().replace("\\n", "\n")
+        file_text = maybe_path.read_text(encoding="utf-8").strip()
         parsed = _try_json(file_text)
         if isinstance(parsed, dict):
-            return parsed
+            return _postprocess(parsed)
         if isinstance(parsed, str):
             parsed2 = _try_json(parsed)
             if isinstance(parsed2, dict):
-                return parsed2
+                return _postprocess(parsed2)
 
-    # 3) Base64 JSON (whitespace/newlines allowed)
+    # 3) Base64 JSON (allow whitespace/newlines)
     b64_candidate = re.sub(r"\s+", "", normalized)
-
-    # Quick sanity check: base64 charset only
     if re.fullmatch(r"[A-Za-z0-9+/=]+", b64_candidate or ""):
         try:
             decoded_bytes = base64.b64decode(b64_candidate, validate=False)
-            decoded = decoded_bytes.decode("utf-8", errors="strict").replace("\\n", "\n")
+            decoded_text = decoded_bytes.decode("utf-8", errors="strict").strip()
 
-            parsed = _try_json(decoded)
+            parsed = _try_json(decoded_text)
             if isinstance(parsed, dict):
-                return parsed
+                return _postprocess(parsed)
 
             if isinstance(parsed, str):
                 parsed2 = _try_json(parsed)
                 if isinstance(parsed2, dict):
-                    return parsed2
+                    return _postprocess(parsed2)
         except Exception:
             pass
 
-    snippet = normalized[:60].replace("\n", "\\n")
+    snippet = normalized[:80].replace("\n", "\\n")
     raise RuntimeError(
         "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. "
         "Provide raw JSON text, a JSON file path, or base64-encoded JSON. "
@@ -843,5 +926,6 @@ async def setup(bot: commands.Bot):
     # If an old cog was loaded (from an older build), remove it safely first.
     await safe_remove_cog(bot, "VideoSubmission")      # legacy name
     await safe_remove_cog(bot, "VideoSubmissionCog")   # current name
+    await safe_remove_cog(bot, "VideoSubmissionCog")   # idempotent
 
     await bot.add_cog(VideoSubmissionCog(bot))
