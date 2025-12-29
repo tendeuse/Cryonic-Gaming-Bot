@@ -22,7 +22,12 @@ REPORT_STATE_FILE = Path("data/video_report_state.json")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 if not YOUTUBE_API_KEY:
     raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
-GOOGLE_SERVICE_ACCOUNT_FILE = "service_account.json"
+
+# NEW: Service account JSON from env (Railway Variables)
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+if not SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set in environment variables.")
+
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 APPROVAL_CHANNEL = "video-submissions"
@@ -37,7 +42,7 @@ REPORT_DM_USER_ID = 559041382573015060
 
 AP_DISTRIBUTION_LOG_CH = "member-join-logs-points-distribute"
 
-# Your local timezone (per your environment requirement)
+# Your local timezone
 LOCAL_TZ = ZoneInfo("America/Moncton")
 
 file_lock = asyncio.Lock()
@@ -101,12 +106,18 @@ def yt_id(url: str):
     return m.group(1) if m else None
 
 def drive_id(url: str):
-    m = re.search(r"/d/([A-Za-z0-9_-]+)", url)
-    if m:
-        return m.group(1)
-    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
-    if m:
-        return m.group(1)
+    # Keep your original patterns, plus common Drive formats
+    patterns = [
+        r"/file/d/([A-Za-z0-9_-]+)",
+        r"/d/([A-Za-z0-9_-]+)",
+        r"[?&]id=([A-Za-z0-9_-]+)",
+        r"drive\.google\.com/open\?id=([A-Za-z0-9_-]+)",
+        r"drive\.google\.com/uc\?id=([A-Za-z0-9_-]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
     return None
 
 def fingerprint(platform: str, duration: float, title: str = ""):
@@ -206,7 +217,6 @@ async def build_video_length_report_embed(
         submitted_at = v.get("submitted_at")
         dt_utc = iso_to_dt_utc(submitted_at) if isinstance(submitted_at, str) else None
         if not dt_utc:
-            # Older entries created before "submitted_at" existed will not be counted in date-based reports.
             continue
 
         if dt_utc < start_utc or dt_utc > end_utc:
@@ -220,10 +230,8 @@ async def build_video_length_report_embed(
         totals[sid] = totals.get(sid, 0.0) + dur
         counts[sid] = counts.get(sid, 0) + 1
 
-    # Sort: most time first
     sorted_rows = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
 
-    # Build description lines
     lines: list[str] = []
     for sid, total_sec in sorted_rows:
         member_name = f"<@{sid}>"
@@ -233,7 +241,6 @@ async def build_video_length_report_embed(
                 member_name = f"{m.display_name} ({m.mention})"
         lines.append(f"• **{member_name}** — **{fmt_hms(total_sec)}** ({counts.get(sid, 0)} videos)")
 
-    # Range label in local time for readability
     start_local = start_utc.astimezone(LOCAL_TZ)
     end_local = end_utc.astimezone(LOCAL_TZ)
     range_label = f"{start_local.date().isoformat()} to {end_local.date().isoformat()} ({LOCAL_TZ.key})"
@@ -358,19 +365,11 @@ class ApprovalView(View):
             return False
         return True
 
-    @discord.ui.button(
-        label="✅ Approve",
-        style=discord.ButtonStyle.green,
-        custom_id="video:approve"
-    )
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id="video:approve")
     async def approve_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.process_decision(interaction, self.video_key, approve=True)
 
-    @discord.ui.button(
-        label="❌ Reject",
-        style=discord.ButtonStyle.red,
-        custom_id="video:reject"
-    )
+    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.red, custom_id="video:reject")
     async def reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.process_decision(interaction, self.video_key, approve=False)
 
@@ -382,11 +381,12 @@ class VideoSubmission(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # googleapiclient is blocking when calling .execute(), but you correctly run those in to_thread later.
+        # YouTube client
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
-        creds = service_account.Credentials.from_service_account_file(
-            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SCOPES
-        )
+
+        # NEW: Drive client from env JSON (no service_account.json file)
+        creds_info = json.loads(SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         self.video_report_scheduler.start()
@@ -410,7 +410,6 @@ class VideoSubmission(commands.Cog):
                 continue
             if v.get("approved") is None:
                 try:
-                    # Persistent view for each pending key
                     self.bot.add_view(ApprovalView(self, str(key)))
                 except Exception:
                     pass
@@ -424,17 +423,45 @@ class VideoSubmission(commands.Cog):
         title = item["snippet"]["title"]
         return float(seconds), str(title)
 
+    # NEW: robust Drive duration fetch (shortcut + mediaInfo fallback)
     def drive_duration_blocking(self, fid: str):
-        f = self.drive.files().get(fileId=fid, fields="name,videoMediaMetadata").execute()
+        def fetch(file_id: str):
+            return self.drive.files().get(
+                fileId=file_id,
+                fields="id,name,mimeType,size,videoMediaMetadata,mediaInfo,shortcutDetails"
+            ).execute()
+
+        f = fetch(fid)
+
+        # Resolve shortcuts
+        if f.get("mimeType") == "application/vnd.google-apps.shortcut":
+            sd = f.get("shortcutDetails") or {}
+            target_id = sd.get("targetId")
+            if not target_id:
+                raise ValueError("Drive link is a shortcut but has no targetId.")
+            f = fetch(target_id)
+
+        title = str(f.get("name", "Untitled"))
         vmeta = f.get("videoMediaMetadata") or {}
+        minfo = f.get("mediaInfo") or {}
+
         ms = vmeta.get("durationMillis")
         if ms is None:
-            raise ValueError("Drive file has no video duration metadata (not a video or not accessible).")
+            ms = minfo.get("durationMillis")
+
+        if ms is None:
+            mime = f.get("mimeType")
+            size = f.get("size")
+            raise ValueError(
+                f"No durationMillis returned. mimeType={mime}, size={size}. "
+                "Likely still processing, not a Drive-video, or service account lacks access."
+            )
+
         sec = int(ms) / 1000
-        return float(sec), str(f.get("name", "Untitled"))
+        return float(sec), title
 
     # =====================
-    # NEW: MANUAL REPORT COMMAND
+    # MANUAL REPORT COMMAND
     # =====================
 
     @app_commands.command(
@@ -453,7 +480,6 @@ class VideoSubmission(commands.Cog):
         try:
             await interaction.response.send_modal(VideoLengthReportModal(self))
         except (discord.HTTPException, discord.NotFound):
-            # Fallback if modal fails for any reason
             await safe_send(interaction, "❌ Could not open the report modal. Please try again.", ephemeral=True)
 
     # =====================
@@ -462,13 +488,6 @@ class VideoSubmission(commands.Cog):
 
     @tasks.loop(minutes=15)
     async def video_report_scheduler(self):
-        """
-        Runs frequently, but only sends reports on:
-          - Local day 16: range 2..15 of current month
-          - Local day 2 : range 16..1 spanning previous->current month
-        DMs the report to REPORT_DM_USER_ID.
-        Uses REPORT_STATE_FILE to prevent duplicates.
-        """
         try:
             state = await load(REPORT_STATE_FILE)
             if not isinstance(state, dict):
@@ -477,25 +496,20 @@ class VideoSubmission(commands.Cog):
             now_local = datetime.datetime.now(tz=LOCAL_TZ)
             day = now_local.day
 
-            # Only act on the 2nd and 16th (local date)
             if day not in (2, 16):
                 return
 
-            # De-dupe key by local date + type
             run_key = f"{now_local.date().isoformat()}-day{day}"
             if state.get(run_key) is True:
                 return
 
-            # Compute local date ranges
             if day == 16:
-                # 2nd -> 15th of current month
                 y = now_local.year
                 m = now_local.month
                 date_from = datetime.date(y, m, 2)
                 date_to = datetime.date(y, m, 15)
                 title_prefix = "Auto (2nd–15th)"
             else:
-                # day == 2: 16th of previous month -> 1st of current month
                 y = now_local.year
                 m = now_local.month
                 first_of_month = datetime.date(y, m, 1)
@@ -510,28 +524,24 @@ class VideoSubmission(commands.Cog):
             end_utc = end_local.astimezone(datetime.timezone.utc)
 
             embed = await build_video_length_report_embed(
-                guild=None,  # DM context: use mentions, not guild display names
+                guild=None,
                 start_utc=start_utc,
                 end_utc=end_utc,
                 title_prefix=title_prefix
             )
 
-            # DM target user
             user = await self.bot.fetch_user(REPORT_DM_USER_ID)
             if not user:
                 return
 
             await user.send(embed=embed)
 
-            # mark sent
             state[run_key] = True
             await save(REPORT_STATE_FILE, state)
 
         except discord.Forbidden:
-            # Cannot DM the user
             return
         except Exception:
-            # Avoid crashing the loop
             return
 
     @video_report_scheduler.before_loop
@@ -539,7 +549,7 @@ class VideoSubmission(commands.Cog):
         await self.bot.wait_until_ready()
 
     # =====================
-    # EXISTING: SUBMISSION / APPROVAL FLOW
+    # SUBMISSION / APPROVAL FLOW
     # =====================
 
     @app_commands.command(name="submit_video", description="Submit a YouTube or Google Drive video for AP approval")
@@ -571,7 +581,7 @@ class VideoSubmission(commands.Cog):
                 platform = "drive"
                 key = did
         except Exception as e:
-            await safe_send(interaction, f"❌ Could not read video data. ({type(e).__name__})", ephemeral=True)
+            await safe_send(interaction, f"❌ Could not read video data. ({type(e).__name__}: {e})", ephemeral=True)
             return
 
         fp = fingerprint(platform, seconds, title)
@@ -589,13 +599,11 @@ class VideoSubmission(commands.Cog):
             "ap": ap_reward,
             "fingerprint": fp,
             "approved": None,
-            # NEW: required for date-based reports
             "submitted_at": now_iso()
         }
 
         await save(VIDEO_FILE, videos)
 
-        # Register persistent view for this key
         try:
             self.bot.add_view(ApprovalView(self, str(key)))
         except Exception:
@@ -614,7 +622,6 @@ class VideoSubmission(commands.Cog):
         await safe_send(interaction, "✅ Video submitted for approval.", ephemeral=True)
 
     async def process_decision(self, interaction: discord.Interaction, key: str, approve: bool):
-        # ACK immediately
         await safe_defer(interaction, ephemeral=False)
 
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -674,7 +681,6 @@ class VideoSubmission(commands.Cog):
                 ts_iso=ts
             )
 
-        # mark decision + audit
         video["approved"] = bool(approve)
         audits[video["fingerprint"]] = {
             "video_key": key,
@@ -687,7 +693,6 @@ class VideoSubmission(commands.Cog):
         await save(VIDEO_FILE, videos)
         await save(AUDIT_FILE, audits)
 
-        # Update original approval message
         try:
             if interaction.message and interaction.message.embeds:
                 base = interaction.message.embeds[0]
