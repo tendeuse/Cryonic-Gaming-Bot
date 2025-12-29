@@ -374,6 +374,9 @@ class ApprovalView(View):
 # =====================
 
 class VideoSubmission(commands.Cog):
+    # Give this cog a unique name so it doesn't collide with the video_submission cog
+    __cog_name__ = "AlertSystem"
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
