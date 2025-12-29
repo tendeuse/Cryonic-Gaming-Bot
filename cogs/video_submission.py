@@ -292,30 +292,44 @@ async def post_points_distribution_confirmation(
         pass
 
 def _parse_service_account_json(raw: str) -> dict:
-    """
-    Accepts either:
-      - raw JSON text
-      - JSON with escaped newlines (common when pasted)
-      - base64 encoded JSON (optional)
-    """
-    s = raw.strip()
+    """Parse service account JSON provided directly, from a file, or as base64."""
 
-    # If it's quoted JSON or has escaped newlines, normalize a bit
-    s = s.replace("\\n", "\n")
+    def _try_json(text: str) -> dict | None:
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
 
-    # Try JSON directly
+    normalized = raw.strip().replace("\\n", "\n")
+    parse_error = RuntimeError(
+        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text or base64-encoded JSON."
+    )
+
+    # 1) Raw JSON (with escaped newlines normalized above)
+    parsed = _try_json(normalized)
+    if parsed is not None:
+        return parsed
+
+    # 2) Value is a filepath pointing to the JSON
+    maybe_path = Path(normalized)
+    if maybe_path.is_file():
+        file_text = maybe_path.read_text(encoding="utf-8").replace("\\n", "\n")
+        parsed = _try_json(file_text)
+        if parsed is not None:
+            return parsed
+
+    # 3) Base64-encoded JSON
     try:
-        return json.loads(s)
-    except Exception:
-        pass
-
-    # Try base64 decode -> JSON
-    try:
-        decoded = base64.b64decode(s).decode("utf-8")
-        decoded = decoded.replace("\\n", "\n").strip()
-        return json.loads(decoded)
+        decoded_bytes = base64.b64decode(normalized, validate=True)
+        decoded = decoded_bytes.decode("utf-8", errors="strict").replace("\\n", "\n")
     except Exception as e:
-        raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed as JSON or base64 JSON: {type(e).__name__}")
+        raise parse_error from e
+
+    parsed = _try_json(decoded)
+    if parsed is not None:
+        return parsed
+
+    raise parse_error
 
 # =====================
 # MODAL: REPORT DATES
