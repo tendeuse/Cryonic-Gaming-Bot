@@ -1,16 +1,19 @@
 import os
-import discord
-from discord.ext import commands, tasks
-from discord import app_commands
-from discord.ui import View
 import json
 import re
 import hashlib
 import datetime
 import isodate
 import asyncio
+import base64
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from discord.ui import View
+
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
@@ -23,10 +26,8 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 if not YOUTUBE_API_KEY:
     raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
 
-# NEW: Service account JSON from env (Railway Variables)
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-if not SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set in environment variables.")
+# Service account JSON from env (Railway Variables)
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -42,7 +43,6 @@ REPORT_DM_USER_ID = 559041382573015060
 
 AP_DISTRIBUTION_LOG_CH = "member-join-logs-points-distribute"
 
-# Your local timezone
 LOCAL_TZ = ZoneInfo("America/Moncton")
 
 file_lock = asyncio.Lock()
@@ -106,7 +106,6 @@ def yt_id(url: str):
     return m.group(1) if m else None
 
 def drive_id(url: str):
-    # Keep your original patterns, plus common Drive formats
     patterns = [
         r"/file/d/([A-Za-z0-9_-]+)",
         r"/d/([A-Za-z0-9_-]+)",
@@ -179,10 +178,6 @@ def fmt_hms(total_seconds: float) -> str:
     return f"{h}h {m:02d}m {sec:02d}s"
 
 def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.datetime, datetime.datetime] | None:
-    """
-    Accepts YYYY-MM-DD strings interpreted in LOCAL_TZ.
-    Returns (start_utc, end_utc) inclusive boundaries.
-    """
     try:
         df = datetime.date.fromisoformat(date_from)
         dt = datetime.date.fromisoformat(date_to)
@@ -193,7 +188,6 @@ def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.date
 
     start_local = datetime.datetime(df.year, df.month, df.day, 0, 0, 0, tzinfo=LOCAL_TZ)
     end_local = datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59, tzinfo=LOCAL_TZ)
-
     return (start_local.astimezone(datetime.timezone.utc), end_local.astimezone(datetime.timezone.utc))
 
 async def build_video_length_report_embed(
@@ -295,6 +289,41 @@ async def post_points_distribution_confirmation(
     except (discord.Forbidden, discord.HTTPException):
         pass
 
+def _parse_service_account_json(raw: str) -> dict:
+    def _try_json(text: str) -> dict | None:
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    normalized = raw.strip().replace("\\n", "\n")
+    parse_error = RuntimeError(
+        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
+    )
+
+    parsed = _try_json(normalized)
+    if parsed is not None:
+        return parsed
+
+    maybe_path = Path(normalized)
+    if maybe_path.is_file():
+        file_text = maybe_path.read_text(encoding="utf-8").replace("\\n", "\n")
+        parsed = _try_json(file_text)
+        if parsed is not None:
+            return parsed
+
+    try:
+        decoded_bytes = base64.b64decode(normalized, validate=True)
+        decoded = decoded_bytes.decode("utf-8", errors="strict").replace("\\n", "\n")
+    except Exception as e:
+        raise parse_error from e
+
+    parsed = _try_json(decoded)
+    if parsed is not None:
+        return parsed
+
+    raise parse_error
+
 # =====================
 # MODAL: REPORT DATES
 # =====================
@@ -313,7 +342,7 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
         max_length=10
     )
 
-    def __init__(self, cog: "VideoSubmission"):
+    def __init__(self, cog: "VideoSubmissionCog"):
         super().__init__()
         self.cog = cog
 
@@ -348,11 +377,11 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
             pass
 
 # =====================
-# APPROVAL VIEW (SAFE)
+# APPROVAL VIEW
 # =====================
 
 class ApprovalView(View):
-    def __init__(self, cog: "VideoSubmission", video_key: str):
+    def __init__(self, cog: "VideoSubmissionCog", video_key: str):
         super().__init__(timeout=None)
         self.cog = cog
         self.video_key = str(video_key)
@@ -377,15 +406,18 @@ class ApprovalView(View):
 # COG
 # =====================
 
-class VideoSubmission(commands.Cog):
+class VideoSubmissionCog(commands.Cog, name="VideoSubmissionCog"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # YouTube client
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
 
-        # NEW: Drive client from env JSON (no service_account.json file)
-        creds_info = json.loads(SERVICE_ACCOUNT_JSON)
+        if not SERVICE_ACCOUNT_JSON:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
+            )
+
+        creds_info = _parse_service_account_json(SERVICE_ACCOUNT_JSON)
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -423,7 +455,6 @@ class VideoSubmission(commands.Cog):
         title = item["snippet"]["title"]
         return float(seconds), str(title)
 
-    # NEW: robust Drive duration fetch (shortcut + mediaInfo fallback)
     def drive_duration_blocking(self, fid: str):
         def fetch(file_id: str):
             return self.drive.files().get(
@@ -433,7 +464,6 @@ class VideoSubmission(commands.Cog):
 
         f = fetch(fid)
 
-        # Resolve shortcuts
         if f.get("mimeType") == "application/vnd.google-apps.shortcut":
             sd = f.get("shortcutDetails") or {}
             target_id = sd.get("targetId")
@@ -460,10 +490,6 @@ class VideoSubmission(commands.Cog):
         sec = int(ms) / 1000
         return float(sec), title
 
-    # =====================
-    # MANUAL REPORT COMMAND
-    # =====================
-
     @app_commands.command(
         name="video_length_report",
         description="Report total submitted video length per member for a date range (YYYY-MM-DD)."
@@ -481,10 +507,6 @@ class VideoSubmission(commands.Cog):
             await interaction.response.send_modal(VideoLengthReportModal(self))
         except (discord.HTTPException, discord.NotFound):
             await safe_send(interaction, "❌ Could not open the report modal. Please try again.", ephemeral=True)
-
-    # =====================
-    # AUTO REPORT SCHEDULER
-    # =====================
 
     @tasks.loop(minutes=15)
     async def video_report_scheduler(self):
@@ -547,10 +569,6 @@ class VideoSubmission(commands.Cog):
     @video_report_scheduler.before_loop
     async def before_video_report_scheduler(self):
         await self.bot.wait_until_ready()
-
-    # =====================
-    # SUBMISSION / APPROVAL FLOW
-    # =====================
 
     @app_commands.command(name="submit_video", description="Submit a YouTube or Google Drive video for AP approval")
     @app_commands.describe(url="YouTube or Google Drive video URL")
@@ -719,4 +737,13 @@ class VideoSubmission(commands.Cog):
         )
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(VideoSubmission(bot))
+    # HARD STOP: remove any old copies before adding (works even if something loads twice)
+    try:
+        if bot.get_cog("VideoSubmission"):
+            bot.remove_cog("VideoSubmission")
+        if bot.get_cog("VideoSubmissionCog"):
+            bot.remove_cog("VideoSubmissionCog")
+    except Exception:
+        pass
+
+    await bot.add_cog(VideoSubmissionCog(bot))
