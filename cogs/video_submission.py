@@ -1,3 +1,4 @@
+print("VIDEO_SUBMISSION LOADED VERSION: 2025-12-29-0445Z")
 import os
 import json
 import re
