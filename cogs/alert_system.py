@@ -1,660 +1,703 @@
+import os
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
-from discord.ui import View, Button, Modal, TextInput
-from pathlib import Path
+from discord.ui import View
 import json
+import re
+import hashlib
 import datetime
+import isodate
 import asyncio
-from typing import Dict, Any, Optional, Set, List, Tuple
-import io
+from pathlib import Path
+from zoneinfo import ZoneInfo
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+
+VIDEO_FILE = Path("data/video_submissions.json")
+AP_FILE = Path("data/ap_data.json")
+AUDIT_FILE = Path("data/video_audit_log.json")
+REPORT_STATE_FILE = Path("data/video_report_state.json")
 
 # =====================
-# CONFIG
+# ENV VARS (Railway)
 # =====================
 
-CHANNEL_NAME = "wormhole-status"
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+if not YOUTUBE_API_KEY:
+    raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
 
-ARC_SECURITY_ROLE = "ARC Security"
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+if not SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set in environment variables.")
 
-ALERT_SEND_ROLES = {
-    "ARC Security Corporation Leader",
-    "ARC Security Administration Council",
-    "ARC General",
-}
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-DATA_FILE = Path("data/alert_system.json")
-DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+APPROVAL_CHANNEL = "video-submissions"
 
-# DM pacing / safety
-DM_DELAY_SECONDS = 1.2
-DM_FAIL_ABORT_THRESHOLD = 25
-DM_CONCURRENCY = 1
+CEO_ROLE = "ARC Security Corporation Leader"
+DIRECTOR_ROLE = "ARC Security Administration Council"
+SECURITY_ROLE = "ARC Security"
 
-# How many broadcasts to keep in storage
-MAX_BROADCAST_HISTORY = 250
+# Report command / automation restrictions
+LYCAN_ROLE = "Lycan King"
+REPORT_DM_USER_ID = 559041382573015060
+
+AP_DISTRIBUTION_LOG_CH = "member-join-logs-points-distribute"
+
+LOCAL_TZ = ZoneInfo("America/Moncton")
+
+file_lock = asyncio.Lock()
 
 # =====================
-# STORAGE HELPERS
+# UTILITIES
 # =====================
 
-def utcnow() -> datetime.datetime:
-    return datetime.datetime.utcnow()
-
-def utcnow_iso() -> str:
-    return utcnow().isoformat()
-
-def load_state() -> Dict[str, Any]:
-    if not DATA_FILE.exists():
-        return {
-            "opt_in": {},  # user_id -> {current: bool, opted_in_at, opted_out_at, username_last_seen}
-            "broadcasts": [],  # list of broadcasts with delivery logs
-            "status": {"value": "Normal", "updated_utc": None, "updated_by": None},
-            "panel_message_ids": {"alert": None, "status": None, "channel_id": None, "guild_id": None},
-        }
+def _load_file(p: Path):
     try:
-        s = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        if not p.exists():
+            return {}
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        s = {}
+        return {}
 
-    s.setdefault("opt_in", {})
-    s.setdefault("broadcasts", [])
-    s.setdefault("status", {"value": "Normal", "updated_utc": None, "updated_by": None})
-    s.setdefault("panel_message_ids", {"alert": None, "status": None, "channel_id": None, "guild_id": None})
-    return s
+def _save_file(p: Path, d):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(d, indent=4), encoding="utf-8")
 
-def save_state(state: Dict[str, Any]) -> None:
-    DATA_FILE.write_text(json.dumps(state, indent=4), encoding="utf-8")
+async def load(p: Path):
+    async with file_lock:
+        return _load_file(p)
 
-def clamp_history(broadcasts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if len(broadcasts) <= MAX_BROADCAST_HISTORY:
-        return broadcasts
-    return broadcasts[-MAX_BROADCAST_HISTORY:]
+async def save(p: Path, d):
+    async with file_lock:
+        _save_file(p, d)
 
-# =====================
-# PERMISSIONS
-# =====================
+def now_iso():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def has_any_role(member: discord.Member, role_names: set) -> bool:
-    return any(r.name in role_names for r in getattr(member, "roles", []))
-
-def has_role(member: discord.Member, role_name: str) -> bool:
-    return any(r.name == role_name for r in getattr(member, "roles", []))
-
-def require_alert_sender_roles():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not isinstance(interaction.user, discord.Member):
-            return False
-        return has_any_role(interaction.user, ALERT_SEND_ROLES)
-    return app_commands.check(predicate)
-
-# =====================
-# DATE PARSING (YYYY-MM-DD)
-# =====================
-
-def parse_yyyy_mm_dd(s: str) -> datetime.date:
+def iso_to_dt_utc(iso_str: str) -> datetime.datetime | None:
     try:
-        return datetime.date.fromisoformat(s)
-    except Exception:
-        raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-22).")
-
-def date_range_to_datetimes(d_from: datetime.date, d_to: datetime.date) -> Tuple[datetime.datetime, datetime.datetime]:
-    if d_to < d_from:
-        raise ValueError("End date must be on or after start date.")
-    start_dt = datetime.datetime.combine(d_from, datetime.time.min)
-    end_dt = datetime.datetime.combine(d_to, datetime.time.max)
-    return start_dt, end_dt
-
-def iso_to_dt(s: Optional[str]) -> Optional[datetime.datetime]:
-    if not s:
-        return None
-    try:
-        # handles "2025-12-22T12:34:56.123456"
-        return datetime.datetime.fromisoformat(s)
+        dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
     except Exception:
         return None
 
+def iso_to_discord_ts(iso_str: str) -> str:
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return f"<t:{int(dt.timestamp())}:f>"
+    except Exception:
+        return iso_str
+
+def is_manager(member: discord.Member) -> bool:
+    return any(r.name in (CEO_ROLE, DIRECTOR_ROLE) for r in member.roles)
+
+def can_run_video_report(member: discord.Member) -> bool:
+    return any(r.name in (CEO_ROLE, LYCAN_ROLE) for r in member.roles)
+
+def corp_ceos(guild: discord.Guild):
+    return [m for m in guild.members if any(r.name == CEO_ROLE for r in m.roles)]
+
+def yt_id(url: str):
+    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+def drive_id(url: str):
+    patterns = [
+        r"/file/d/([A-Za-z0-9_-]+)",
+        r"/d/([A-Za-z0-9_-]+)",
+        r"[?&]id=([A-Za-z0-9_-]+)",
+        r"drive\.google\.com/open\?id=([A-Za-z0-9_-]+)",
+        r"drive\.google\.com/uc\?id=([A-Za-z0-9_-]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+def fingerprint(platform: str, duration: float, title: str = ""):
+    base = f"{platform}:{round(duration)}:{title.lower().strip()}"
+    return hashlib.sha256(base.encode()).hexdigest()
+
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+async def safe_send(interaction: discord.Interaction, content: str, *, ephemeral: bool):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(content, ephemeral=ephemeral)
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+async def ensure_text_channel(guild: discord.Guild, name: str) -> discord.TextChannel | None:
+    ch = discord.utils.get(guild.text_channels, name=name)
+    if ch:
+        return ch
+    try:
+        return await guild.create_text_channel(name)
+    except discord.Forbidden:
+        return None
+
+def decision_embed(base: discord.Embed, *, approved: bool, decided_by: discord.Member, ts_iso: str) -> discord.Embed:
+    e = discord.Embed(title=base.title, description=base.description)
+    if base.footer and base.footer.text:
+        e.set_footer(text=base.footer.text)
+
+    for f in base.fields:
+        e.add_field(name=f.name, value=f.value, inline=f.inline)
+
+    status = "✅ Approved" if approved else "❌ Rejected"
+    e.add_field(name="Status", value=status, inline=True)
+    e.add_field(name="Decided By", value=decided_by.mention, inline=True)
+    e.add_field(name="Decided At", value=iso_to_discord_ts(ts_iso), inline=False)
+    return e
+
+def disable_view(view: View) -> View:
+    for item in view.children:
+        try:
+            item.disabled = True
+        except Exception:
+            pass
+    return view
+
+def fmt_hms(total_seconds: float) -> str:
+    s = int(round(total_seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h}h {m:02d}m {sec:02d}s"
+
+def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.datetime, datetime.datetime] | None:
+    try:
+        df = datetime.date.fromisoformat(date_from)
+        dt = datetime.date.fromisoformat(date_to)
+    except Exception:
+        return None
+    if dt < df:
+        return None
+
+    start_local = datetime.datetime(df.year, df.month, df.day, 0, 0, 0, tzinfo=LOCAL_TZ)
+    end_local = datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59, tzinfo=LOCAL_TZ)
+    return (start_local.astimezone(datetime.timezone.utc), end_local.astimezone(datetime.timezone.utc))
+
+async def build_video_length_report_embed(
+    *,
+    guild: discord.Guild | None,
+    start_utc: datetime.datetime,
+    end_utc: datetime.datetime,
+    title_prefix: str
+) -> discord.Embed:
+    videos = await load(VIDEO_FILE)
+    if not isinstance(videos, dict):
+        videos = {}
+
+    totals: dict[int, float] = {}
+    counts: dict[int, int] = {}
+
+    for _key, v in videos.items():
+        if not isinstance(v, dict):
+            continue
+
+        submitted_at = v.get("submitted_at")
+        dt_utc = iso_to_dt_utc(submitted_at) if isinstance(submitted_at, str) else None
+        if not dt_utc:
+            continue
+
+        if dt_utc < start_utc or dt_utc > end_utc:
+            continue
+
+        sid = int(v.get("submitter", 0) or 0)
+        dur = float(v.get("duration", 0) or 0)
+        if sid <= 0 or dur <= 0:
+            continue
+
+        totals[sid] = totals.get(sid, 0.0) + dur
+        counts[sid] = counts.get(sid, 0) + 1
+
+    sorted_rows = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+
+    lines: list[str] = []
+    for sid, total_sec in sorted_rows:
+        member_name = f"<@{sid}>"
+        if guild:
+            m = guild.get_member(sid)
+            if m:
+                member_name = f"{m.display_name} ({m.mention})"
+        lines.append(f"• **{member_name}** — **{fmt_hms(total_sec)}** ({counts.get(sid, 0)} videos)")
+
+    start_local = start_utc.astimezone(LOCAL_TZ)
+    end_local = end_utc.astimezone(LOCAL_TZ)
+    range_label = f"{start_local.date().isoformat()} to {end_local.date().isoformat()} ({LOCAL_TZ.key})"
+
+    e = discord.Embed(
+        title=f"{title_prefix} — Video Length Report",
+        description=f"**Range:** {range_label}\n\n" + ("\n".join(lines) if lines else "_No submissions found in this date range._"),
+        timestamp=datetime.datetime.utcnow()
+    )
+    e.set_footer(text="Totals are based on submitted_at timestamps recorded at submission time.")
+    return e
+
+async def post_points_distribution_confirmation(
+    guild: discord.Guild,
+    *,
+    submitter: discord.Member | None,
+    submitter_id: int,
+    title: str,
+    url: str,
+    seconds: float,
+    awarded_ap: int,
+    decided_by: discord.Member,
+    ceo_bonus_each: int,
+    ts_iso: str
+) -> None:
+    ch = await ensure_text_channel(guild, AP_DISTRIBUTION_LOG_CH)
+    if not ch:
+        return
+
+    recipient_mention = submitter.mention if submitter else f"<@{submitter_id}>"
+
+    e = discord.Embed(
+        title="Point Distribution Confirmation",
+        description="Video submission approved and AP distributed.",
+        timestamp=datetime.datetime.utcnow()
+    )
+    e.add_field(name="Recipient", value=f"{recipient_mention} (`{submitter_id}`)", inline=False)
+    e.add_field(name="Awarded AP", value=f"**+{awarded_ap} AP**", inline=True)
+    e.add_field(name="Rate", value="1000 AP / hour", inline=True)
+    e.add_field(name="Duration", value=f"{round(seconds / 3600, 2)} hours", inline=True)
+    e.add_field(name="Video Title", value=title[:256], inline=False)
+    e.add_field(name="URL", value=url, inline=False)
+
+    if ceo_bonus_each > 0:
+        e.add_field(name="CEO Bonus", value=f"**+{ceo_bonus_each} AP** to each CEO", inline=False)
+
+    e.add_field(name="Approved By", value=f"{decided_by.mention} (`{decided_by.id}`)", inline=False)
+    e.add_field(name="Approved At", value=iso_to_discord_ts(ts_iso), inline=False)
+
+    try:
+        await ch.send(embed=e)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
 # =====================
-# MODALS
+# MODAL: REPORT DATES
 # =====================
 
-class AlertMessageModal(Modal):
-    def __init__(self, cog: "AlertSystemCog"):
-        super().__init__(title="Send Alert to ARC Security (DM)")
+class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
+    date_from = discord.ui.TextInput(
+        label="From date (YYYY-MM-DD)",
+        placeholder="2025-12-02",
+        required=True,
+        max_length=10
+    )
+    date_to = discord.ui.TextInput(
+        label="To date (YYYY-MM-DD)",
+        placeholder="2025-12-15",
+        required=True,
+        max_length=10
+    )
+
+    def __init__(self, cog: "VideoSubmission"):
+        super().__init__()
         self.cog = cog
-        self.msg = TextInput(
-            label="Alert message",
-            placeholder="Keep it short, clear, and operational.",
-            required=True,
-            max_length=1500,
-            style=discord.TextStyle.paragraph,
-        )
-        self.add_item(self.msg)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await self.cog.handle_send_alert(interaction, str(self.msg.value))
+        await safe_defer(interaction, ephemeral=True)
+
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await safe_send(interaction, "❌ This must be used in a server.", ephemeral=True)
+            return
+
+        if not can_run_video_report(interaction.user):
+            await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
+            return
+
+        rng = date_str_to_local_range(str(self.date_from).strip(), str(self.date_to).strip())
+        if not rng:
+            await safe_send(interaction, "❌ Invalid dates. Use YYYY-MM-DD, and ensure To ≥ From.", ephemeral=True)
+            return
+
+        start_utc, end_utc = rng
+        embed = await build_video_length_report_embed(
+            guild=interaction.guild,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            title_prefix="Manual"
+        )
+
+        await safe_send(interaction, "✅ Report generated:", ephemeral=True)
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 # =====================
-# VIEWS
+# APPROVAL VIEW (SAFE)
 # =====================
 
-class AlertPanelView(View):
-    def __init__(self, cog: "AlertSystemCog"):
+class ApprovalView(View):
+    def __init__(self, cog: "VideoSubmission", video_key: str):
         super().__init__(timeout=None)
         self.cog = cog
+        self.video_key = str(video_key)
 
-    @discord.ui.button(label="Alert", style=discord.ButtonStyle.danger, custom_id="arc_alert:send")
-    async def alert_send(self, interaction: discord.Interaction, button: Button):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
-            return
-        if not has_any_role(interaction.user, ALERT_SEND_ROLES):
-            await interaction.response.send_message("You do not have permission to send alerts.", ephemeral=True)
-            return
+            return False
+        if not is_manager(interaction.user):
+            await safe_send(interaction, "❌ Only the CEO and Directors can approve/reject videos.", ephemeral=True)
+            return False
+        return True
 
-        await interaction.response.send_modal(AlertMessageModal(self.cog))
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id="video:approve")
+    async def approve_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.process_decision(interaction, self.video_key, approve=True)
 
-    @discord.ui.button(label="Enable DMs", style=discord.ButtonStyle.success, custom_id="arc_alert:optin")
-    async def opt_in(self, interaction: discord.Interaction, button: Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
-            return
-        if not has_role(interaction.user, ARC_SECURITY_ROLE):
-            await interaction.response.send_message(f"Only members with `{ARC_SECURITY_ROLE}` can opt in.", ephemeral=True)
-            return
-
-        self.cog.set_opt_in(interaction.user, True)
-        await interaction.response.send_message("You are now opted-in to ARC Security DM alerts.", ephemeral=True)
-
-    @discord.ui.button(label="Disable DMs", style=discord.ButtonStyle.secondary, custom_id="arc_alert:optout")
-    async def opt_out(self, interaction: discord.Interaction, button: Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
-            return
-        if not has_role(interaction.user, ARC_SECURITY_ROLE):
-            await interaction.response.send_message(f"Only members with `{ARC_SECURITY_ROLE}` can opt out.", ephemeral=True)
-            return
-
-        self.cog.set_opt_in(interaction.user, False)
-        await interaction.response.send_message("You are now opted-out of ARC Security DM alerts.", ephemeral=True)
-
-class WormholeStatusView(View):
-    def __init__(self, cog: "AlertSystemCog"):
-        super().__init__(timeout=None)
-        self.cog = cog
-
-    async def _set(self, interaction: discord.Interaction, value: str):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
-            return
-        if not has_any_role(interaction.user, ALERT_SEND_ROLES):
-            await interaction.response.send_message("You do not have permission to update wormhole status.", ephemeral=True)
-            return
-
-        self.cog.set_status(value, f"{interaction.user} (ID: {interaction.user.id})")
-        await self.cog.refresh_status_panel(interaction.guild)
-        await interaction.response.send_message(f"Wormhole status set to `{value}`.", ephemeral=True)
-
-    @discord.ui.button(label="Normal", style=discord.ButtonStyle.success, custom_id="wh_status:normal")
-    async def normal(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Normal")
-
-    @discord.ui.button(label="Dangerous", style=discord.ButtonStyle.primary, custom_id="wh_status:dangerous")
-    async def dangerous(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Dangerous")
-
-    @discord.ui.button(label="Enemy Fleet Spotted", style=discord.ButtonStyle.danger, custom_id="wh_status:enemy")
-    async def enemy(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Enemy Fleet Spotted")
-
-    @discord.ui.button(label="Lock-down", style=discord.ButtonStyle.secondary, custom_id="wh_status:lockdown")
-    async def lockdown(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Lock-down")
-
-    @discord.ui.button(label="Under attack", style=discord.ButtonStyle.danger, custom_id="wh_status:attack")
-    async def attack(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Under attack")
+    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.red, custom_id="video:reject")
+    async def reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.process_decision(interaction, self.video_key, approve=False)
 
 # =====================
 # COG
 # =====================
 
-class AlertReportMode(app_commands.Transform, str):
-    """
-    Placeholder for clarity. We'll use a Choice parameter instead.
-    """
-    pass
-
-class AlertSystemCog(commands.Cog):
+class VideoSubmission(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.state = load_state()
 
-        self.bot.add_view(AlertPanelView(self))
-        self.bot.add_view(WormholeStatusView(self))
+        self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
 
-        self._send_lock = asyncio.Lock()
+        # NEW: Build creds from env var JSON, not a file
+        creds_info = json.loads(SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 
-    # -------- Storage ops --------
+        self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    def opt_in_records(self) -> Dict[str, Any]:
-        return self.state.get("opt_in", {}) or {}
+        self.video_report_scheduler.start()
 
-    def is_opted_in(self, user_id: int) -> bool:
-        rec = self.opt_in_records().get(str(user_id))
-        return bool(rec and rec.get("current") is True)
+    async def cog_load(self):
+        await self._restore_pending_views()
 
-    def set_opt_in(self, member: discord.Member, enabled: bool):
-        recs = self.opt_in_records()
-        uid = str(member.id)
-        now = utcnow_iso()
-
-        rec = recs.get(uid) or {
-            "current": False,
-            "opted_in_at": None,
-            "opted_out_at": None,
-            "username_last_seen": str(member),
-        }
-
-        rec["username_last_seen"] = str(member)
-        if enabled:
-            if rec.get("current") is not True:
-                rec["current"] = True
-                rec["opted_in_at"] = now
-            # do not clear opted_out_at; keep audit history
-        else:
-            if rec.get("current") is True:
-                rec["current"] = False
-                rec["opted_out_at"] = now
-
-        recs[uid] = rec
-        self.state["opt_in"] = recs
-        save_state(self.state)
-
-    def set_status(self, value: str, updated_by: str):
-        self.state["status"] = {"value": value, "updated_utc": utcnow_iso(), "updated_by": updated_by}
-        save_state(self.state)
-
-    def add_broadcast(self, broadcast: Dict[str, Any]):
-        b = self.state.get("broadcasts", []) or []
-        b.append(broadcast)
-        self.state["broadcasts"] = clamp_history(b)
-        save_state(self.state)
-
-    # -------- Channel / Panels --------
-
-    async def ensure_channel(self, guild: discord.Guild) -> discord.TextChannel:
-        ch = discord.utils.get(guild.text_channels, name=CHANNEL_NAME)
-        if ch:
-            return ch
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(send_messages=False, add_reactions=False),
-            guild.me: discord.PermissionOverwrite(send_messages=True, embed_links=True, read_messages=True),
-        }
-        return await guild.create_text_channel(CHANNEL_NAME, overwrites=overwrites, reason="Wormhole status channel")
-
-    def build_alert_panel_embed(self, guild: discord.Guild) -> discord.Embed:
-        # Count opted-in among ARC Security members (best effort)
-        role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
-        opted_in_count = 0
-        if role:
-            for m in role.members:
-                if not m.bot and self.is_opted_in(m.id):
-                    opted_in_count += 1
-
-        emb = discord.Embed(
-            title="ARC Security Alert System",
-            description=(
-                "**Leadership:** Use `Alert` to DM an operational alert.\n"
-                f"**Recipients:** Members with `{ARC_SECURITY_ROLE}` who have opted in.\n\n"
-                f"**Opted-in recipients (current):** `{opted_in_count}`\n"
-            ),
-            timestamp=utcnow(),
-        )
-        emb.set_footer(text="Cryonic Gaming bot — Alerts")
-        return emb
-
-    def build_status_embed(self) -> discord.Embed:
-        st = self.state.get("status", {}) or {}
-        value = st.get("value", "Normal")
-        updated_utc = st.get("updated_utc") or "Never"
-        updated_by = st.get("updated_by") or "N/A"
-
-        emb = discord.Embed(
-            title="Wormhole Status",
-            description=(
-                f"**Current Status:** `{value}`\n"
-                f"**Last Updated (UTC):** `{updated_utc}`\n"
-                f"**Updated By:** `{updated_by}`\n"
-            ),
-            timestamp=utcnow(),
-        )
-        emb.set_footer(text="Cryonic Gaming bot — Wormhole Status")
-        return emb
-
-    async def upsert_panels(self, guild: discord.Guild):
-        ch = await self.ensure_channel(guild)
-
-        panel_ids = self.state.get("panel_message_ids", {}) or {}
-        alert_msg_id = panel_ids.get("alert")
-        status_msg_id = panel_ids.get("status")
-
-        alert_embed = self.build_alert_panel_embed(guild)
-        if alert_msg_id:
-            try:
-                msg = await ch.fetch_message(int(alert_msg_id))
-                await msg.edit(embed=alert_embed, view=AlertPanelView(self))
-            except Exception:
-                msg = await ch.send(embed=alert_embed, view=AlertPanelView(self))
-                alert_msg_id = msg.id
-        else:
-            msg = await ch.send(embed=alert_embed, view=AlertPanelView(self))
-            alert_msg_id = msg.id
-
-        status_embed = self.build_status_embed()
-        if status_msg_id:
-            try:
-                msg2 = await ch.fetch_message(int(status_msg_id))
-                await msg2.edit(embed=status_embed, view=WormholeStatusView(self))
-            except Exception:
-                msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
-                status_msg_id = msg2.id
-        else:
-            msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
-            status_msg_id = msg2.id
-
-        self.state["panel_message_ids"] = {
-            "guild_id": guild.id,
-            "channel_id": ch.id,
-            "alert": alert_msg_id,
-            "status": status_msg_id,
-        }
-        save_state(self.state)
-
-    async def refresh_status_panel(self, guild: discord.Guild):
-        panel_ids = self.state.get("panel_message_ids", {}) or {}
-        channel_id = panel_ids.get("channel_id")
-        status_msg_id = panel_ids.get("status")
-        if not channel_id or not status_msg_id:
-            return
-        ch = guild.get_channel(int(channel_id))
-        if not isinstance(ch, discord.TextChannel):
-            return
+    def cog_unload(self):
         try:
-            msg = await ch.fetch_message(int(status_msg_id))
-            await msg.edit(embed=self.build_status_embed(), view=WormholeStatusView(self))
+            self.video_report_scheduler.cancel()
         except Exception:
             pass
 
-    # -------- Alert broadcast --------
-
-    async def handle_send_alert(self, interaction: discord.Interaction, message: str):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
-            return
-        if not has_any_role(interaction.user, ALERT_SEND_ROLES):
-            await interaction.response.send_message("You do not have permission to send alerts.", ephemeral=True)
+    async def _restore_pending_views(self):
+        videos = await load(VIDEO_FILE)
+        if not isinstance(videos, dict):
             return
 
-        guild = interaction.guild
-        role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
-        if role is None:
-            await interaction.response.send_message(f"Role `{ARC_SECURITY_ROLE}` not found.", ephemeral=True)
-            return
-
-        # recipients: ARC Security, opted in, not bots
-        recipients: List[discord.Member] = []
-        for m in role.members:
-            if m.bot:
+        for key, v in videos.items():
+            if not isinstance(v, dict):
                 continue
-            # update username_last_seen (audit)
-            recs = self.opt_in_records()
-            if str(m.id) in recs:
-                recs[str(m.id)]["username_last_seen"] = str(m)
-                self.state["opt_in"] = recs
-            if self.is_opted_in(m.id):
-                recipients.append(m)
-        save_state(self.state)
+            if v.get("approved") is None:
+                try:
+                    self.bot.add_view(ApprovalView(self, str(key)))
+                except Exception:
+                    pass
 
-        if not recipients:
-            await interaction.response.send_message(
-                f"No opted-in members found in `{ARC_SECURITY_ROLE}`. They must click `Enable DMs` first.",
-                ephemeral=True,
+    def youtube_data_blocking(self, vid: str):
+        r = self.youtube.videos().list(part="contentDetails,snippet", id=vid).execute()
+        if not r.get("items"):
+            raise ValueError("YouTube video not found or not accessible.")
+        item = r["items"][0]
+        seconds = isodate.parse_duration(item["contentDetails"]["duration"]).total_seconds()
+        title = item["snippet"]["title"]
+        return float(seconds), str(title)
+
+    # NEW: robust Drive duration fetch + helpful error message
+    def drive_duration_blocking(self, fid: str):
+        def fetch(file_id: str):
+            return self.drive.files().get(
+                fileId=file_id,
+                fields="id,name,mimeType,size,videoMediaMetadata,mediaInfo,shortcutDetails"
+            ).execute()
+
+        f = fetch(fid)
+
+        # Resolve shortcuts
+        if f.get("mimeType") == "application/vnd.google-apps.shortcut":
+            sd = f.get("shortcutDetails") or {}
+            target_id = sd.get("targetId")
+            if not target_id:
+                raise ValueError("Drive link is a shortcut but has no targetId.")
+            f = fetch(target_id)
+
+        title = str(f.get("name", "Untitled"))
+        vmeta = f.get("videoMediaMetadata") or {}
+        minfo = f.get("mediaInfo") or {}
+
+        ms = vmeta.get("durationMillis")
+        if ms is None:
+            ms = minfo.get("durationMillis")
+
+        if ms is None:
+            mime = f.get("mimeType")
+            size = f.get("size")
+            raise ValueError(
+                f"No durationMillis returned. mimeType={mime}, size={size}. "
+                "Likely still processing, not a Drive-video, or service account lacks access."
             )
-            return
 
-        await interaction.response.send_message(
-            f"Sending alert to `{len(recipients)}` opted-in `{ARC_SECURITY_ROLE}` members...",
-            ephemeral=True,
-        )
+        sec = int(ms) / 1000
+        return float(sec), title
 
-        dm_embed = discord.Embed(
-            title="ARC Security Alert",
-            description=message,
-            timestamp=utcnow(),
-        )
-        dm_embed.add_field(name="Sent By", value=f"{interaction.user} (ID: {interaction.user.id})", inline=False)
-        dm_embed.add_field(name="Server", value=guild.name, inline=False)
-        dm_embed.set_footer(text="Cryonic Gaming bot — Alerts")
-
-        broadcast_id = utcnow_iso()
-        deliveries: List[Dict[str, Any]] = []
-
-        async with self._send_lock:
-            sem = asyncio.Semaphore(DM_CONCURRENCY)
-            sent = 0
-            failed = 0
-
-            async def send_one(member: discord.Member):
-                nonlocal sent, failed
-                async with sem:
-                    try:
-                        await member.send(embed=dm_embed)
-                        sent += 1
-                        deliveries.append({
-                            "user_id": member.id,
-                            "username": str(member),
-                            "sent_utc": utcnow_iso(),
-                        })
-                    except discord.Forbidden:
-                        failed += 1
-                    except discord.HTTPException:
-                        failed += 1
-                    await asyncio.sleep(DM_DELAY_SECONDS)
-
-            for member in recipients:
-                await send_one(member)
-                if failed >= DM_FAIL_ABORT_THRESHOLD:
-                    break
-
-        # Persist broadcast log
-        self.add_broadcast({
-            "broadcast_id": broadcast_id,
-            "created_utc": broadcast_id,
-            "sender": f"{interaction.user} (ID: {interaction.user.id})",
-            "guild_id": guild.id,
-            "message_excerpt": (message[:200] + "…") if len(message) > 200 else message,
-            "recipient_target_count": len(recipients),
-            "delivered_count": len(deliveries),
-            "deliveries": deliveries,  # successful only (as requested)
-            "aborted_due_to_failures": failed >= DM_FAIL_ABORT_THRESHOLD,
-            "fail_count": failed,
-        })
-
-        # Summary in channel
-        try:
-            ch = await self.ensure_channel(guild)
-            summary = discord.Embed(
-                title="Alert Dispatch Summary",
-                description=(
-                    f"**Sender:** {interaction.user.mention}\n"
-                    f"**Recipients (opted-in target):** `{len(recipients)}`\n"
-                    f"**Delivered (successful):** `{len(deliveries)}`\n"
-                    f"**Failed (DMs closed / errors):** `{failed}`\n"
-                    f"**Broadcast ID (UTC):** `{broadcast_id}`"
-                ),
-                timestamp=utcnow(),
-            )
-            await ch.send(embed=summary)
-        except Exception:
-            pass
-
-        await self.upsert_panels(guild)
-
-    # =====================
-    # REPORT GENERATION
-    # =====================
-
-    def _format_opt_in_report_lines(self) -> List[str]:
-        recs = self.opt_in_records()
-        lines = []
-        for uid, rec in recs.items():
-            lines.append(
-                f"{rec.get('username_last_seen','unknown')} | ID={uid} | "
-                f"current={rec.get('current')} | opted_in_at={rec.get('opted_in_at')} | opted_out_at={rec.get('opted_out_at')}"
-            )
-        lines.sort()
-        return lines
-
-    def _filter_broadcasts_by_range(self, start_dt: datetime.datetime, end_dt: datetime.datetime) -> List[Dict[str, Any]]:
-        out = []
-        for b in (self.state.get("broadcasts", []) or []):
-            dt = iso_to_dt(b.get("created_utc"))
-            if not dt:
-                continue
-            if start_dt <= dt <= end_dt:
-                out.append(b)
-        return out
-
-    def _build_broadcast_text(self, b: Dict[str, Any], include_deliveries: bool = True) -> str:
-        lines = []
-        lines.append(f"Broadcast ID (UTC): {b.get('broadcast_id')}")
-        lines.append(f"Created UTC: {b.get('created_utc')}")
-        lines.append(f"Sender: {b.get('sender')}")
-        lines.append(f"Target recipients (opted-in): {b.get('recipient_target_count')}")
-        lines.append(f"Delivered (successful): {b.get('delivered_count')}")
-        lines.append(f"Failures: {b.get('fail_count')} | Aborted: {b.get('aborted_due_to_failures')}")
-        lines.append(f"Message excerpt: {b.get('message_excerpt')}")
-        lines.append("")
-        if include_deliveries:
-            lines.append("Successful deliveries:")
-            deliveries = b.get("deliveries", []) or []
-            for d in deliveries:
-                lines.append(f"  - {d.get('username')} (ID: {d.get('user_id')}) @ {d.get('sent_utc')} UTC")
-        return "\n".join(lines)
-
-    async def _send_report(self, interaction: discord.Interaction, title: str, body_text: str):
-        """
-        If body is too long for an embed, attach as file.
-        """
-        # Discord embed description limit ~4096
-        if len(body_text) <= 3500:
-            emb = discord.Embed(
-                title=title,
-                description=body_text,
-                timestamp=utcnow(),
-            )
-            await interaction.response.send_message(embed=emb, ephemeral=True)
-            return
-
-        # Otherwise, file attachment
-        fp = io.StringIO(body_text)
-        data = fp.getvalue().encode("utf-8")
-        file = discord.File(io.BytesIO(data), filename="alert_report.txt")
-        emb = discord.Embed(
-            title=title,
-            description="Report is attached as a text file (too long for an embed).",
-            timestamp=utcnow(),
-        )
-        await interaction.response.send_message(embed=emb, file=file, ephemeral=True)
-
-    # =====================
-    # SLASH COMMANDS
-    # =====================
-
-    @app_commands.command(name="alert_setup", description="Post/refresh the alert and wormhole status panels in #wormhole-status.")
-    @require_alert_sender_roles()
-    async def alert_setup(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
-            return
-        await self.upsert_panels(interaction.guild)
-        await interaction.response.send_message("Panels posted/refreshed in #wormhole-status.", ephemeral=True)
-
-    @app_commands.command(name="alert_report", description="Generate alert delivery + opt-in audit report.")
-    @require_alert_sender_roles()
-    @app_commands.choices(
-        mode=[
-            app_commands.Choice(name="last_sent", value="last_sent"),
-            app_commands.Choice(name="timeframe", value="timeframe"),
-        ]
+    @app_commands.command(
+        name="video_length_report",
+        description="Report total submitted video length per member for a date range (YYYY-MM-DD)."
     )
-    async def alert_report(
-        self,
-        interaction: discord.Interaction,
-        mode: app_commands.Choice[str],
-        date_from: Optional[str] = None,  # YYYY-MM-DD
-        date_to: Optional[str] = None,    # YYYY-MM-DD
-        include_opt_in_audit: Optional[bool] = True,
-    ):
-        """
-        mode=last_sent: ignores date_from/date_to
-        mode=timeframe: requires date_from/date_to (YYYY-MM-DD)
-        """
-        broadcasts = self.state.get("broadcasts", []) or []
-
-        if mode.value == "last_sent":
-            if not broadcasts:
-                await interaction.response.send_message("No broadcasts have been sent yet.", ephemeral=True)
-                return
-            b = broadcasts[-1]
-            text = self._build_broadcast_text(b, include_deliveries=True)
-
-            if include_opt_in_audit:
-                text += "\n\n---\nOpt-in audit (current + timestamps):\n"
-                text += "\n".join(self._format_opt_in_report_lines())
-
-            await self._send_report(interaction, "Alert Report — Last Sent", text)
+    async def video_length_report(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await safe_send(interaction, "❌ This command must be used in a server.", ephemeral=True)
             return
 
-        # timeframe mode
-        if not date_from or not date_to:
-            await interaction.response.send_message(
-                "For timeframe reports, provide both `date_from` and `date_to` in YYYY-MM-DD format.",
-                ephemeral=True,
-            )
+        if not can_run_video_report(interaction.user):
+            await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
             return
 
         try:
-            d_from = parse_yyyy_mm_dd(date_from)
-            d_to = parse_yyyy_mm_dd(date_to)
-            start_dt, end_dt = date_range_to_datetimes(d_from, d_to)
-        except ValueError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await interaction.response.send_modal(VideoLengthReportModal(self))
+        except (discord.HTTPException, discord.NotFound):
+            await safe_send(interaction, "❌ Could not open the report modal. Please try again.", ephemeral=True)
+
+    @tasks.loop(minutes=15)
+    async def video_report_scheduler(self):
+        try:
+            state = await load(REPORT_STATE_FILE)
+            if not isinstance(state, dict):
+                state = {}
+
+            now_local = datetime.datetime.now(tz=LOCAL_TZ)
+            day = now_local.day
+
+            if day not in (2, 16):
+                return
+
+            run_key = f"{now_local.date().isoformat()}-day{day}"
+            if state.get(run_key) is True:
+                return
+
+            if day == 16:
+                y = now_local.year
+                m = now_local.month
+                date_from = datetime.date(y, m, 2)
+                date_to = datetime.date(y, m, 15)
+                title_prefix = "Auto (2nd–15th)"
+            else:
+                y = now_local.year
+                m = now_local.month
+                first_of_month = datetime.date(y, m, 1)
+                prev_month_last = first_of_month - datetime.timedelta(days=1)
+                date_from = datetime.date(prev_month_last.year, prev_month_last.month, 16)
+                date_to = datetime.date(y, m, 1)
+                title_prefix = "Auto (16th–1st)"
+
+            start_local = datetime.datetime(date_from.year, date_from.month, date_from.day, 0, 0, 0, tzinfo=LOCAL_TZ)
+            end_local = datetime.datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=LOCAL_TZ)
+            start_utc = start_local.astimezone(datetime.timezone.utc)
+            end_utc = end_local.astimezone(datetime.timezone.utc)
+
+            embed = await build_video_length_report_embed(
+                guild=None,
+                start_utc=start_utc,
+                end_utc=end_utc,
+                title_prefix=title_prefix
+            )
+
+            user = await self.bot.fetch_user(REPORT_DM_USER_ID)
+            if not user:
+                return
+
+            await user.send(embed=embed)
+
+            state[run_key] = True
+            await save(REPORT_STATE_FILE, state)
+
+        except discord.Forbidden:
+            return
+        except Exception:
             return
 
-        filtered = self._filter_broadcasts_by_range(start_dt, end_dt)
-        if not filtered:
-            await interaction.response.send_message("No broadcasts found in that timeframe.", ephemeral=True)
+    @video_report_scheduler.before_loop
+    async def before_video_report_scheduler(self):
+        await self.bot.wait_until_ready()
+
+    @app_commands.command(name="submit_video", description="Submit a YouTube or Google Drive video for AP approval")
+    @app_commands.describe(url="YouTube or Google Drive video URL")
+    async def submit_video(self, interaction: discord.Interaction, url: str):
+        await safe_defer(interaction, ephemeral=True)
+
+        if not interaction.guild:
+            await safe_send(interaction, "❌ This command must be used in a server.", ephemeral=True)
             return
 
-        # Build report text
-        lines = []
-        lines.append(f"Alert Report — Timeframe")
-        lines.append(f"From (UTC): {start_dt.isoformat()}  To (UTC): {end_dt.isoformat()}")
-        lines.append(f"Broadcasts found: {len(filtered)}")
-        lines.append("")
+        videos = await load(VIDEO_FILE)
+        audits = await load(AUDIT_FILE)
 
-        for b in filtered:
-            lines.append(self._build_broadcast_text(b, include_deliveries=True))
-            lines.append("\n" + ("-" * 60) + "\n")
+        yid = yt_id(url)
+        did = drive_id(url)
 
-        if include_opt_in_audit:
-            lines.append("Opt-in audit (current + timestamps):")
-            lines.extend(self._format_opt_in_report_lines())
+        if not yid and not did:
+            await safe_send(interaction, "❌ Unsupported video URL.", ephemeral=True)
+            return
 
-        await self._send_report(interaction, "Alert Report — Timeframe", "\n".join(lines))
+        try:
+            if yid:
+                seconds, title = await asyncio.to_thread(self.youtube_data_blocking, yid)
+                platform = "youtube"
+                key = yid
+            else:
+                seconds, title = await asyncio.to_thread(self.drive_duration_blocking, did)
+                platform = "drive"
+                key = did
+        except Exception as e:
+            # NEW: show the underlying message so you can diagnose quickly
+            await safe_send(interaction, f"❌ Could not read video data. ({type(e).__name__}: {e})", ephemeral=True)
+            return
+
+        fp = fingerprint(platform, seconds, title)
+        if fp in audits:
+            await safe_send(interaction, "❌ This video (or a re-upload) was already submitted.", ephemeral=True)
+            return
+
+        ap_reward = int((seconds / 3600) * 1000)
+
+        videos[str(key)] = {
+            "url": url,
+            "submitter": interaction.user.id,
+            "duration": seconds,
+            "title": title,
+            "ap": ap_reward,
+            "fingerprint": fp,
+            "approved": None,
+            "submitted_at": now_iso()
+        }
+
+        await save(VIDEO_FILE, videos)
+
+        try:
+            self.bot.add_view(ApprovalView(self, str(key)))
+        except Exception:
+            pass
+
+        approval_ch = discord.utils.get(interaction.guild.text_channels, name=APPROVAL_CHANNEL)
+        if approval_ch:
+            embed = discord.Embed(title="🎥 Video Approval Required", description=title)
+            embed.add_field(name="Submitter", value=interaction.user.mention, inline=False)
+            embed.add_field(name="Duration (hours)", value=round(seconds / 3600, 2), inline=True)
+            embed.add_field(name="AP Reward", value=ap_reward, inline=True)
+            embed.add_field(name="URL", value=url, inline=False)
+
+            await approval_ch.send(embed=embed, view=ApprovalView(self, str(key)))
+
+        await safe_send(interaction, "✅ Video submitted for approval.", ephemeral=True)
+
+    async def process_decision(self, interaction: discord.Interaction, key: str, approve: bool):
+        await safe_defer(interaction, ephemeral=False)
+
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        if not is_manager(interaction.user):
+            await safe_send(interaction, "❌ Only the CEO and Directors can approve/reject videos.", ephemeral=True)
+            return
+
+        videos = await load(VIDEO_FILE)
+        ap_data = await load(AP_FILE)
+        audits = await load(AUDIT_FILE)
+
+        key = str(key)
+        if key not in videos:
+            await safe_send(interaction, "❌ Video not found.", ephemeral=False)
+            return
+
+        video = videos[key]
+        if video.get("approved") is not None:
+            await safe_send(interaction, "⚠️ Already processed.", ephemeral=False)
+            return
+
+        submitter_id = int(video["submitter"])
+        submitter = interaction.guild.get_member(submitter_id)
+
+        awarded_ap = 0
+        ceo_bonus_each = 0
+        ts = now_iso()
+
+        if approve and submitter:
+            awarded_ap = int(video.get("ap", 0))
+            uid = str(submitter.id)
+
+            ap_data.setdefault(uid, {"ap": 0})
+            ap_data[uid]["ap"] = int(ap_data[uid].get("ap", 0)) + awarded_ap
+
+            if any(r.name == SECURITY_ROLE for r in submitter.roles):
+                ceo_bonus_each = int(awarded_ap * 0.10)
+                for leader in corp_ceos(interaction.guild):
+                    lid = str(leader.id)
+                    ap_data.setdefault(lid, {"ap": 0})
+                    ap_data[lid]["ap"] = int(ap_data[lid].get("ap", 0)) + ceo_bonus_each
+
+            await save(AP_FILE, ap_data)
+
+            await post_points_distribution_confirmation(
+                interaction.guild,
+                submitter=submitter,
+                submitter_id=submitter_id,
+                title=str(video.get("title", "Untitled")),
+                url=str(video.get("url", "")),
+                seconds=float(video.get("duration", 0)),
+                awarded_ap=int(awarded_ap),
+                decided_by=interaction.user,
+                ceo_bonus_each=int(ceo_bonus_each),
+                ts_iso=ts
+            )
+
+        video["approved"] = bool(approve)
+        audits[video["fingerprint"]] = {
+            "video_key": key,
+            "approved": bool(approve),
+            "ap": int(video.get("ap", 0)) if approve else 0,
+            "decided_by": interaction.user.id,
+            "timestamp": ts
+        }
+
+        await save(VIDEO_FILE, videos)
+        await save(AUDIT_FILE, audits)
+
+        try:
+            if interaction.message and interaction.message.embeds:
+                base = interaction.message.embeds[0]
+                updated = decision_embed(base, approved=bool(approve), decided_by=interaction.user, ts_iso=ts)
+                await interaction.message.edit(embed=updated, view=disable_view(ApprovalView(self, key)))
+        except Exception:
+            pass
+
+        status = "✅ Approved" if approve else "❌ Rejected"
+        who = interaction.user.mention
+        sub = submitter.mention if submitter else f"<@{submitter_id}>"
+        title = video.get("title", "Untitled")
+
+        extra = ""
+        if approve:
+            extra = f" — Awarded **+{int(video.get('ap', 0))} AP**"
+            if ceo_bonus_each > 0:
+                extra += f" (CEO bonus: **+{ceo_bonus_each} AP** each)"
+
+        await safe_send(interaction, f"{status} by {who} — {sub} — **{title}**{extra}", ephemeral=False)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(AlertSystemCog(bot))
+    await bot.add_cog(VideoSubmission(bot))

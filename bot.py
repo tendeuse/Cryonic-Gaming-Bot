@@ -1,11 +1,13 @@
 import os
+import time
+import asyncio
 import traceback
 import discord
 from discord.ext import commands
 from discord import app_commands
-from aiohttp import web  # <-- add
+from aiohttp import web  # keepalive server
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not set in environment variables.")
 
@@ -20,6 +22,7 @@ CLEANUP_GUILD_IDS = [
     # 781978392894505020,
 ]
 
+
 def is_admin_or_allowed_role(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
         return True
@@ -27,19 +30,22 @@ def is_admin_or_allowed_role(member: discord.Member) -> bool:
         return any(r.name in ADMIN_SYNC_ROLE_NAMES for r in getattr(member, "roles", []))
     return False
 
+
 # =====================
-# REPLIT KEEP-ALIVE (FREE REPL WORKAROUND)
+# KEEP-ALIVE HTTP SERVER
+# (needed for Replit free uptime pingers; harmless elsewhere)
 # =====================
 
 async def _handle_root(request):
     return web.Response(text="OK")
 
-async def start_keepalive_server(bot: commands.Bot, host: str = "0.0.0.0", port: int = 8080):
+async def start_keepalive_server(host: str = "0.0.0.0", port: int = 8080):
     app = web.Application()
     app.router.add_get("/", _handle_root)
 
     runner = web.AppRunner(app)
     await runner.setup()
+
     site = web.TCPSite(runner, host, port)
     await site.start()
 
@@ -77,7 +83,10 @@ class SyncCog(commands.Cog):
         if not guild_id:
             try:
                 synced = await self.bot.tree.sync()
-                await interaction.followup.send(f"Global sync complete. Synced `{len(synced)}` command(s).", ephemeral=True)
+                await interaction.followup.send(
+                    f"Global sync complete. Synced `{len(synced)}` command(s).",
+                    ephemeral=True
+                )
             except Exception as e:
                 traceback.print_exception(type(e), e, e.__traceback__)
                 await interaction.followup.send("Global sync failed. Check bot logs.", ephemeral=True)
@@ -108,9 +117,9 @@ class SyncCog(commands.Cog):
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
-        # ---- Start keepalive HTTP server for uptime pingers (Replit free) ----
+        # ---- Start keepalive HTTP server (Replit free) ----
         try:
-            self.loop.create_task(start_keepalive_server(self))
+            asyncio.create_task(start_keepalive_server())
         except Exception as e:
             print(f"Failed to start keepalive server: {e}")
             traceback.print_exception(type(e), e, e.__traceback__)
@@ -175,10 +184,12 @@ class MyBot(commands.Bot):
 
 bot = MyBot(command_prefix="!", intents=intents)
 
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("Bot is ready.")
+
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
@@ -202,4 +213,16 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
     except Exception:
         pass
 
-bot.run(TOKEN)
+
+# =====================
+# Step 5: crash protection wrapper
+# Put it around bot.run() at the very bottom of bot.py
+# =====================
+while True:
+    try:
+        bot.run(TOKEN)
+        break  # if it exits cleanly, do not restart
+    except Exception as e:
+        print("Bot crashed, restarting in 5 seconds...")
+        traceback.print_exception(type(e), e, e.__traceback__)
+        time.sleep(5)
