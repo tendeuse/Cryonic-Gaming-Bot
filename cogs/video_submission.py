@@ -1,4 +1,3 @@
-print("VIDEO_SUBMISSION LOADED VERSION: 2025-12-29-0445Z")
 import os
 import json
 import re
@@ -7,6 +6,7 @@ import datetime
 import isodate
 import asyncio
 import base64
+import inspect
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,8 @@ from discord.ui import View
 
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
+
+print("VIDEO_SUBMISSION LOADED VERSION: 2025-12-29-0445Z")
 
 VIDEO_FILE = Path("data/video_submissions.json")
 AP_FILE = Path("data/ap_data.json")
@@ -48,6 +50,26 @@ LOCAL_TZ = ZoneInfo("America/Moncton")
 
 file_lock = asyncio.Lock()
 
+
+async def maybe_await(result):
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def safe_remove_cog(bot: commands.Bot, name: str) -> None:
+    """
+    Discord.py variants differ: remove_cog may be sync or async.
+    This helper works for both.
+    """
+    try:
+        if bot.get_cog(name) is None:
+            return
+        await maybe_await(bot.remove_cog(name))
+    except Exception:
+        pass
+
+
 # =====================
 # UTILITIES
 # =====================
@@ -60,20 +82,25 @@ def _load_file(p: Path):
     except Exception:
         return {}
 
+
 def _save_file(p: Path, d):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(d, indent=4), encoding="utf-8")
+
 
 async def load(p: Path):
     async with file_lock:
         return _load_file(p)
 
+
 async def save(p: Path, d):
     async with file_lock:
         _save_file(p, d)
 
+
 def now_iso():
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 def iso_to_dt_utc(iso_str: str) -> datetime.datetime | None:
     try:
@@ -84,6 +111,7 @@ def iso_to_dt_utc(iso_str: str) -> datetime.datetime | None:
     except Exception:
         return None
 
+
 def iso_to_discord_ts(iso_str: str) -> str:
     try:
         dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
@@ -93,18 +121,23 @@ def iso_to_discord_ts(iso_str: str) -> str:
     except Exception:
         return iso_str
 
+
 def is_manager(member: discord.Member) -> bool:
     return any(r.name in (CEO_ROLE, DIRECTOR_ROLE) for r in member.roles)
+
 
 def can_run_video_report(member: discord.Member) -> bool:
     return any(r.name in (CEO_ROLE, LYCAN_ROLE) for r in member.roles)
 
+
 def corp_ceos(guild: discord.Guild):
     return [m for m in guild.members if any(r.name == CEO_ROLE for r in m.roles)]
+
 
 def yt_id(url: str):
     m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
     return m.group(1) if m else None
+
 
 def drive_id(url: str):
     patterns = [
@@ -120,9 +153,11 @@ def drive_id(url: str):
             return m.group(1)
     return None
 
+
 def fingerprint(platform: str, duration: float, title: str = ""):
     base = f"{platform}:{round(duration)}:{title.lower().strip()}"
     return hashlib.sha256(base.encode()).hexdigest()
+
 
 async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool):
     try:
@@ -130,6 +165,7 @@ async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool):
             await interaction.response.defer(ephemeral=ephemeral, thinking=True)
     except (discord.NotFound, discord.HTTPException):
         pass
+
 
 async def safe_send(interaction: discord.Interaction, content: str, *, ephemeral: bool):
     try:
@@ -140,6 +176,7 @@ async def safe_send(interaction: discord.Interaction, content: str, *, ephemeral
     except (discord.NotFound, discord.HTTPException):
         pass
 
+
 async def ensure_text_channel(guild: discord.Guild, name: str) -> discord.TextChannel | None:
     ch = discord.utils.get(guild.text_channels, name=name)
     if ch:
@@ -148,6 +185,7 @@ async def ensure_text_channel(guild: discord.Guild, name: str) -> discord.TextCh
         return await guild.create_text_channel(name)
     except discord.Forbidden:
         return None
+
 
 def decision_embed(base: discord.Embed, *, approved: bool, decided_by: discord.Member, ts_iso: str) -> discord.Embed:
     e = discord.Embed(title=base.title, description=base.description)
@@ -163,6 +201,7 @@ def decision_embed(base: discord.Embed, *, approved: bool, decided_by: discord.M
     e.add_field(name="Decided At", value=iso_to_discord_ts(ts_iso), inline=False)
     return e
 
+
 def disable_view(view: View) -> View:
     for item in view.children:
         try:
@@ -171,12 +210,14 @@ def disable_view(view: View) -> View:
             pass
     return view
 
+
 def fmt_hms(total_seconds: float) -> str:
     s = int(round(total_seconds))
     h = s // 3600
     m = (s % 3600) // 60
     sec = s % 60
     return f"{h}h {m:02d}m {sec:02d}s"
+
 
 def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.datetime, datetime.datetime] | None:
     try:
@@ -190,6 +231,7 @@ def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.date
     start_local = datetime.datetime(df.year, df.month, df.day, 0, 0, 0, tzinfo=LOCAL_TZ)
     end_local = datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59, tzinfo=LOCAL_TZ)
     return (start_local.astimezone(datetime.timezone.utc), end_local.astimezone(datetime.timezone.utc))
+
 
 async def build_video_length_report_embed(
     *,
@@ -248,6 +290,7 @@ async def build_video_length_report_embed(
     e.set_footer(text="Totals are based on submitted_at timestamps recorded at submission time.")
     return e
 
+
 async def post_points_distribution_confirmation(
     guild: discord.Guild,
     *,
@@ -290,40 +333,86 @@ async def post_points_distribution_confirmation(
     except (discord.Forbidden, discord.HTTPException):
         pass
 
+
 def _parse_service_account_json(raw: str) -> dict:
-    def _try_json(text: str) -> dict | None:
+    """
+    Accepts:
+      - Raw JSON object text
+      - JSON wrapped in quotes (common in env UIs)
+      - Double-encoded JSON (JSON string containing JSON)
+      - A file path to a JSON file
+      - Base64-encoded JSON (whitespace/newlines allowed)
+    """
+
+    def _try_json(text: str):
         try:
             return json.loads(text)
         except Exception:
             return None
 
-    normalized = raw.strip().replace("\\n", "\n")
+    if not raw:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
+        )
+
+    normalized = raw.strip()
+
+    # If the env UI added surrounding quotes, strip them
+    if (normalized.startswith('"') and normalized.endswith('"')) or (normalized.startswith("'") and normalized.endswith("'")):
+        normalized = normalized[1:-1].strip()
+
+    # Convert literal \n sequences to real newlines (private_key often stored this way)
+    normalized = normalized.replace("\\n", "\n")
+
     parse_error = RuntimeError(
         "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
     )
 
+    # 1) Raw JSON
     parsed = _try_json(normalized)
-    if parsed is not None:
+    if isinstance(parsed, dict):
         return parsed
 
+    # 1b) Double-encoded: JSON string containing JSON
+    if isinstance(parsed, str):
+        parsed2 = _try_json(parsed)
+        if isinstance(parsed2, dict):
+            return parsed2
+
+    # 2) File path to JSON
     maybe_path = Path(normalized)
     if maybe_path.is_file():
-        file_text = maybe_path.read_text(encoding="utf-8").replace("\\n", "\n")
+        file_text = maybe_path.read_text(encoding="utf-8").strip().replace("\\n", "\n")
         parsed = _try_json(file_text)
-        if parsed is not None:
+        if isinstance(parsed, dict):
             return parsed
+        if isinstance(parsed, str):
+            parsed2 = _try_json(parsed)
+            if isinstance(parsed2, dict):
+                return parsed2
 
-    try:
-        decoded_bytes = base64.b64decode(normalized, validate=True)
-        decoded = decoded_bytes.decode("utf-8", errors="strict").replace("\\n", "\n")
-    except Exception as e:
-        raise parse_error from e
+    # 3) Base64 JSON (allow whitespace/newlines)
+    b64_candidate = re.sub(r"\s+", "", normalized)
+    # base64 often includes = padding; allow it
+    if re.fullmatch(r"[A-Za-z0-9+/=]+", b64_candidate or ""):
+        try:
+            decoded_bytes = base64.b64decode(b64_candidate, validate=False)
+            decoded = decoded_bytes.decode("utf-8", errors="strict").replace("\\n", "\n")
+            parsed = _try_json(decoded)
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, str):
+                parsed2 = _try_json(parsed)
+                if isinstance(parsed2, dict):
+                    return parsed2
+        except Exception:
+            # fall through to final error
+            pass
 
-    parsed = _try_json(decoded)
-    if parsed is not None:
-        return parsed
+    # Give a helpful snippet (won’t leak full key; just first few chars)
+    snippet = normalized[:40].replace("\n", "\\n")
+    raise RuntimeError(f"{parse_error} (value starts with: {snippet!r})")
 
-    raise parse_error
 
 # =====================
 # MODAL: REPORT DATES
@@ -377,8 +466,9 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
         except (discord.NotFound, discord.HTTPException):
             pass
 
+
 # =====================
-# APPROVAL VIEW
+# APPROVAL VIEW (SAFE)
 # =====================
 
 class ApprovalView(View):
@@ -403,21 +493,19 @@ class ApprovalView(View):
     async def reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.process_decision(interaction, self.video_key, approve=False)
 
+
 # =====================
 # COG
 # =====================
 
-class VideoSubmissionCog(commands.Cog, name="VideoSubmissionCog"):
+class VideoSubmissionCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+        # YouTube client
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
 
-        if not SERVICE_ACCOUNT_JSON:
-            raise RuntimeError(
-                "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
-            )
-
+        # Drive client from env JSON
         creds_info = _parse_service_account_json(SERVICE_ACCOUNT_JSON)
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -491,6 +579,10 @@ class VideoSubmissionCog(commands.Cog, name="VideoSubmissionCog"):
         sec = int(ms) / 1000
         return float(sec), title
 
+    # =====================
+    # MANUAL REPORT COMMAND
+    # =====================
+
     @app_commands.command(
         name="video_length_report",
         description="Report total submitted video length per member for a date range (YYYY-MM-DD)."
@@ -508,6 +600,10 @@ class VideoSubmissionCog(commands.Cog, name="VideoSubmissionCog"):
             await interaction.response.send_modal(VideoLengthReportModal(self))
         except (discord.HTTPException, discord.NotFound):
             await safe_send(interaction, "❌ Could not open the report modal. Please try again.", ephemeral=True)
+
+    # =====================
+    # AUTO REPORT SCHEDULER
+    # =====================
 
     @tasks.loop(minutes=15)
     async def video_report_scheduler(self):
@@ -570,6 +666,10 @@ class VideoSubmissionCog(commands.Cog, name="VideoSubmissionCog"):
     @video_report_scheduler.before_loop
     async def before_video_report_scheduler(self):
         await self.bot.wait_until_ready()
+
+    # =====================
+    # SUBMISSION / APPROVAL FLOW
+    # =====================
 
     @app_commands.command(name="submit_video", description="Submit a YouTube or Google Drive video for AP approval")
     @app_commands.describe(url="YouTube or Google Drive video URL")
@@ -737,14 +837,10 @@ class VideoSubmissionCog(commands.Cog, name="VideoSubmissionCog"):
             ephemeral=False
         )
 
+
 async def setup(bot: commands.Bot):
-    # HARD STOP: remove any old copies before adding (works even if something loads twice)
-    try:
-        if bot.get_cog("VideoSubmission"):
-            bot.remove_cog("VideoSubmission")
-        if bot.get_cog("VideoSubmissionCog"):
-            bot.remove_cog("VideoSubmissionCog")
-    except Exception:
-        pass
+    # If an old cog was loaded (from an older build), remove it safely first.
+    await safe_remove_cog(bot, "VideoSubmission")      # legacy name
+    await safe_remove_cog(bot, "VideoSubmissionCog")   # current name
 
     await bot.add_cog(VideoSubmissionCog(bot))
