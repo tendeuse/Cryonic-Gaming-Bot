@@ -764,10 +764,12 @@ class VideoSubmission(commands.Cog):
 
 async def setup(bot: commands.Bot):
     # Idempotent setup: aggressively remove any existing instance before adding
-    try:
-        bot.remove_cog("VideoSubmission")
-    except Exception:
-        # remove_cog is synchronous and safe to ignore failures
-        pass
+    cog_name = getattr(VideoSubmission, "__cog_name__", VideoSubmission.__name__)
+
+    # Remove by the canonical cog name, and also fall back to the class name
+    for name in {cog_name, VideoSubmission.__name__}:
+        existing = bot.get_cog(name)
+        if existing:
+            bot.remove_cog(name)
 
     await bot.add_cog(VideoSubmission(bot), override=True)
