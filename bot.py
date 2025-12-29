@@ -32,11 +32,12 @@ def is_admin_or_allowed_role(member: discord.Member) -> bool:
 
 # =====================
 # KEEP-ALIVE HTTP SERVER
-# (needed for Replit free uptime pingers; harmless elsewhere)
+# (useful on Replit; harmless elsewhere)
 # =====================
 
 async def _handle_root(request):
     return web.Response(text="OK")
+
 
 async def start_keepalive_server(host: str = "0.0.0.0", port: int = 8080):
     app = web.Application()
@@ -116,7 +117,7 @@ class SyncCog(commands.Cog):
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
-        # ---- Start keepalive HTTP server (Replit free) ----
+        # ---- Start keepalive HTTP server ----
         try:
             asyncio.create_task(start_keepalive_server())
         except Exception as e:
@@ -135,21 +136,16 @@ class MyBot(commands.Bot):
 
             ext = f"{cogs_folder}.{filename[:-3]}"
             try:
-                # Idempotent load: unload first if already present
-                if ext in self.extensions:
-                    await self.unload_extension(ext)
-
+                # load_extension already prevents double-loading in one process
                 await self.load_extension(ext)
                 print(f"Loaded cog: {ext}")
             except Exception as e:
                 print(f"Failed to load {ext}: {e}")
                 traceback.print_exception(type(e), e, e.__traceback__)
 
-        # ---- Add /sync command cog (must be added BEFORE syncing) ----
+        # ---- Add /sync command cog ----
         try:
-            existing = self.get_cog("SyncCog")
-            if existing is None:
-                await self.add_cog(SyncCog(self))
+            await self.add_cog(SyncCog(self))
             print("Loaded internal cog: SyncCog (/sync)")
         except Exception as e:
             print(f"Failed to add SyncCog: {e}")
@@ -217,7 +213,4 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
         pass
 
 
-# IMPORTANT:
-# Do NOT wrap bot.run() in a while True restart loop on Railway.
-# discord.py handles reconnects; Railway handles restarts cleanly at the process/container level.
 bot.run(TOKEN)
