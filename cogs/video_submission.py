@@ -769,4 +769,4 @@ async def setup(bot: commands.Bot):
         # remove_cog is synchronous; do not await
         bot.remove_cog("VideoSubmission")
 
-    await bot.add_cog(VideoSubmission(bot))
+    await bot.add_cog(VideoSubmission(bot), override=True)
