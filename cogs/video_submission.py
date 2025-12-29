@@ -764,11 +764,9 @@ class VideoSubmission(commands.Cog):
 
 async def setup(bot: commands.Bot):
     # Idempotent setup: remove existing cog instance if it exists
-    try:
-        existing = bot.get_cog("VideoSubmission")
-        if existing is not None:
-            await bot.remove_cog("VideoSubmission")
-    except Exception:
-        pass
+    existing = bot.get_cog("VideoSubmission")
+    if existing is not None:
+        # remove_cog is synchronous; do not await
+        bot.remove_cog("VideoSubmission")
 
     await bot.add_cog(VideoSubmission(bot))
