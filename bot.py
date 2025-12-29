@@ -1,5 +1,4 @@
 import os
-import time
 import asyncio
 import traceback
 import discord
@@ -136,8 +135,10 @@ class MyBot(commands.Bot):
 
             ext = f"{cogs_folder}.{filename[:-3]}"
             try:
+                # Idempotent load: unload first if already present
                 if ext in self.extensions:
                     await self.unload_extension(ext)
+
                 await self.load_extension(ext)
                 print(f"Loaded cog: {ext}")
             except Exception as e:
@@ -146,7 +147,9 @@ class MyBot(commands.Bot):
 
         # ---- Add /sync command cog (must be added BEFORE syncing) ----
         try:
-            await self.add_cog(SyncCog(self))
+            existing = self.get_cog("SyncCog")
+            if existing is None:
+                await self.add_cog(SyncCog(self))
             print("Loaded internal cog: SyncCog (/sync)")
         except Exception as e:
             print(f"Failed to add SyncCog: {e}")
@@ -214,15 +217,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
         pass
 
 
-# =====================
-# Step 5: crash protection wrapper
-# Put it around bot.run() at the very bottom of bot.py
-# =====================
-while True:
-    try:
-        bot.run(TOKEN)
-        break  # if it exits cleanly, do not restart
-    except Exception as e:
-        print("Bot crashed, restarting in 5 seconds...")
-        traceback.print_exception(type(e), e, e.__traceback__)
-        time.sleep(5)
+# IMPORTANT:
+# Do NOT wrap bot.run() in a while True restart loop on Railway.
+# discord.py handles reconnects; Railway handles restarts cleanly at the process/container level.
+bot.run(TOKEN)
