@@ -1,7 +1,6 @@
 import os
 import asyncio
 import traceback
-
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -9,7 +8,8 @@ from aiohttp import web  # keepalive server
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is not set in environment variables.")
+    print("FATAL: DISCORD_TOKEN is not set in environment variables.")
+    raise SystemExit(1)
 
 intents = discord.Intents.all()
 
@@ -80,7 +80,6 @@ class SyncCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        # Global sync
         if not guild_id:
             try:
                 synced = await self.bot.tree.sync()
@@ -93,7 +92,6 @@ class SyncCog(commands.Cog):
                 await interaction.followup.send("Global sync failed. Check bot logs.", ephemeral=True)
             return
 
-        # Guild-only sync
         try:
             gid = int(str(guild_id).strip())
         except ValueError:
@@ -119,7 +117,7 @@ class SyncCog(commands.Cog):
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
-        # ---- Start keepalive server ----
+        # ---- Start keepalive HTTP server ----
         try:
             asyncio.create_task(start_keepalive_server())
         except Exception as e:
@@ -137,21 +135,35 @@ class MyBot(commands.Bot):
                 continue
 
             ext = f"{cogs_folder}.{filename[:-3]}"
+
+            # HARDENING: if an extension partially loaded or got reloaded, clean it first
             try:
-                # IMPORTANT: reload if already present in this process.
                 if ext in self.extensions:
-                    await self.reload_extension(ext)
-                    print(f"Reloaded cog: {ext}")
-                else:
-                    await self.load_extension(ext)
-                    print(f"Loaded cog: {ext}")
+                    await self.unload_extension(ext)
+            except Exception:
+                pass
+
+            # HARDENING: specifically clean the old VideoSubmission cog name if it exists
+            # (this is what throws "Cog named 'VideoSubmission' already loaded")
+            if ext == "cogs.video_submission":
+                try:
+                    if self.get_cog("VideoSubmission"):
+                        self.remove_cog("VideoSubmission")
+                    if self.get_cog("VideoSubmissionCog"):
+                        self.remove_cog("VideoSubmissionCog")
+                except Exception:
+                    pass
+
+            try:
+                await self.load_extension(ext)
+                print(f"Loaded cog: {ext}")
             except Exception as e:
                 print(f"Failed to load {ext}: {e}")
                 traceback.print_exception(type(e), e, e.__traceback__)
 
         # ---- Add /sync command cog ----
         try:
-            if self.get_cog("SyncCog") is None:
+            if not self.get_cog("SyncCog"):
                 await self.add_cog(SyncCog(self))
             print("Loaded internal cog: SyncCog (/sync)")
         except Exception as e:
@@ -168,7 +180,7 @@ class MyBot(commands.Bot):
             traceback.print_exception(type(e), e, e.__traceback__)
             return
 
-        # ---- OPTIONAL CLEANUP ----
+        # ---- OPTIONAL CLEANUP: remove old guild commands ----
         for gid in CLEANUP_GUILD_IDS:
             try:
                 guild = discord.Object(id=int(gid))
