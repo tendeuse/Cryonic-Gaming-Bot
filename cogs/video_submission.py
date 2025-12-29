@@ -28,8 +28,6 @@ if not YOUTUBE_API_KEY:
 
 # Service account JSON from env (Railway Variables)
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-if not SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set in environment variables.")
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -292,7 +290,13 @@ async def post_points_distribution_confirmation(
         pass
 
 def _parse_service_account_json(raw: str) -> dict:
-    """Parse service account JSON provided directly, from a file, or as base64."""
+    """Parse service account JSON provided directly, from a file, or as base64.
+
+    The error message is designed to be copy-paste friendly for GitHub comments,
+    so users can set the `GOOGLE_SERVICE_ACCOUNT_JSON` Railway variable with
+    either raw JSON text, an absolute/relative path to a JSON file, or a
+    base64-encoded JSON blob (for example: `base64 -w0 key.json`).
+    """
 
     def _try_json(text: str) -> dict | None:
         try:
@@ -302,7 +306,7 @@ def _parse_service_account_json(raw: str) -> dict:
 
     normalized = raw.strip().replace("\\n", "\n")
     parse_error = RuntimeError(
-        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text or base64-encoded JSON."
+        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
     )
 
     # 1) Raw JSON (with escaped newlines normalized above)
@@ -421,6 +425,10 @@ class VideoSubmission(commands.Cog):
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
 
         # Drive client from env JSON
+        if not SERVICE_ACCOUNT_JSON:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Provide raw JSON text, a JSON file path, or base64-encoded JSON."
+            )
         creds_info = _parse_service_account_json(SERVICE_ACCOUNT_JSON)
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
