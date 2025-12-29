@@ -1,6 +1,8 @@
 import os
 import asyncio
 import traceback
+import inspect
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -8,8 +10,7 @@ from aiohttp import web  # keepalive server
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
-    print("FATAL: DISCORD_TOKEN is not set in environment variables.")
-    raise SystemExit(1)
+    raise RuntimeError("DISCORD_TOKEN is not set in environment variables.")
 
 intents = discord.Intents.all()
 
@@ -31,8 +32,30 @@ def is_admin_or_allowed_role(member: discord.Member) -> bool:
     return False
 
 
+async def maybe_await(result):
+    """Await if the returned value is awaitable."""
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def safe_remove_cog(bot: commands.Bot, name: str) -> None:
+    """
+    Discord.py variants differ: remove_cog may be sync or async.
+    This helper works for both.
+    """
+    try:
+        if bot.get_cog(name) is None:
+            return
+        await maybe_await(bot.remove_cog(name))
+    except Exception:
+        # never fail startup on best-effort cleanup
+        pass
+
+
 # =====================
 # KEEP-ALIVE HTTP SERVER
+# (useful on Replit; harmless elsewhere)
 # =====================
 
 async def _handle_root(request):
@@ -135,37 +158,23 @@ class MyBot(commands.Bot):
                 continue
 
             ext = f"{cogs_folder}.{filename[:-3]}"
-
-            # HARDENING: if an extension partially loaded or got reloaded, clean it first
             try:
+                # If already loaded (rare), reload cleanly.
                 if ext in self.extensions:
-                    await self.unload_extension(ext)
-            except Exception:
-                pass
-
-            # HARDENING: specifically clean the old VideoSubmission cog name if it exists
-            # (this is what throws "Cog named 'VideoSubmission' already loaded")
-            if ext == "cogs.video_submission":
-                try:
-                    if self.get_cog("VideoSubmission"):
-                        self.remove_cog("VideoSubmission")
-                    if self.get_cog("VideoSubmissionCog"):
-                        self.remove_cog("VideoSubmissionCog")
-                except Exception:
-                    pass
-
-            try:
-                await self.load_extension(ext)
-                print(f"Loaded cog: {ext}")
+                    await self.reload_extension(ext)
+                    print(f"Reloaded cog: {ext}")
+                else:
+                    await self.load_extension(ext)
+                    print(f"Loaded cog: {ext}")
             except Exception as e:
                 print(f"Failed to load {ext}: {e}")
                 traceback.print_exception(type(e), e, e.__traceback__)
 
         # ---- Add /sync command cog ----
         try:
-            if not self.get_cog("SyncCog"):
+            if self.get_cog("SyncCog") is None:
                 await self.add_cog(SyncCog(self))
-            print("Loaded internal cog: SyncCog (/sync)")
+                print("Loaded internal cog: SyncCog (/sync)")
         except Exception as e:
             print(f"Failed to add SyncCog: {e}")
             traceback.print_exception(type(e), e, e.__traceback__)
