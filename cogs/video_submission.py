@@ -1,19 +1,16 @@
 import os
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from discord.ui import View
 import json
 import re
 import hashlib
 import datetime
 import isodate
 import asyncio
-import base64
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
-import discord
-from discord.ext import commands, tasks
-from discord import app_commands
-from discord.ui import View
-
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
@@ -26,8 +23,8 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 if not YOUTUBE_API_KEY:
     raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
 
-# Service account JSON from env (Railway Variables)
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+# NEW: Service account JSON from env (Railway Variables)
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 if not SERVICE_ACCOUNT_JSON:
     raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set in environment variables.")
 
@@ -45,6 +42,7 @@ REPORT_DM_USER_ID = 559041382573015060
 
 AP_DISTRIBUTION_LOG_CH = "member-join-logs-points-distribute"
 
+# Your local timezone
 LOCAL_TZ = ZoneInfo("America/Moncton")
 
 file_lock = asyncio.Lock()
@@ -108,6 +106,7 @@ def yt_id(url: str):
     return m.group(1) if m else None
 
 def drive_id(url: str):
+    # Keep your original patterns, plus common Drive formats
     patterns = [
         r"/file/d/([A-Za-z0-9_-]+)",
         r"/d/([A-Za-z0-9_-]+)",
@@ -180,6 +179,10 @@ def fmt_hms(total_seconds: float) -> str:
     return f"{h}h {m:02d}m {sec:02d}s"
 
 def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.datetime, datetime.datetime] | None:
+    """
+    Accepts YYYY-MM-DD strings interpreted in LOCAL_TZ.
+    Returns (start_utc, end_utc) inclusive boundaries.
+    """
     try:
         df = datetime.date.fromisoformat(date_from)
         dt = datetime.date.fromisoformat(date_to)
@@ -190,6 +193,7 @@ def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.date
 
     start_local = datetime.datetime(df.year, df.month, df.day, 0, 0, 0, tzinfo=LOCAL_TZ)
     end_local = datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59, tzinfo=LOCAL_TZ)
+
     return (start_local.astimezone(datetime.timezone.utc), end_local.astimezone(datetime.timezone.utc))
 
 async def build_video_length_report_embed(
@@ -267,120 +271,67 @@ async def post_points_distribution_confirmation(
         return
 
     recipient_mention = submitter.mention if submitter else f"<@{submitter_id}>"
-diff --git a/cogs/video_submission.py b/cogs/video_submission.py
-index 904d4777cfb2d7b822951f7c3dab930d34dbf47c..337f08c51f9e3ce6af9bec93b2f8c7df04718be0 100644
---- a/cogs/video_submission.py
-+++ b/cogs/video_submission.py
-@@ -270,74 +270,88 @@ async def post_points_distribution_confirmation(
- 
-     e = discord.Embed(
-         title="Point Distribution Confirmation",
-         description="Video submission approved and AP distributed.",
-         timestamp=datetime.datetime.utcnow()
-     )
-     e.add_field(name="Recipient", value=f"{recipient_mention} (`{submitter_id}`)", inline=False)
-     e.add_field(name="Awarded AP", value=f"**+{awarded_ap} AP**", inline=True)
-     e.add_field(name="Rate", value="1000 AP / hour", inline=True)
-     e.add_field(name="Duration", value=f"{round(seconds / 3600, 2)} hours", inline=True)
-     e.add_field(name="Video Title", value=title[:256], inline=False)
-     e.add_field(name="URL", value=url, inline=False)
- 
-     if ceo_bonus_each > 0:
-         e.add_field(name="CEO Bonus", value=f"**+{ceo_bonus_each} AP** to each CEO", inline=False)
- 
-     e.add_field(name="Approved By", value=f"{decided_by.mention} (`{decided_by.id}`)", inline=False)
-     e.add_field(name="Approved At", value=iso_to_discord_ts(ts_iso), inline=False)
- 
-     try:
-         await ch.send(embed=e)
-     except (discord.Forbidden, discord.HTTPException):
-         pass
- 
- def _parse_service_account_json(raw: str) -> dict:
--    """
--    Accepts either:
--      - raw JSON text
--      - JSON with escaped newlines (common when pasted)
--      - base64 encoded JSON (optional)
--    """
--    s = raw.strip()
--
--    # If it's quoted JSON or has escaped newlines, normalize a bit
--    s = s.replace("\\n", "\n")
--
--    # Try JSON directly
--    try:
--        return json.loads(s)
--    except Exception:
--        pass
-+    """Parse service account JSON provided directly or as base64."""
-+
-+    def _try_json(text: str) -> dict | None:
-+        try:
-+            return json.loads(text)
-+        except Exception:
-+            return None
- 
--    # Try base64 decode -> JSON
-+    s = raw.strip().replace("\\n", "\n")
-+
-+    # 1) Raw JSON (with escaped newlines normalized above)
-+    parsed = _try_json(s)
-+    if parsed is not None:
-+        return parsed
-+
-+    # 2) Value is a filepath pointing to the JSON
-+    maybe_path = Path(s)
-+    if maybe_path.is_file():
-+        file_text = maybe_path.read_text(encoding="utf-8").replace("\\n", "\n")
-+        parsed = _try_json(file_text)
-+        if parsed is not None:
-+            return parsed
-+
-+    # 3) Base64-encoded JSON
-     try:
--        decoded = base64.b64decode(s).decode("utf-8")
--        decoded = decoded.replace("\\n", "\n").strip()
--        return json.loads(decoded)
-+        decoded_bytes = base64.b64decode(s, validate=True)
-+        decoded = decoded_bytes.decode("utf-8", errors="strict").replace("\\n", "\n")
-+        parsed = _try_json(decoded)
-+        if parsed is not None:
-+            return parsed
-     except Exception as e:
--        raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed as JSON or base64 JSON: {type(e).__name__}")
-+        raise RuntimeError(
-+            "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text or base64-encoded JSON."
-+        ) from e
-+
-+    raise RuntimeError(
-+        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text or base64-encoded JSON."
-+    )
- 
- # =====================
- # MODAL: REPORT DATES
- # =====================
- 
- class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
-     date_from = discord.ui.TextInput(
-         label="From date (YYYY-MM-DD)",
-         placeholder="2025-12-02",
-         required=True,
-         max_length=10
-     )
-     date_to = discord.ui.TextInput(
-         label="To date (YYYY-MM-DD)",
-         placeholder="2025-12-15",
-         required=True,
-         max_length=10
-     )
- 
-     def __init__(self, cog: "VideoSubmission"):
-         super().__init__()
-         self.cog = cog
- 
-     async def on_submit(self, interaction: discord.Interaction):
-         await safe_defer(interaction, ephemeral=True)
+
+    e = discord.Embed(
+        title="Point Distribution Confirmation",
+        description="Video submission approved and AP distributed.",
+        timestamp=datetime.datetime.utcnow()
+    )
+    e.add_field(name="Recipient", value=f"{recipient_mention} (`{submitter_id}`)", inline=False)
+    e.add_field(name="Awarded AP", value=f"**+{awarded_ap} AP**", inline=True)
+    e.add_field(name="Rate", value="1000 AP / hour", inline=True)
+    e.add_field(name="Duration", value=f"{round(seconds / 3600, 2)} hours", inline=True)
+    e.add_field(name="Video Title", value=title[:256], inline=False)
+    e.add_field(name="URL", value=url, inline=False)
+
+    if ceo_bonus_each > 0:
+        e.add_field(name="CEO Bonus", value=f"**+{ceo_bonus_each} AP** to each CEO", inline=False)
+
+    e.add_field(name="Approved By", value=f"{decided_by.mention} (`{decided_by.id}`)", inline=False)
+    e.add_field(name="Approved At", value=iso_to_discord_ts(ts_iso), inline=False)
+
+    try:
+        await ch.send(embed=e)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+# =====================
+# MODAL: REPORT DATES
+# =====================
+
+class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
+    date_from = discord.ui.TextInput(
+        label="From date (YYYY-MM-DD)",
+        placeholder="2025-12-02",
+        required=True,
+        max_length=10
+    )
+    date_to = discord.ui.TextInput(
+        label="To date (YYYY-MM-DD)",
+        placeholder="2025-12-15",
+        required=True,
+        max_length=10
+    )
+
+    def __init__(self, cog: "VideoSubmission"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True)
+
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await safe_send(interaction, "❌ This must be used in a server.", ephemeral=True)
+            return
+
+        if not can_run_video_report(interaction.user):
+            await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
+            return
+
+        rng = date_str_to_local_range(str(self.date_from).strip(), str(self.date_to).strip())
+        if not rng:
+            await safe_send(interaction, "❌ Invalid dates. Use YYYY-MM-DD, and ensure To ≥ From.", ephemeral=True)
+            return
 
         start_utc, end_utc = rng
         embed = await build_video_length_report_embed(
@@ -433,8 +384,8 @@ class VideoSubmission(commands.Cog):
         # YouTube client
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
 
-        # Drive client from env JSON
-        creds_info = _parse_service_account_json(SERVICE_ACCOUNT_JSON)
+        # NEW: Drive client from env JSON (no service_account.json file)
+        creds_info = json.loads(SERVICE_ACCOUNT_JSON)
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -472,7 +423,7 @@ class VideoSubmission(commands.Cog):
         title = item["snippet"]["title"]
         return float(seconds), str(title)
 
-    # Robust Drive duration fetch (shortcut + mediaInfo fallback)
+    # NEW: robust Drive duration fetch (shortcut + mediaInfo fallback)
     def drive_duration_blocking(self, fid: str):
         def fetch(file_id: str):
             return self.drive.files().get(
@@ -768,12 +719,4 @@ class VideoSubmission(commands.Cog):
         )
 
 async def setup(bot: commands.Bot):
-    # Idempotent setup: remove existing cog instance if it exists
-    try:
-        existing = bot.get_cog("VideoSubmission")
-        if existing is not None:
-            await bot.remove_cog("VideoSubmission")
-    except Exception:
-        pass
-
     await bot.add_cog(VideoSubmission(bot))
