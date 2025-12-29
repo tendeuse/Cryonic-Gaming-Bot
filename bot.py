@@ -1,6 +1,7 @@
 import os
 import asyncio
 import traceback
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -32,7 +33,6 @@ def is_admin_or_allowed_role(member: discord.Member) -> bool:
 
 # =====================
 # KEEP-ALIVE HTTP SERVER
-# (useful on Replit; harmless elsewhere)
 # =====================
 
 async def _handle_root(request):
@@ -80,6 +80,7 @@ class SyncCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
+        # Global sync
         if not guild_id:
             try:
                 synced = await self.bot.tree.sync()
@@ -92,6 +93,7 @@ class SyncCog(commands.Cog):
                 await interaction.followup.send("Global sync failed. Check bot logs.", ephemeral=True)
             return
 
+        # Guild-only sync
         try:
             gid = int(str(guild_id).strip())
         except ValueError:
@@ -117,7 +119,7 @@ class SyncCog(commands.Cog):
 
 class MyBot(commands.Bot):
     async def setup_hook(self):
-        # ---- Start keepalive HTTP server ----
+        # ---- Start keepalive server ----
         try:
             asyncio.create_task(start_keepalive_server())
         except Exception as e:
@@ -136,16 +138,21 @@ class MyBot(commands.Bot):
 
             ext = f"{cogs_folder}.{filename[:-3]}"
             try:
-                # load_extension already prevents double-loading in one process
-                await self.load_extension(ext)
-                print(f"Loaded cog: {ext}")
+                # IMPORTANT: reload if already present in this process.
+                if ext in self.extensions:
+                    await self.reload_extension(ext)
+                    print(f"Reloaded cog: {ext}")
+                else:
+                    await self.load_extension(ext)
+                    print(f"Loaded cog: {ext}")
             except Exception as e:
                 print(f"Failed to load {ext}: {e}")
                 traceback.print_exception(type(e), e, e.__traceback__)
 
         # ---- Add /sync command cog ----
         try:
-            await self.add_cog(SyncCog(self))
+            if self.get_cog("SyncCog") is None:
+                await self.add_cog(SyncCog(self))
             print("Loaded internal cog: SyncCog (/sync)")
         except Exception as e:
             print(f"Failed to add SyncCog: {e}")
@@ -161,7 +168,7 @@ class MyBot(commands.Bot):
             traceback.print_exception(type(e), e, e.__traceback__)
             return
 
-        # ---- OPTIONAL CLEANUP: remove old guild commands ----
+        # ---- OPTIONAL CLEANUP ----
         for gid in CLEANUP_GUILD_IDS:
             try:
                 guild = discord.Object(id=int(gid))
