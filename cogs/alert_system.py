@@ -1,4 +1,6 @@
 import os
+import base64
+import binascii
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -23,13 +25,10 @@ REPORT_STATE_FILE = Path("data/video_report_state.json")
 # ENV VARS (Railway)
 # =====================
 
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
-if not YOUTUBE_API_KEY:
-    raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-if not SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set in environment variables.")
+# IMPORTANT: This env var is Base64-encoded JSON
+GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -57,7 +56,10 @@ def _load_file(p: Path):
     try:
         if not p.exists():
             return {}
-        return json.loads(p.read_text(encoding="utf-8"))
+        txt = p.read_text(encoding="utf-8").strip()
+        if not txt:
+            return {}
+        return json.loads(txt)
     except Exception:
         return {}
 
@@ -151,7 +153,11 @@ async def ensure_text_channel(guild: discord.Guild, name: str) -> discord.TextCh
         return None
 
 def decision_embed(base: discord.Embed, *, approved: bool, decided_by: discord.Member, ts_iso: str) -> discord.Embed:
-    e = discord.Embed(title=base.title, description=base.description)
+    e = discord.Embed(
+        title=base.title,
+        description=base.description,
+        color=base.color
+    )
     if base.footer and base.footer.text:
         e.set_footer(text=base.footer.text)
 
@@ -191,6 +197,51 @@ def date_str_to_local_range(date_from: str, date_to: str) -> tuple[datetime.date
     start_local = datetime.datetime(df.year, df.month, df.day, 0, 0, 0, tzinfo=LOCAL_TZ)
     end_local = datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59, tzinfo=LOCAL_TZ)
     return (start_local.astimezone(datetime.timezone.utc), end_local.astimezone(datetime.timezone.utc))
+
+def load_service_account_info_from_b64(b64_value: str) -> dict:
+    """
+    GOOGLE_SERVICE_ACCOUNT_JSON is Base64-encoded JSON.
+    Supports standard and URL-safe Base64 (with/without padding).
+    """
+    raw = (b64_value or "").strip()
+    if not raw:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set (expected Base64-encoded service account JSON).")
+
+    # Add missing padding if necessary
+    pad = (-len(raw)) % 4
+    if pad:
+        raw += "=" * pad
+
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except binascii.Error:
+        # Try URL-safe as a fallback
+        try:
+            decoded = base64.urlsafe_b64decode(raw)
+        except Exception as e:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON is not valid Base64. Re-copy the Base64 value exactly."
+            ) from e
+
+    try:
+        text = decoded.decode("utf-8").strip()
+    except Exception as e:
+        raise RuntimeError("Decoded service account data is not valid UTF-8 text.") from e
+
+    if not text:
+        raise RuntimeError("Decoded service account JSON is empty (Base64 decodes to blank).")
+
+    try:
+        info = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "Decoded service account payload is not valid JSON. Ensure you encoded the full JSON file."
+        ) from e
+
+    if not isinstance(info, dict) or info.get("type") != "service_account":
+        raise RuntimeError("Decoded JSON does not look like a Google service account key (type != service_account).")
+
+    return info
 
 async def build_video_length_report_embed(
     *,
@@ -377,12 +428,15 @@ class VideoSubmission(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+        # Validate config at runtime (not at import time)
+        if not YOUTUBE_API_KEY:
+            raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
+
+        # Build clients
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
 
-        # NEW: Build creds from env var JSON, not a file
-        creds_info = json.loads(SERVICE_ACCOUNT_JSON)
+        creds_info = load_service_account_info_from_b64(GOOGLE_SERVICE_ACCOUNT_JSON_B64)
         creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-
         self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         self.video_report_scheduler.start()
@@ -419,7 +473,6 @@ class VideoSubmission(commands.Cog):
         title = item["snippet"]["title"]
         return float(seconds), str(title)
 
-    # NEW: robust Drive duration fetch + helpful error message
     def drive_duration_blocking(self, fid: str):
         def fetch(file_id: str):
             return self.drive.files().get(
@@ -565,7 +618,6 @@ class VideoSubmission(commands.Cog):
                 platform = "drive"
                 key = did
         except Exception as e:
-            # NEW: show the underlying message so you can diagnose quickly
             await safe_send(interaction, f"❌ Could not read video data. ({type(e).__name__}: {e})", ephemeral=True)
             return
 
@@ -678,11 +730,14 @@ class VideoSubmission(commands.Cog):
         await save(VIDEO_FILE, videos)
         await save(AUDIT_FILE, audits)
 
+        # Update the original approval message (disable buttons)
         try:
             if interaction.message and interaction.message.embeds:
                 base = interaction.message.embeds[0]
                 updated = decision_embed(base, approved=bool(approve), decided_by=interaction.user, ts_iso=ts)
-                await interaction.message.edit(embed=updated, view=disable_view(ApprovalView(self, key)))
+                v = ApprovalView(self, key)
+                disable_view(v)
+                await interaction.message.edit(embed=updated, view=v)
         except Exception:
             pass
 
