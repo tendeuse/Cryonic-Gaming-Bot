@@ -57,7 +57,7 @@ CLAIM_IGN_KEY = "ign"
 CLAIM_GAME_KEY = "game"
 
 # Game rates
-GAME_EVE = "EVE Online"
+GAME_EVE = "EVE online"
 GAME_WOW = "World of Warcraft"
 EVE_ISK_PER_AP = 100_000
 WOW_GOLD_PER_AP = 10
@@ -427,7 +427,7 @@ def render_grouped_csv(groups: Dict[str, List[List[str]]]) -> bytes:
     CSV divided per game:
       - World of Warcraft players
       - blank line
-      - EVE Online players
+      - EVE online players
       - blank line
       - Unclaimed / Unknown
     """

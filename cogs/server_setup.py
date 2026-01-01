@@ -30,7 +30,7 @@ UNITLESS_ROLE = "Unitless"
 OTHER_ROLES = [
     "Shop Steward",
     "World of Warcraft",
-    "Eve Online",
+    "EVE online",
     NEWBRO_ROLE,
     "Exploration Certified",
     UNITLESS_ROLE,
