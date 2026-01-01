@@ -2,6 +2,8 @@
 # CONFIG
 # =====================
 import os
+from pathlib import Path
+
 
 # Railway persistent volume mount point
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
