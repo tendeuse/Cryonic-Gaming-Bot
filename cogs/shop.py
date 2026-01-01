@@ -3,15 +3,17 @@
 # Key changes vs your current version:
 # 1) NO channel purge on startup or rebuild.
 # 2) Shop/Manage/Management buttons remain functional after bot restarts (persistent views).
-# 3) Message IDs are persisted to disk (data/shop_message_index.json) so the bot edits existing messages
+# 3) Message IDs are persisted to disk (shop_message_index.json) so the bot edits existing messages
 #    instead of deleting and reposting everything.
 #
-# Fixes in this version:
-# - Removed dead ShopRouterView placeholder (it could never match real custom_ids).
-# - Hardened interaction router to safely handle "already responded" / NotFound edge cases.
-# - Added small safe helpers used by the router.
-# - Kept your persistence and no-purge behavior intact.
+# Additional fix in THIS version:
+# - Prevents reposting on every redeploy by persisting all shop files to Railway volume (/data by default)
+#   and by rebuilding the index from existing messages if the index is missing/corrupt.
+#
+# Notes:
+# - Make sure your Railway volume is mounted to /data OR set env var PERSIST_ROOT to your mounted path.
 
+import os
 import discord
 import json
 import asyncio
@@ -21,10 +23,16 @@ from pathlib import Path
 from discord.ext import commands
 from discord import app_commands
 
-SHOP_FILE = Path("data/shop.json")
-AP_FILE = Path("data/ap_data.json")
-ORDERS_FILE = Path("data/shop_orders.json")
-INDEX_FILE = Path("data/shop_message_index.json")
+# ----------------------------
+# Persistence root (Railway)
+# ----------------------------
+PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
+
+SHOP_FILE = PERSIST_ROOT / "shop.json"
+AP_FILE = PERSIST_ROOT / "ap_data.json"
+ORDERS_FILE = PERSIST_ROOT / "shop_orders.json"
+INDEX_FILE = PERSIST_ROOT / "shop_message_index.json"
 
 for p in (SHOP_FILE, AP_FILE, ORDERS_FILE, INDEX_FILE):
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +154,11 @@ def is_manager(member: discord.abc.User | discord.Member) -> bool:
 # ----------------------------
 # Embed builders
 # ----------------------------
-def build_item_embed(item: dict) -> discord.Embed:
+def build_item_embed(item_id: str, item: dict) -> discord.Embed:
+    """
+    Includes the item_id in the footer so we can rebuild the message index
+    without reposting if the index file is missing/corrupt.
+    """
     embed = discord.Embed(
         title=item.get("name", "Unnamed Item"),
         description=item.get("desc", ""),
@@ -156,7 +168,7 @@ def build_item_embed(item: dict) -> discord.Embed:
     embed.add_field(name="Stock", value=str(int(item.get("stock", 0))), inline=True)
     if item.get("image"):
         embed.set_image(url=item["image"])
-    embed.set_footer(text="Cryonic Gaming Shop")
+    embed.set_footer(text=f"Cryonic Gaming Shop | id:{item_id}")
     return embed
 
 def build_order_embed(order: dict) -> discord.Embed:
@@ -183,6 +195,67 @@ def build_order_embed(order: dict) -> discord.Embed:
 
     embed.set_footer(text="Shop Orders")
     return embed
+
+# ----------------------------
+# Index recovery (prevents repost storms)
+# ----------------------------
+async def rebuild_index_from_channels(guild: discord.Guild) -> None:
+    """
+    Best-effort rebuild of INDEX_FILE by scanning recent messages in SHOP_CHANNEL and ACCESS_CHANNEL
+    and reading item_id from embed footer ("Cryonic Gaming Shop | id:<item_id>").
+    """
+    shop_ch = discord.utils.get(guild.text_channels, name=SHOP_CHANNEL)
+    access_ch = discord.utils.get(guild.text_channels, name=ACCESS_CHANNEL)
+    if not shop_ch or not access_ch:
+        return
+
+    idx = load_index()
+    gkey = str(guild.id)
+    gidx = idx.setdefault(gkey, {})
+    gidx.setdefault("items", {})
+    items_idx: dict = gidx["items"]
+
+    async def scan_channel(ch: discord.TextChannel, key_name: str):
+        async for msg in ch.history(limit=250):
+            try:
+                me = guild.me  # type: ignore
+                if not me or not msg.author or msg.author.id != me.id:
+                    continue
+                if not msg.embeds:
+                    continue
+                e = msg.embeds[0]
+                footer_text = (e.footer.text or "") if e.footer else ""
+                if "Cryonic Gaming Shop" not in footer_text or "id:" not in footer_text:
+                    continue
+                item_id = footer_text.split("id:", 1)[1].strip()
+                if not item_id:
+                    continue
+
+                entry = items_idx.get(item_id) or {}
+                if not isinstance(entry, dict):
+                    entry = {}
+                entry[key_name] = int(msg.id)
+                items_idx[item_id] = entry
+            except Exception:
+                continue
+
+    await scan_channel(shop_ch, "shop_msg_id")
+    await scan_channel(access_ch, "access_msg_id")
+
+    # Recover management message (avoid repost if missing)
+    if not gidx.get("management_msg_id"):
+        async for msg in access_ch.history(limit=150):
+            try:
+                me = guild.me  # type: ignore
+                if me and msg.author and msg.author.id == me.id and msg.content.strip() == "**Shop Management**":
+                    gidx["management_msg_id"] = int(msg.id)
+                    break
+            except Exception:
+                continue
+
+    gidx["items"] = items_idx
+    idx[gkey] = gidx
+    save_index(idx)
 
 # ----------------------------
 # Undelivered Reason Modal
@@ -675,6 +748,17 @@ class ShopCog(commands.Cog):
             self._startup_done.add(guild.id)
 
             await self.ensure_channels(guild)
+
+            # If the index is empty/missing, recover message IDs from existing messages
+            try:
+                idx = load_index()
+                gidx = idx.get(str(guild.id), {})
+                items_idx = (gidx.get("items") or {})
+                if not isinstance(items_idx, dict) or not items_idx:
+                    await rebuild_index_from_channels(guild)
+            except Exception:
+                pass
+
             await self.sync_shop_messages(guild)
             await self.sync_order_messages_best_effort(guild)
 
@@ -758,8 +842,9 @@ class ShopCog(commands.Cog):
                             idx = load_index()
                             gidx = idx.get(str(interaction.guild.id), {})
                             items_idx = gidx.get("items", {})
-                            items_idx.pop(item_id, None)
-                            gidx["items"] = items_idx
+                            if isinstance(items_idx, dict):
+                                items_idx.pop(item_id, None)
+                            gidx["items"] = items_idx if isinstance(items_idx, dict) else {}
                             idx[str(interaction.guild.id)] = gidx
                             save_index(idx)
 
@@ -868,9 +953,20 @@ class ShopCog(commands.Cog):
             gidx.setdefault("items", {})
             items_idx = gidx["items"]
 
+            # If mapping is empty, try to recover from existing messages before posting new ones
+            if not isinstance(items_idx, dict) or not items_idx:
+                await rebuild_index_from_channels(guild)
+                idx = load_index()
+                gidx = idx.setdefault(gkey, {})
+                gidx.setdefault("items", {})
+                items_idx = gidx["items"]
+                if not isinstance(items_idx, dict):
+                    items_idx = {}
+                    gidx["items"] = items_idx
+
             # Upsert each item message (shop + access)
             for item_id, item in items.items():
-                embed = build_item_embed(item)
+                embed = build_item_embed(item_id, item)
                 out_of_stock = int(item.get("stock", 0)) <= 0
 
                 # --- SHOP message ---
@@ -939,7 +1035,7 @@ class ShopCog(commands.Cog):
             return
 
         item = items[item_id]
-        embed = build_item_embed(item)
+        embed = build_item_embed(item_id, item)
         out_of_stock = int(item.get("stock", 0)) <= 0
 
         idx = load_index()
