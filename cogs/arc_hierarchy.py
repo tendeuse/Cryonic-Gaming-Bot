@@ -484,6 +484,98 @@ class ARCHierarchyCog(commands.Cog):
             ephemeral=False,
         )
 
+    # NEW: CEO-only unit ownership transfer (roles, reports, AP attribution via director_id)
+    @arc.command(name="transfer_unit")
+    @app_commands.describe(
+        from_director="Director currently owning the unit",
+        to_director="Director who will receive the unit"
+    )
+    async def transfer_unit(self, interaction: discord.Interaction, from_director: discord.Member, to_director: discord.Member):
+        # I/O + multiple operations; defer to avoid Unknown interaction.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        actor = interaction.user
+        guild = interaction.guild
+
+        if not isinstance(actor, discord.Member) or not is_ceo(actor):
+            await interaction.followup.send("Only the CEO may use this command.", ephemeral=True)
+            return
+
+        if not is_director(from_director):
+            await interaction.followup.send("`from_director` must be a Director.", ephemeral=True)
+            return
+
+        if not is_director(to_director):
+            await interaction.followup.send("`to_director` must be a Director.", ephemeral=True)
+            return
+
+        if from_director.id == to_director.id:
+            await interaction.followup.send("Source and destination Directors are the same.", ephemeral=True)
+            return
+
+        moved_count = 0
+        unit: Dict[str, Any] = {}
+
+        # Serialize JSON update (prevents races with join/promote/demote)
+        async with file_lock:
+            data = load_data()
+
+            # Validate: source unit exists
+            unit = data.get("units", {}).get(str(from_director.id))
+            if not unit:
+                await interaction.followup.send("That source Director has no unit to transfer.", ephemeral=True)
+                return
+
+            # Validate: destination director does NOT already own a unit
+            if str(to_director.id) in data.get("units", {}):
+                await interaction.followup.send("The destination Director already owns a unit.", ephemeral=True)
+                return
+
+            # Move the unit entry (ownership transfer)
+            data["units"][str(to_director.id)] = unit
+            data["units"].pop(str(from_director.id), None)
+
+            # Update all members assigned to the old unit → new director_id
+            members = data.get("members", {})
+            for _uid, rec in members.items():
+                if isinstance(rec, dict) and rec.get("director_id") == from_director.id:
+                    rec["director_id"] = to_director.id
+                    moved_count += 1
+
+            # Ensure destination director record exists and is correct
+            to_rec = ensure_member_record(data, to_director.id)
+            to_rec["rank"] = RANK_DIRECTOR
+            to_rec["director_id"] = to_director.id
+
+            save_data(data)
+
+        # Ensure destination director has the unit role so they can access the unit category/channels
+        try:
+            role_id = unit.get("unit_role_id")
+            role_obj = guild.get_role(role_id) if isinstance(role_id, int) else None
+            if role_obj and role_obj not in to_director.roles:
+                await to_director.add_roles(role_obj, reason="ARC unit transfer: new Director receiving unit role")
+            await remove_unitless_if_present(to_director)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        await log_action(
+            guild,
+            (
+                f"Unit transferred: **{unit.get('unit_name', 'Unnamed Unit')}**\n"
+                f"From Director: {from_director.mention}\n"
+                f"To Director: {to_director.mention}\n"
+                f"Moved member records: **{moved_count}**"
+            ),
+            mention_director_ids=[from_director.id, to_director.id, actor.id],
+        )
+
+        await interaction.followup.send(
+            f"✅ Transferred unit **{unit.get('unit_name', 'Unnamed Unit')}** from {from_director.mention} to {to_director.mention}.\n"
+            f"Updated **{moved_count}** member record(s).",
+            ephemeral=True,
+        )
+
     # -----------------
     # PROMOTE / DEMOTE
     # -----------------
