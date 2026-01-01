@@ -1,3 +1,13 @@
+# cogs/video_submission.py
+#
+# Fixes included (copy/paste safe):
+# 1) Removes the unreachable/duplicated code at the bottom of _parse_service_account_json (it was never executed).
+# 2) Makes Approval buttons truly restart-safe and collision-free by using UNIQUE custom_ids per video:
+#       video:approve:<video_key> / video:reject:<video_key>
+#    (Your prior version used the same custom_id for every approval card, which causes persistent-view collisions.)
+# 3) Fixes VideoLengthReportModal date parsing: uses .value (your code used str(self.date_from) which is not the input).
+# 4) Disables the approval buttons correctly on the ORIGINAL message after decision.
+
 import os
 import json
 import re
@@ -18,7 +28,7 @@ from discord.ui import View
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
-print("VIDEO_SUBMISSION LOADED VERSION: 2025-12-29-2050Z")
+print("VIDEO_SUBMISSION LOADED VERSION: 2026-01-01-VIDEO-FIX")
 
 VIDEO_FILE = Path("data/video_submissions.json")
 AP_FILE = Path("data/ap_data.json")
@@ -202,15 +212,6 @@ def decision_embed(base: discord.Embed, *, approved: bool, decided_by: discord.M
     return e
 
 
-def disable_view(view: View) -> View:
-    for item in view.children:
-        try:
-            item.disabled = True
-        except Exception:
-            pass
-    return view
-
-
 def fmt_hms(total_seconds: float) -> str:
     s = int(round(total_seconds))
     h = s // 3600
@@ -344,7 +345,6 @@ def _parse_service_account_json(raw: str) -> dict:
       - A file path to a JSON file
       - Base64-encoded JSON (whitespace/newlines allowed)
     """
-
     def _try_json(text: str):
         try:
             return json.loads(text)
@@ -358,7 +358,7 @@ def _parse_service_account_json(raw: str) -> dict:
 
     s = raw.strip()
 
-    # 0) If it looks like base64, try it early (Railway often wraps long values)
+    # 0) Base64 (common on Railway for long values)
     b64_candidate = re.sub(r"\s+", "", s)
     if re.fullmatch(r"[A-Za-z0-9+/=]+", b64_candidate or "") and len(b64_candidate) > 64:
         try:
@@ -371,9 +371,9 @@ def _parse_service_account_json(raw: str) -> dict:
                 if isinstance(j2, dict):
                     return j2
         except Exception:
-            pass  # fall through
+            pass
 
-    # 1) Direct JSON
+    # 1) Direct JSON (or JSON string that contains JSON)
     j = _try_json(s)
     if isinstance(j, dict):
         return j
@@ -382,7 +382,7 @@ def _parse_service_account_json(raw: str) -> dict:
         if isinstance(j2, dict):
             return j2
 
-    # 2) Strip surrounding quotes (env UIs sometimes store it quoted)
+    # 2) Strip surrounding quotes
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
         s2 = s[1:-1].strip()
         j = _try_json(s2)
@@ -392,9 +392,9 @@ def _parse_service_account_json(raw: str) -> dict:
             j2 = _try_json(j)
             if isinstance(j2, dict):
                 return j2
-        s = s2  # keep going with unquoted
+        s = s2
 
-    # 3) If it's a file path, read it
+    # 3) File path
     try:
         p = Path(s)
         if p.is_file():
@@ -406,14 +406,12 @@ def _parse_service_account_json(raw: str) -> dict:
                 j2 = _try_json(j)
                 if isinstance(j2, dict):
                     return j2
-            s = file_text  # continue attempts on file content
+            s = file_text
     except Exception:
         pass
 
-    # 4) Handle literal backslash escapes (your log shows '{\\n ...')
-    #    First pass: convert common sequences into real characters
+    # 4) Handle literal backslash escapes (e.g. '{\\n  "type": ... }')
     s_esc = s.replace("\\r\\n", "\\n").replace("\\n", "\n").replace("\\r", "\r")
-
     j = _try_json(s_esc)
     if isinstance(j, dict):
         return j
@@ -422,9 +420,8 @@ def _parse_service_account_json(raw: str) -> dict:
         if isinstance(j2, dict):
             return j2
 
-    # 5) If it is STILL escaped, do a unicode-escape decode once (double-escaped case)
+    # 5) One unicode-escape decode pass for double-escaped values
     try:
-        # This turns sequences like \\n into \n, and \" into "
         s_uni = s.encode("utf-8").decode("unicode_escape")
         j = _try_json(s_uni)
         if isinstance(j, dict):
@@ -439,61 +436,6 @@ def _parse_service_account_json(raw: str) -> dict:
     snippet = s[:80].replace("\n", "\\n")
     raise RuntimeError(
         "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text, a JSON file path, or base64-encoded JSON. "
-        f"(value starts with: {snippet!r})"
-    )
-
-
-    normalized = raw.strip()
-
-    # If the env UI added surrounding quotes, strip them (but keep internal escapes)
-    if (normalized.startswith('"') and normalized.endswith('"')) or (normalized.startswith("'") and normalized.endswith("'")):
-        normalized = normalized[1:-1].strip()
-
-    # 1) Raw JSON as-is
-    parsed = _try_json(normalized)
-    if isinstance(parsed, dict):
-        return _postprocess(parsed)
-
-    # 1b) Double-encoded: JSON string containing JSON
-    if isinstance(parsed, str):
-        parsed2 = _try_json(parsed)
-        if isinstance(parsed2, dict):
-            return _postprocess(parsed2)
-
-    # 2) File path to JSON
-    maybe_path = Path(normalized)
-    if maybe_path.is_file():
-        file_text = maybe_path.read_text(encoding="utf-8").strip()
-        parsed = _try_json(file_text)
-        if isinstance(parsed, dict):
-            return _postprocess(parsed)
-        if isinstance(parsed, str):
-            parsed2 = _try_json(parsed)
-            if isinstance(parsed2, dict):
-                return _postprocess(parsed2)
-
-    # 3) Base64 JSON (allow whitespace/newlines)
-    b64_candidate = re.sub(r"\s+", "", normalized)
-    if re.fullmatch(r"[A-Za-z0-9+/=]+", b64_candidate or ""):
-        try:
-            decoded_bytes = base64.b64decode(b64_candidate, validate=False)
-            decoded_text = decoded_bytes.decode("utf-8", errors="strict").strip()
-
-            parsed = _try_json(decoded_text)
-            if isinstance(parsed, dict):
-                return _postprocess(parsed)
-
-            if isinstance(parsed, str):
-                parsed2 = _try_json(parsed)
-                if isinstance(parsed2, dict):
-                    return _postprocess(parsed2)
-        except Exception:
-            pass
-
-    snippet = normalized[:80].replace("\n", "\\n")
-    raise RuntimeError(
-        "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. "
-        "Provide raw JSON text, a JSON file path, or base64-encoded JSON. "
         f"(value starts with: {snippet!r})"
     )
 
@@ -531,7 +473,8 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
             await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
             return
 
-        rng = date_str_to_local_range(str(self.date_from).strip(), str(self.date_to).strip())
+        # FIX: use .value
+        rng = date_str_to_local_range(str(self.date_from.value).strip(), str(self.date_to.value).strip())
         if not rng:
             await safe_send(interaction, "❌ Invalid dates. Use YYYY-MM-DD, and ensure To ≥ From.", ephemeral=True)
             return
@@ -552,14 +495,36 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
 
 
 # =====================
-# APPROVAL VIEW (SAFE)
+# APPROVAL VIEW (PERSISTENT + UNIQUE CUSTOM_IDS)
 # =====================
 
 class ApprovalView(View):
+    """
+    Persistent approval view with UNIQUE custom_ids per video.
+    This prevents collisions across multiple pending approvals.
+    """
     def __init__(self, cog: "VideoSubmissionCog", video_key: str):
         super().__init__(timeout=None)
         self.cog = cog
         self.video_key = str(video_key)
+
+        approve_id = f"video:approve:{self.video_key}"
+        reject_id = f"video:reject:{self.video_key}"
+
+        btn_approve = discord.ui.Button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id=approve_id)
+        btn_reject = discord.ui.Button(label="❌ Reject", style=discord.ButtonStyle.red, custom_id=reject_id)
+
+        async def _approve_cb(interaction: discord.Interaction):
+            await self.cog.process_decision(interaction, self.video_key, approve=True)
+
+        async def _reject_cb(interaction: discord.Interaction):
+            await self.cog.process_decision(interaction, self.video_key, approve=False)
+
+        btn_approve.callback = _approve_cb  # type: ignore
+        btn_reject.callback = _reject_cb    # type: ignore
+
+        self.add_item(btn_approve)
+        self.add_item(btn_reject)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -569,13 +534,14 @@ class ApprovalView(View):
             return False
         return True
 
-    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green, custom_id="video:approve")
-    async def approve_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog.process_decision(interaction, self.video_key, approve=True)
 
-    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.red, custom_id="video:reject")
-    async def reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog.process_decision(interaction, self.video_key, approve=False)
+def disable_view(view: View) -> View:
+    for item in view.children:
+        try:
+            item.disabled = True
+        except Exception:
+            pass
+    return view
 
 
 # =====================
@@ -807,6 +773,7 @@ class VideoSubmissionCog(commands.Cog):
 
         await save(VIDEO_FILE, videos)
 
+        # Register persistent view for this specific key
         try:
             self.bot.add_view(ApprovalView(self, str(key)))
         except Exception:
@@ -825,6 +792,7 @@ class VideoSubmissionCog(commands.Cog):
         await safe_send(interaction, "✅ Video submitted for approval.", ephemeral=True)
 
     async def process_decision(self, interaction: discord.Interaction, key: str, approve: bool):
+        # Public in approvals channel
         await safe_defer(interaction, ephemeral=False)
 
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -896,11 +864,14 @@ class VideoSubmissionCog(commands.Cog):
         await save(VIDEO_FILE, videos)
         await save(AUDIT_FILE, audits)
 
+        # Update the original approval card embed + disable its buttons
         try:
             if interaction.message and interaction.message.embeds:
                 base = interaction.message.embeds[0]
                 updated = decision_embed(base, approved=bool(approve), decided_by=interaction.user, ts_iso=ts)
-                await interaction.message.edit(embed=updated, view=disable_view(ApprovalView(self, key)))
+
+                disabled = disable_view(ApprovalView(self, key))
+                await interaction.message.edit(embed=updated, view=disabled)
         except Exception:
             pass
 
@@ -926,6 +897,5 @@ async def setup(bot: commands.Bot):
     # If an old cog was loaded (from an older build), remove it safely first.
     await safe_remove_cog(bot, "VideoSubmission")      # legacy name
     await safe_remove_cog(bot, "VideoSubmissionCog")   # current name
-    await safe_remove_cog(bot, "VideoSubmissionCog")   # idempotent
 
     await bot.add_cog(VideoSubmissionCog(bot))

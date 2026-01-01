@@ -1,3 +1,4 @@
+import os
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -11,8 +12,13 @@ from typing import Dict, Any, List, Optional
 # CONFIG
 # =====================
 
-DATA_FILE = Path("data/ign_registry.json")
-DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+# Railway volume path:
+# - Default to /data (Railway Volume mount)
+# - Allow override via env var if you ever change mount point
+PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
+
+DATA_FILE = PERSIST_ROOT / "ign_registry.json"
 
 ACCESS_CHANNEL_NAME = "location_access"
 
@@ -48,7 +54,13 @@ def load_state() -> Dict[str, Any]:
         return {"users": {}, "requests": {}, "leave_warnings": {}}
 
 def save_state(state: Dict[str, Any]) -> None:
-    DATA_FILE.write_text(json.dumps(state, indent=4), encoding="utf-8")
+    # Ensure volume directory exists
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Atomic write to reduce chance of corruption on restart/deploy
+    tmp = DATA_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=4), encoding="utf-8")
+    tmp.replace(DATA_FILE)
 
 def normalize_ign(s: str) -> str:
     return " ".join((s or "").strip().split())

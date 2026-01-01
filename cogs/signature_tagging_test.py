@@ -1,9 +1,16 @@
 # cogs/signature_tagging_test.py
+#
+# Fixes in this version (copy/paste safe):
+# 1) Removes ALL ephemeral responses in DMs (ephemeral is guild-only and causes "This interaction failed" in DMs).
+# 2) Adds safe interaction helpers (defer/reply/edit) that work in both guild + DM contexts.
+# 3) Keeps your existing behavior: 5 random questions, 2 tries/day (UTC), 100% required, grants Exploration Certified.
+# 4) Ensures attempts file parent folder exists.
+
 import discord
 from discord.ext import commands
 import random
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict
 import datetime
 import json
 from pathlib import Path
@@ -21,6 +28,7 @@ PASS_PERCENT = 100  # perfect score required
 CERT_ROLE_NAME = "Exploration Certified"
 
 ATTEMPTS_FILE = Path("signature_tagging_attempts.json")
+ATTEMPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 START_BUTTON_CUSTOM_ID = "sig_tag_test:start_dm"
 
@@ -60,6 +68,44 @@ def message_has_start_button(msg: discord.Message) -> bool:
     except Exception:
         return False
     return False
+
+
+def can_ephemeral(interaction: discord.Interaction) -> bool:
+    # Ephemeral only works in guild interactions.
+    return interaction.guild is not None
+
+
+async def safe_defer(interaction: discord.Interaction) -> None:
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=can_ephemeral(interaction))
+    except Exception:
+        pass
+
+
+async def safe_reply(interaction: discord.Interaction, content: str) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=can_ephemeral(interaction))
+        else:
+            await interaction.response.send_message(content, ephemeral=can_ephemeral(interaction))
+    except Exception:
+        pass
+
+
+async def safe_edit_message(interaction: discord.Interaction, *, content: str, view: discord.ui.View) -> None:
+    """
+    Edit the message that triggered this interaction (works in DM and guild).
+    """
+    try:
+        if interaction.response.is_done():
+            # Edit the original interaction message via followup (webhook edit)
+            await interaction.followup.edit_message(message_id=interaction.message.id, content=content, view=view)  # type: ignore
+        else:
+            await interaction.response.edit_message(content=content, view=view)
+    except Exception:
+        # Last resort: just defer so Discord doesn't show "interaction failed"
+        await safe_defer(interaction)
 
 
 # =====================
@@ -140,9 +186,8 @@ QUESTION_BANK: List[Question] = [
     ),
 ]
 
-
 # =====================
-# Paged Quiz View (robust, no decorator buttons)
+# Paged Quiz View
 # =====================
 class AnswerSelect(discord.ui.Select):
     def __init__(self, q_index: int, q: Question):
@@ -164,8 +209,9 @@ class AnswerSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         view: "PagedQuizView" = self.view  # type: ignore
         view.answers[self.q_index] = int(self.values[0])
-        # Always respond quickly
-        await interaction.response.send_message(f"Recorded answer for Q{self.q_index + 1}.", ephemeral=True)
+
+        # In DMs, ephemeral is invalid. Use safe_reply (ephemeral in guild, normal in DM).
+        await safe_reply(interaction, f"Recorded answer for Q{self.q_index + 1}.")
 
 
 class PagedQuizView(discord.ui.View):
@@ -179,7 +225,7 @@ class PagedQuizView(discord.ui.View):
         self.page = 0
         self.answers: Dict[int, int] = {}
 
-        # Buttons (explicit)
+        # Buttons
         self.btn_prev = discord.ui.Button(label="Prev", style=discord.ButtonStyle.secondary, row=1, custom_id="sig_tag_quiz:prev")
         self.btn_next = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary, row=1, custom_id="sig_tag_quiz:next")
         self.btn_submit = discord.ui.Button(label="Submit", style=discord.ButtonStyle.success, row=2, custom_id="sig_tag_quiz:submit")
@@ -192,18 +238,16 @@ class PagedQuizView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This test is not for you.", ephemeral=True)
+            await safe_reply(interaction, "This test is not for you.")
             return False
         return True
 
     def _render(self):
-        # Rebuild items safely
         self.clear_items()
 
         q = self.questions[self.page]
         self.add_item(AnswerSelect(self.page, q))
 
-        # nav/submit state
         self.btn_prev.disabled = (self.page == 0)
         self.btn_next.disabled = (self.page >= len(self.questions) - 1)
         self.btn_submit.disabled = (self.page != len(self.questions) - 1)
@@ -224,40 +268,17 @@ class PagedQuizView(discord.ui.View):
             f"{chosen_txt}"
         )
 
-    async def _safe_edit(self, interaction: discord.Interaction):
-        # Ensure we respond within Discord deadline
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.edit_message(message_id=interaction.message.id, content=self.content(), view=self)
-            else:
-                await interaction.response.edit_message(content=self.content(), view=self)
-        except Exception:
-            # As a last resort, acknowledge to avoid "interaction failed"
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.defer(ephemeral=True)
-            except Exception:
-                pass
-
     async def _on_prev(self, interaction: discord.Interaction):
-        try:
-            if self.page > 0:
-                self.page -= 1
-            self._render()
-            await self._safe_edit(interaction)
-        except Exception:
-            await interaction.response.send_message("An error occurred moving pages. Please restart the test.", ephemeral=True)
-            raise
+        if self.page > 0:
+            self.page -= 1
+        self._render()
+        await safe_edit_message(interaction, content=self.content(), view=self)
 
     async def _on_next(self, interaction: discord.Interaction):
-        try:
-            if self.page < len(self.questions) - 1:
-                self.page += 1
-            self._render()
-            await self._safe_edit(interaction)
-        except Exception:
-            await interaction.response.send_message("An error occurred moving pages. Please restart the test.", ephemeral=True)
-            raise
+        if self.page < len(self.questions) - 1:
+            self.page += 1
+        self._render()
+        await safe_edit_message(interaction, content=self.content(), view=self)
 
     async def _on_submit(self, interaction: discord.Interaction):
         try:
@@ -270,9 +291,10 @@ class PagedQuizView(discord.ui.View):
             percent = int((correct / total) * 100)
             passed = (percent == PASS_PERCENT)
 
+            # Disable UI
             for item in self.children:
                 item.disabled = True
-            await interaction.response.edit_message(view=self)
+            await safe_edit_message(interaction, content=self.content(), view=self)
 
             role_msg = "No role changes."
             if passed:
@@ -280,17 +302,14 @@ class PagedQuizView(discord.ui.View):
 
             await self.cog.log_result(self.guild_id, self.user_id, passed, correct, total, percent)
 
-            await interaction.followup.send(
-                f"**Result:** {correct}/{total} (**{percent}%**) — {'PASS' if passed else 'FAIL'}\n{role_msg}",
-                ephemeral=True
+            # Follow-up result (ephemeral in guild, normal in DM)
+            await safe_reply(
+                interaction,
+                f"**Result:** {correct}/{total} (**{percent}%**) — {'PASS' if passed else 'FAIL'}\n{role_msg}"
             )
+
         except Exception:
-            # Make sure user gets something even on crash
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("An error occurred submitting the test. Please retry.", ephemeral=True)
-            except Exception:
-                pass
+            await safe_reply(interaction, "An error occurred submitting the test. Please retry.")
             raise
 
 
@@ -305,7 +324,7 @@ class StartTestView(discord.ui.View):
     @discord.ui.button(label="Start Test (DM)", style=discord.ButtonStyle.primary, custom_id=START_BUTTON_CUSTOM_ID)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            await safe_reply(interaction, "This must be used in a server.")
             return
 
         day = utc_day_key()
@@ -313,10 +332,7 @@ class StartTestView(discord.ui.View):
         used = int(attempts.get(day, {}).get(str(interaction.user.id), 0))
 
         if used >= MAX_TRIES_PER_DAY:
-            await interaction.response.send_message(
-                f"You have used all **{MAX_TRIES_PER_DAY}** attempts for **{day} (UTC)**.",
-                ephemeral=True,
-            )
+            await safe_reply(interaction, f"You have used all **{MAX_TRIES_PER_DAY}** attempts for **{day} (UTC)**.")
             return
 
         questions = random.sample(QUESTION_BANK, QUESTIONS_PER_TEST)
@@ -326,7 +342,7 @@ class StartTestView(discord.ui.View):
             dm = await interaction.user.create_dm()
             await dm.send(quiz_view.content(), view=quiz_view)
         except discord.Forbidden:
-            await interaction.response.send_message("I couldn't DM you. Enable DMs and try again.", ephemeral=True)
+            await safe_reply(interaction, "I couldn't DM you. Enable DMs and try again.")
             return
 
         # consume attempt only after successful DM
@@ -334,10 +350,7 @@ class StartTestView(discord.ui.View):
         attempts[day][str(interaction.user.id)] = used + 1
         save_attempts(attempts)
 
-        await interaction.response.send_message(
-            f"Test sent. Attempts used today: **{used + 1}/{MAX_TRIES_PER_DAY}** (UTC).",
-            ephemeral=True,
-        )
+        await safe_reply(interaction, f"Test sent. Attempts used today: **{used + 1}/{MAX_TRIES_PER_DAY}** (UTC).")
 
 
 # =====================
@@ -349,6 +362,7 @@ class SignatureTaggingTestCog(commands.Cog):
         self.start_view = StartTestView(self)
 
     async def cog_load(self):
+        # persistent view so the button continues to work after restart
         self.bot.add_view(self.start_view)
 
     @commands.Cog.listener()

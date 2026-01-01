@@ -20,6 +20,7 @@
 # - /killmail_inspect
 # - /killmail_reload (restricted roles)
 
+import os
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -61,8 +62,14 @@ USER_AGENT = "Cryonic Gaming bot/1.0 (contact: tendeuse on Discord)"
 ESI_BASE = "https://esi.evetech.net/latest"
 IMAGE_BASE = "https://images.evetech.net"
 
-DATA_FILE = Path("data/killmail_feed.json")
-DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+# ---------------------
+# PERSISTENCE (Railway)
+# ---------------------
+# Default to /data (Railway Volume mount); override with env var if desired.
+PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
+
+DATA_FILE = PERSIST_ROOT / "killmail_feed.json"
 
 MAX_NAME_CACHE = 10000
 MAX_SYSTEM_CACHE = 5000
@@ -93,7 +100,11 @@ def load_json(path: Path) -> Dict[str, Any]:
         return {}
 
 def save_json(path: Path, data: Dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    # Ensure volume directory exists and write atomically
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    tmp.replace(path)
 
 def safe_int(x) -> Optional[int]:
     try:

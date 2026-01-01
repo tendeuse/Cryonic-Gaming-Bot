@@ -6,9 +6,11 @@
 # 3) Message IDs are persisted to disk (data/shop_message_index.json) so the bot edits existing messages
 #    instead of deleting and reposting everything.
 #
-# Notes:
-# - Order buttons were already persistent (custom_id) and are restored on startup.
-# - Buy/Manage buttons are now persistent via custom_id patterns + a router view.
+# Fixes in this version:
+# - Removed dead ShopRouterView placeholder (it could never match real custom_ids).
+# - Hardened interaction router to safely handle "already responded" / NotFound edge cases.
+# - Added small safe helpers used by the router.
+# - Kept your persistence and no-purge behavior intact.
 
 import discord
 import json
@@ -34,6 +36,46 @@ ORDER_LOG_CHANNEL = "ap-shop-orders"
 ALLOWED_ROLES = {"Shop Steward", "ARC Security Administration Council"}
 
 SHOP_LOCK = asyncio.Lock()
+
+# ----------------------------
+# Interaction safety helpers
+# ----------------------------
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True) -> None:
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+    except Exception:
+        pass
+
+async def safe_reply(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    ephemeral: bool = True,
+) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except Exception:
+        pass
+
+async def safe_send_modal(interaction: discord.Interaction, modal: discord.ui.Modal) -> None:
+    try:
+        if interaction.response.is_done():
+            # If already acknowledged elsewhere, we cannot open a modal.
+            await interaction.followup.send("❌ Please try again.", ephemeral=True)
+            return
+        await interaction.response.send_modal(modal)
+    except (discord.InteractionResponded, discord.NotFound):
+        # Already responded / interaction expired
+        return
+    except Exception:
+        try:
+            await safe_reply(interaction, "❌ Failed to open the form. Please try again.", ephemeral=True)
+        except Exception:
+            pass
 
 # ----------------------------
 # JSON helpers
@@ -107,19 +149,21 @@ def is_manager(member: discord.abc.User | discord.Member) -> bool:
 def build_item_embed(item: dict) -> discord.Embed:
     embed = discord.Embed(
         title=item.get("name", "Unnamed Item"),
-        description=item.get("desc", "")
+        description=item.get("desc", ""),
+        timestamp=discord.utils.utcnow(),
     )
     embed.add_field(name="Price", value=f'{int(item.get("price", 0))} AP', inline=True)
     embed.add_field(name="Stock", value=str(int(item.get("stock", 0))), inline=True)
     if item.get("image"):
         embed.set_image(url=item["image"])
+    embed.set_footer(text="Cryonic Gaming Shop")
     return embed
 
 def build_order_embed(order: dict) -> discord.Embed:
     status = order.get("status", "PENDING")
     title = f"Order {order.get('order_id', '')} — {status}"
 
-    embed = discord.Embed(title=title)
+    embed = discord.Embed(title=title, timestamp=discord.utils.utcnow())
     embed.add_field(name="Buyer", value=f"<@{order.get('buyer_id')}> ({order.get('buyer_tag')})", inline=False)
     embed.add_field(name="Item", value=str(order.get("item_name", "Unknown")), inline=True)
     embed.add_field(name="Quantity", value=str(order.get("qty", 0)), inline=True)
@@ -137,6 +181,7 @@ def build_order_embed(order: dict) -> discord.Embed:
         reason = order.get("undelivered_reason") or "No reason provided."
         embed.add_field(name="Reason", value=reason[:1024], inline=False)
 
+    embed.set_footer(text="Shop Orders")
     return embed
 
 # ----------------------------
@@ -159,17 +204,17 @@ class UndeliveredReasonModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_manager(interaction.user):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         async with SHOP_LOCK:
             data = load_orders()
             orders = data.setdefault("orders", {})
             o = orders.get(self.order_id)
             if not o:
-                await interaction.followup.send("❌ Order not found.", ephemeral=True)
+                await safe_reply(interaction, "❌ Order not found.", ephemeral=True)
                 return
 
             o["status"] = "UNDELIVERED"
@@ -183,11 +228,12 @@ class UndeliveredReasonModal(discord.ui.Modal):
             orders[self.order_id] = o
             save_orders(data)
 
-        await self.cog.refresh_order_message(interaction.guild, self.order_id)
-        await interaction.followup.send("✅ Marked as UNDELIVERED.", ephemeral=True)
+        if interaction.guild:
+            await self.cog.refresh_order_message(interaction.guild, self.order_id)
+        await safe_reply(interaction, "✅ Marked as UNDELIVERED.", ephemeral=True)
 
 # ----------------------------
-# Persistent Order Buttons (already good)
+# Persistent Order Buttons
 # ----------------------------
 class DeliveredButton(discord.ui.Button):
     def __init__(self, cog: "ShopCog", order_id: str):
@@ -201,17 +247,17 @@ class DeliveredButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_manager(interaction.user):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         async with SHOP_LOCK:
             data = load_orders()
             orders = data.setdefault("orders", {})
             o = orders.get(self.order_id)
             if not o:
-                await interaction.followup.send("❌ Order not found.", ephemeral=True)
+                await safe_reply(interaction, "❌ Order not found.", ephemeral=True)
                 return
 
             o["status"] = "DELIVERED"
@@ -225,8 +271,9 @@ class DeliveredButton(discord.ui.Button):
             orders[self.order_id] = o
             save_orders(data)
 
-        await self.cog.refresh_order_message(interaction.guild, self.order_id)
-        await interaction.followup.send("✅ Marked as DELIVERED.", ephemeral=True)
+        if interaction.guild:
+            await self.cog.refresh_order_message(interaction.guild, self.order_id)
+        await safe_reply(interaction, "✅ Marked as DELIVERED.", ephemeral=True)
 
 class UndeliveredButton(discord.ui.Button):
     def __init__(self, cog: "ShopCog", order_id: str):
@@ -240,9 +287,9 @@ class UndeliveredButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_manager(interaction.user):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
-        await interaction.response.send_modal(UndeliveredReasonModal(self.cog, self.order_id))
+        await safe_send_modal(interaction, UndeliveredReasonModal(self.cog, self.order_id))
 
 class UndoButton(discord.ui.Button):
     def __init__(self, cog: "ShopCog", order_id: str):
@@ -256,17 +303,17 @@ class UndoButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if not is_manager(interaction.user):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         async with SHOP_LOCK:
             data = load_orders()
             orders = data.setdefault("orders", {})
             o = orders.get(self.order_id)
             if not o:
-                await interaction.followup.send("❌ Order not found.", ephemeral=True)
+                await safe_reply(interaction, "❌ Order not found.", ephemeral=True)
                 return
 
             o["status"] = "PENDING"
@@ -279,8 +326,9 @@ class UndoButton(discord.ui.Button):
             orders[self.order_id] = o
             save_orders(data)
 
-        await self.cog.refresh_order_message(interaction.guild, self.order_id)
-        await interaction.followup.send("✅ Status reset to PENDING.", ephemeral=True)
+        if interaction.guild:
+            await self.cog.refresh_order_message(interaction.guild, self.order_id)
+        await safe_reply(interaction, "✅ Status reset to PENDING.", ephemeral=True)
 
 class OrderStatusView(discord.ui.View):
     def __init__(self, cog: "ShopCog", order_id: str):
@@ -304,19 +352,19 @@ class BuyItemModal(discord.ui.Modal):
         self.add_item(self.ign)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         try:
             qty = int(str(self.qty.value).strip())
             if qty <= 0:
                 raise ValueError
         except ValueError:
-            await interaction.followup.send("❌ Quantity must be a positive whole number.", ephemeral=True)
+            await safe_reply(interaction, "❌ Quantity must be a positive whole number.", ephemeral=True)
             return
 
         ign = str(self.ign.value).strip()
         if not ign:
-            await interaction.followup.send("❌ IGN is required.", ephemeral=True)
+            await safe_reply(interaction, "❌ IGN is required.", ephemeral=True)
             return
 
         async with SHOP_LOCK:
@@ -324,30 +372,30 @@ class BuyItemModal(discord.ui.Modal):
             items = shop["items"]
 
             if self.item_id not in items:
-                await interaction.followup.send("❌ This item no longer exists.", ephemeral=True)
+                await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
                 return
 
             item = items[self.item_id]
             stock = int(item.get("stock", 0))
             if stock <= 0:
-                await interaction.followup.send("❌ Out of stock.", ephemeral=True)
+                await safe_reply(interaction, "❌ Out of stock.", ephemeral=True)
                 return
             if qty > stock:
-                await interaction.followup.send(f"❌ Not enough stock (requested {qty}, available {stock}).", ephemeral=True)
+                await safe_reply(interaction, f"❌ Not enough stock (requested {qty}, available {stock}).", ephemeral=True)
                 return
 
             ap_data = load_ap()
             uid = str(interaction.user.id)
             user_entry = ap_data.get(uid)
             if not user_entry or "ap" not in user_entry:
-                await interaction.followup.send("❌ You have no AP account.", ephemeral=True)
+                await safe_reply(interaction, "❌ You have no AP account.", ephemeral=True)
                 return
 
             price = int(item.get("price", 0))
             total_cost = price * qty
             user_ap = int(float(user_entry.get("ap", 0)))
             if user_ap < total_cost:
-                await interaction.followup.send(f"❌ Not enough AP (cost {total_cost}, you have {user_ap}).", ephemeral=True)
+                await safe_reply(interaction, f"❌ Not enough AP (cost {total_cost}, you have {user_ap}).", ephemeral=True)
                 return
 
             # Apply AP + stock
@@ -382,12 +430,12 @@ class BuyItemModal(discord.ui.Modal):
             save_orders(orders_data)
 
         if not interaction.guild:
-            await interaction.followup.send("❌ Guild context missing.", ephemeral=True)
+            await safe_reply(interaction, "❌ Guild context missing.", ephemeral=True)
             return
 
         order_ch = discord.utils.get(interaction.guild.text_channels, name=ORDER_LOG_CHANNEL)
         if not order_ch:
-            await interaction.followup.send("❌ Order channel not found. Contact staff.", ephemeral=True)
+            await safe_reply(interaction, "❌ Order channel not found. Contact staff.", ephemeral=True)
             return
 
         # Ensure persistent order view exists for this order
@@ -406,7 +454,7 @@ class BuyItemModal(discord.ui.Modal):
         # Update this item's embeds without purging
         await self.cog.update_item_messages(interaction.guild, self.item_id)
 
-        await interaction.followup.send("✅ Order placed.", ephemeral=True)
+        await safe_reply(interaction, "✅ Order placed.", ephemeral=True)
 
 # ----------------------------
 # Stock / item management modals
@@ -422,24 +470,24 @@ class AdjustStockModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_manager(interaction.user):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         try:
             amt = int(str(self.amount.value).strip())
             if amt <= 0:
                 raise ValueError
         except ValueError:
-            await interaction.followup.send("❌ Quantity must be a positive whole number.", ephemeral=True)
+            await safe_reply(interaction, "❌ Quantity must be a positive whole number.", ephemeral=True)
             return
 
         async with SHOP_LOCK:
             shop = ensure_shop_schema(load_shop())
             items = shop["items"]
             if self.item_id not in items:
-                await interaction.followup.send("❌ This item no longer exists.", ephemeral=True)
+                await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
                 return
 
             item = items[self.item_id]
@@ -451,8 +499,9 @@ class AdjustStockModal(discord.ui.Modal):
             items[self.item_id] = item
             save_shop(shop)
 
-        await self.cog.update_item_messages(interaction.guild, self.item_id)
-        await interaction.followup.send("✅ Stock updated.", ephemeral=True)
+        if interaction.guild:
+            await self.cog.update_item_messages(interaction.guild, self.item_id)
+        await safe_reply(interaction, "✅ Stock updated.", ephemeral=True)
 
 class UpdateItemModal(discord.ui.Modal):
     def __init__(self, cog: "ShopCog", item_id: str, item: dict):
@@ -470,24 +519,24 @@ class UpdateItemModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_manager(interaction.user):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         try:
             price = int(str(self.price.value).strip())
             if price < 0:
                 raise ValueError
         except ValueError:
-            await interaction.followup.send("❌ Price must be a non-negative integer.", ephemeral=True)
+            await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
             return
 
         async with SHOP_LOCK:
             shop = ensure_shop_schema(load_shop())
             items = shop["items"]
             if self.item_id not in items:
-                await interaction.followup.send("❌ This item no longer exists.", ephemeral=True)
+                await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
                 return
 
             item = items[self.item_id]
@@ -499,8 +548,9 @@ class UpdateItemModal(discord.ui.Modal):
             items[self.item_id] = item
             save_shop(shop)
 
-        await self.cog.update_item_messages(interaction.guild, self.item_id)
-        await interaction.followup.send("✅ Item updated.", ephemeral=True)
+        if interaction.guild:
+            await self.cog.update_item_messages(interaction.guild, self.item_id)
+        await safe_reply(interaction, "✅ Item updated.", ephemeral=True)
 
 class AddNewItemModal(discord.ui.Modal):
     def __init__(self, cog: "ShopCog"):
@@ -517,17 +567,17 @@ class AddNewItemModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_manager(interaction.user):
-            await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
 
         try:
             price = int(str(self.price.value).strip())
             if price < 0:
                 raise ValueError
         except ValueError:
-            await interaction.followup.send("❌ Price must be a non-negative integer.", ephemeral=True)
+            await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
             return
 
         async with SHOP_LOCK:
@@ -545,51 +595,17 @@ class AddNewItemModal(discord.ui.Modal):
             save_shop(shop)
 
         # Sync messages without purging
-        await self.cog.sync_shop_messages(interaction.guild)
-        await interaction.followup.send("✅ New item added.", ephemeral=True)
+        if interaction.guild:
+            await self.cog.sync_shop_messages(interaction.guild)
+        await safe_reply(interaction, "✅ New item added.", ephemeral=True)
 
 # ----------------------------
 # Persistent Views (restart-safe)
 # ----------------------------
-class ShopRouterView(discord.ui.View):
-    """
-    A single persistent view that routes button presses via custom_id patterns.
-
-    custom_id patterns:
-      shop:buy:<item_id>
-      shop:stock_add:<item_id>
-      shop:stock_remove:<item_id>
-      shop:update:<item_id>
-      shop:remove:<item_id>
-      shop:add_new
-    """
-    def __init__(self, cog: "ShopCog"):
-        super().__init__(timeout=None)
-        self.cog = cog
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Always allow viewing/clicking; permissions enforced per action.
-        return True
-
-    # BUY button
-    @discord.ui.button(label="Buy", style=discord.ButtonStyle.success, custom_id="shop:buy:__placeholder__")
-    async def buy_button(self, interaction: discord.Interaction, _btn: discord.ui.Button):
-        # This method won't be used because custom_id must match exactly.
-        # Routing happens in on_interaction (below). Kept only to satisfy UI builder.
-        pass
-
-    async def on_timeout(self):
-        return
-
-    # Router: discord.py calls View interaction dispatch by matching custom_id to items.
-    # Because custom_id must match exactly, we implement a *DynamicItem-style* approach:
-    # We attach Buttons dynamically in register_*_views() below instead of relying on decorator.
-
 class BuyView(discord.ui.View):
     def __init__(self, cog: "ShopCog", item_id: str, disabled: bool):
         super().__init__(timeout=None)
         self.cog = cog
-
         self.add_item(discord.ui.Button(
             label="Buy",
             style=discord.ButtonStyle.success,
@@ -604,7 +620,6 @@ class ManageView(discord.ui.View):
     def __init__(self, cog: "ShopCog", item_id: str):
         super().__init__(timeout=None)
         self.cog = cog
-
         self.add_item(discord.ui.Button(label="Add Stock", style=discord.ButtonStyle.primary, custom_id=f"shop:stock_add:{item_id}"))
         self.add_item(discord.ui.Button(label="Remove Stock", style=discord.ButtonStyle.danger, custom_id=f"shop:stock_remove:{item_id}"))
         self.add_item(discord.ui.Button(label="Update Item", style=discord.ButtonStyle.secondary, custom_id=f"shop:update:{item_id}"))
@@ -690,66 +705,73 @@ class ShopCog(commands.Cog):
 
             # ---------- BUY ----------
             if action == "buy" and item_id:
-                # Stock check happens inside modal submit; we only open modal here.
-                await interaction.response.send_modal(BuyItemModal(self, item_id))
+                await safe_send_modal(interaction, BuyItemModal(self, item_id))
                 return
 
             # ---------- MANAGEMENT: add new item ----------
             if action == "add_new":
                 if not is_manager(interaction.user):
-                    await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+                    await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
                     return
-                await interaction.response.send_modal(AddNewItemModal(self))
+                await safe_send_modal(interaction, AddNewItemModal(self))
                 return
 
             # Below actions require manager
             if action in ("stock_add", "stock_remove", "update", "remove") and item_id:
                 if not is_manager(interaction.user):
-                    await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
+                    await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
                     return
 
                 if action == "stock_add":
-                    await interaction.response.send_modal(AdjustStockModal(self, item_id, "add"))
+                    await safe_send_modal(interaction, AdjustStockModal(self, item_id, "add"))
                     return
+
                 if action == "stock_remove":
-                    await interaction.response.send_modal(AdjustStockModal(self, item_id, "remove"))
+                    await safe_send_modal(interaction, AdjustStockModal(self, item_id, "remove"))
                     return
+
                 if action == "update":
                     shop = ensure_shop_schema(load_shop())
                     items = shop["items"]
                     if item_id not in items:
-                        await interaction.response.send_message("❌ This item no longer exists.", ephemeral=True)
+                        await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
                         return
-                    await interaction.response.send_modal(UpdateItemModal(self, item_id, items[item_id]))
+                    await safe_send_modal(interaction, UpdateItemModal(self, item_id, items[item_id]))
                     return
+
                 if action == "remove":
-                    await interaction.response.defer(ephemeral=True)
+                    await safe_defer(interaction, ephemeral=True)
+
                     async with SHOP_LOCK:
                         shop = ensure_shop_schema(load_shop())
                         items = shop["items"]
                         if item_id not in items:
-                            await interaction.followup.send("❌ This item no longer exists.", ephemeral=True)
+                            await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
                             return
+
                         item_name = items[item_id].get("name", item_id)
                         items.pop(item_id, None)
                         save_shop(shop)
 
                         # Remove the index entry; do NOT purge channels
-                        idx = load_index()
-                        gidx = idx.get(str(interaction.guild.id), {})
-                        items_idx = gidx.get("items", {})
-                        items_idx.pop(item_id, None)
-                        gidx["items"] = items_idx
-                        idx[str(interaction.guild.id)] = gidx
-                        save_index(idx)
+                        if interaction.guild:
+                            idx = load_index()
+                            gidx = idx.get(str(interaction.guild.id), {})
+                            items_idx = gidx.get("items", {})
+                            items_idx.pop(item_id, None)
+                            gidx["items"] = items_idx
+                            idx[str(interaction.guild.id)] = gidx
+                            save_index(idx)
 
                     # Resync messages (edits existing, creates missing)
-                    await self.sync_shop_messages(interaction.guild)
-                    await interaction.followup.send(f"🗑️ Removed **{item_name}**.", ephemeral=True)
+                    if interaction.guild:
+                        await self.sync_shop_messages(interaction.guild)
+
+                    await safe_reply(interaction, f"🗑️ Removed **{item_name}**.", ephemeral=True)
                     return
 
         except Exception:
-            # never crash the bot on interaction routing
+            # Never crash the bot on interaction routing
             return
 
     # ----------------------------
@@ -767,11 +789,7 @@ class ShopCog(commands.Cog):
         self._registered_order_views.add(order_id)
 
     async def sync_order_messages_best_effort(self, guild: discord.Guild):
-        """
-        Optional: after restart, ensure existing order messages still have working views.
-        We do NOT edit every message; we only reattach view when refreshing individual orders.
-        """
-        # Nothing required here; order views are registered via bot.add_view(OrderStatusView(...))
+        # Order views are registered via bot.add_view(OrderStatusView(...))
         # and will work for messages that already have those custom_ids.
         return
 
@@ -786,19 +804,25 @@ class ShopCog(commands.Cog):
             everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
         }
         if me:
-            shop_overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, read_message_history=True)
+            shop_overwrites[me] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
+            )
 
         orders_overwrites = {
             everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
         }
         if me:
-            orders_overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, read_message_history=True)
+            orders_overwrites[me] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
+            )
 
         access_overwrites = {
             everyone: discord.PermissionOverwrite(view_channel=False),
         }
         if me:
-            access_overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, read_message_history=True)
+            access_overwrites[me] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
+            )
         for role_name in ALLOWED_ROLES:
             role = discord.utils.get(guild.roles, name=role_name)
             if role:
@@ -944,9 +968,6 @@ class ShopCog(commands.Cog):
             return
 
     async def refresh_order_message(self, guild: discord.Guild, order_id: str):
-        if not guild:
-            return
-
         orders_ch = discord.utils.get(guild.text_channels, name=ORDER_LOG_CHANNEL)
         if not orders_ch:
             return
@@ -970,24 +991,21 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="shop_rebuild", description="Sync shop displays without purging (Shop Steward / Admin Council only).")
     @has_required_role()
     async def shop_rebuild(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
+        if not interaction.guild:
+            await safe_reply(interaction, "❌ Must be used in a server.", ephemeral=True)
+            return
         await self.ensure_channels(interaction.guild)
         await self.sync_shop_messages(interaction.guild)
-        await interaction.followup.send("✅ Shop synced (no purge).", ephemeral=True)
+        await safe_reply(interaction, "✅ Shop synced (no purge).", ephemeral=True)
 
     @shop_rebuild.error
     async def shop_rebuild_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CheckFailure):
-            try:
-                await interaction.response.send_message("❌ Not authorized.", ephemeral=True)
-            except discord.InteractionResponded:
-                await interaction.followup.send("❌ Not authorized.", ephemeral=True)
-        else:
-            try:
-                await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
-            except discord.InteractionResponded:
-                await interaction.followup.send("❌ An error occurred.", ephemeral=True)
-            raise error
+            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
+            return
+        await safe_reply(interaction, "❌ An error occurred.", ephemeral=True)
+        raise error
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(ShopCog(bot))

@@ -1,5 +1,6 @@
 # cogs/arc_hierarchy.py
 
+import os
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -7,6 +8,21 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import io
+import asyncio
+
+# =====================
+# PERSISTENCE (Railway Volume)
+# =====================
+# Mount your Railway Volume at /data.
+# Optionally override with env var PERSIST_ROOT (e.g., "/data").
+PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Persist hierarchy state on the volume
+DATA_FILE = PERSIST_ROOT / "arc_hierarchy.json"
+
+# Single-process lock to serialize JSON read/write
+file_lock = asyncio.Lock()
 
 # =====================
 # ROLES
@@ -24,10 +40,9 @@ UNITLESS_ROLE = "Unitless"
 PROTECTED_RANK_ROLES = {SECURITY_ROLE, DIRECTOR_ROLE, CEO_ROLE}
 
 # =====================
-# CHANNELS / STORAGE
+# CHANNELS
 # =====================
 LOG_CH = "arc-hierarchy-log"
-DATA_FILE = Path("arc_hierarchy.json")
 
 # =====================
 # RANKS
@@ -64,13 +79,62 @@ DEMOTE_TO = {
 # =====================
 # PERSISTENCE
 # =====================
+def _default_data() -> Dict[str, Any]:
+    return {"members": {}, "units": {}}
+
+def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
+    """
+    Atomic JSON write:
+      - write to .tmp in same directory
+      - replace target
+    Reduces risk of corruption on crash/redeploy.
+    """
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    payload = json.dumps(data, indent=2)
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(p)
+
 def load_data() -> Dict[str, Any]:
-    if not DATA_FILE.exists():
-        return {"members": {}, "units": {}}
-    return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    """
+    Robust load:
+      - if missing: default structure
+      - if blank/corrupt: keep a .bak and default
+    """
+    try:
+        if not DATA_FILE.exists():
+            return _default_data()
+
+        txt = DATA_FILE.read_text(encoding="utf-8").strip()
+        if not txt:
+            return _default_data()
+
+        data = json.loads(txt)
+        if not isinstance(data, dict):
+            return _default_data()
+
+        data.setdefault("members", {})
+        data.setdefault("units", {})
+        if not isinstance(data["members"], dict):
+            data["members"] = {}
+        if not isinstance(data["units"], dict):
+            data["units"] = {}
+
+        return data
+
+    except json.JSONDecodeError:
+        # Keep a backup for inspection, then reset
+        try:
+            bak = DATA_FILE.with_suffix(DATA_FILE.suffix + ".bak")
+            DATA_FILE.replace(bak)
+        except Exception:
+            pass
+        return _default_data()
+    except Exception:
+        return _default_data()
 
 def save_data(data: Dict[str, Any]) -> None:
-    DATA_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _atomic_write_json(DATA_FILE, data)
 
 # =====================
 # HELPERS
@@ -226,32 +290,35 @@ async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str,
     (ARC Security + Director + CEO).
     """
     guild = member.guild
-    data = load_data()
-    rec = ensure_member_record(data, member.id)
 
-    old_rank = rec.get("rank", RANK_SECURITY)
-    rec["rank"] = new_rank
+    # Serialize state updates
+    async with file_lock:
+        data = load_data()
+        rec = ensure_member_record(data, member.id)
 
-    # Remove prior rank roles except protected roles
-    to_remove: List[discord.Role] = []
-    for role in rank_roles_to_strip(guild):
-        if role in member.roles:
-            to_remove.append(role)
-    if to_remove:
-        await member.remove_roles(*to_remove, reason="ARC rank change: removing prior rank roles")
+        old_rank = rec.get("rank", RANK_SECURITY)
+        rec["rank"] = new_rank
 
-    # Add the new rank role (if applicable)
-    if new_rank in (RANK_OFFICER, RANK_COMMANDER, RANK_GENERAL, RANK_DIRECTOR, RANK_CEO):
-        role_name = ROLE_BY_RANK.get(new_rank)
-        role_obj = get_role(guild, role_name) if role_name else None
-        if role_obj and role_obj not in member.roles:
-            try:
-                await member.add_roles(role_obj, reason=f"ARC rank change: set to {new_rank}")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+        # Remove prior rank roles except protected roles
+        to_remove: List[discord.Role] = []
+        for role in rank_roles_to_strip(guild):
+            if role in member.roles:
+                to_remove.append(role)
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="ARC rank change: removing prior rank roles")
 
-    save_data(data)
-    return old_rank, new_rank
+        # Add the new rank role (if applicable)
+        if new_rank in (RANK_OFFICER, RANK_COMMANDER, RANK_GENERAL, RANK_DIRECTOR, RANK_CEO):
+            role_name = ROLE_BY_RANK.get(new_rank)
+            role_obj = get_role(guild, role_name) if role_name else None
+            if role_obj and role_obj not in member.roles:
+                try:
+                    await member.add_roles(role_obj, reason=f"ARC rank change: set to {new_rank}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+        save_data(data)
+        return old_rank, new_rank
 
 async def log_action(guild: discord.Guild, content: str, mention_director_ids: List[int]) -> None:
     ch = await ensure_log_channel(guild)
@@ -283,13 +350,13 @@ class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
         director = interaction.user
-        data = load_data()
 
         # Validate quickly BEFORE deferring
         if not is_director(director):
             await interaction.response.send_message("Only Directors may create units.", ephemeral=True)
             return
 
+        data = load_data()
         if str(director.id) in data["units"]:
             await interaction.response.send_message("You already own a unit.", ephemeral=True)
             return

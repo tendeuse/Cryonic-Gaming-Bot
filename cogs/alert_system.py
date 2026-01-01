@@ -16,10 +16,18 @@ from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
-VIDEO_FILE = Path("data/video_submissions.json")
-AP_FILE = Path("data/ap_data.json")
-AUDIT_FILE = Path("data/video_audit_log.json")
-REPORT_STATE_FILE = Path("data/video_report_state.json")
+# =====================
+# PERSISTENCE (Railway Volume)
+# =====================
+# Mount your Railway Volume at /data.
+# Optionally override with env var PERSIST_ROOT (e.g., "/data").
+PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
+
+VIDEO_FILE = PERSIST_ROOT / "video_submissions.json"
+AP_FILE = PERSIST_ROOT / "ap_data.json"
+AUDIT_FILE = PERSIST_ROOT / "video_audit_log.json"
+REPORT_STATE_FILE = PERSIST_ROOT / "video_report_state.json"
 
 # =====================
 # ENV VARS (Railway)
@@ -63,9 +71,18 @@ def _load_file(p: Path):
     except Exception:
         return {}
 
-def _save_file(p: Path, d):
+def _atomic_write_json(p: Path, d) -> None:
+    """
+    Atomic JSON write:
+      - write to .tmp in same directory
+      - replace target
+    This reduces risk of corruption on crash/redeploy.
+    """
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(d, indent=4), encoding="utf-8")
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    payload = json.dumps(d, indent=4)
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(p)
 
 async def load(p: Path):
     async with file_lock:
@@ -73,7 +90,7 @@ async def load(p: Path):
 
 async def save(p: Path, d):
     async with file_lock:
-        _save_file(p, d)
+        _atomic_write_json(p, d)
 
 def now_iso():
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
