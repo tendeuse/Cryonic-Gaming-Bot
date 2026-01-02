@@ -2,6 +2,9 @@
 #
 # Alert System + Wormhole Status
 # Railway persistence via /data volume (or PERSIST_ROOT override).
+# Auto-load behavior:
+#   - On bot ready: for every guild, ensure #wormhole-status exists and panels are posted/refreshed
+#   - Persistent Views registered (so buttons keep working after restart)
 #
 import os
 import discord
@@ -256,15 +259,31 @@ class AlertSystemCog(commands.Cog):
         self.bot = bot
         self.state: Dict[str, Any] = _default_state()
 
-        # Persistent views (safe to call at init)
+        # Register persistent views so buttons work after restarts.
+        # (They must use stable custom_id values, which they do.)
         self.bot.add_view(AlertPanelView(self))
         self.bot.add_view(WormholeStatusView(self))
 
         self._send_lock = asyncio.Lock()
+        self._auto_setup_done: Set[int] = set()  # guild_id set
 
     async def cog_load(self):
         # Load persisted state from Railway volume on cog load
         self.state = await load_state()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # Auto-create/refresh panels in every guild this bot is in.
+        # Safe to run multiple times; we guard per guild.
+        for g in self.bot.guilds:
+            if g.id in self._auto_setup_done:
+                continue
+            try:
+                await self.upsert_panels(g)
+            except Exception:
+                # Do not crash bot on missing perms; it can still be run manually via /alert_setup
+                pass
+            self._auto_setup_done.add(g.id)
 
     # -------- Storage ops --------
 
@@ -311,9 +330,6 @@ class AlertSystemCog(commands.Cog):
         self.state["broadcasts"] = clamp_history(b)
         await save_state(self.state)
 
-    async def persist_state(self):
-        await save_state(self.state)
-
     # -------- Channel / Panels --------
 
     async def ensure_channel(self, guild: discord.Guild) -> discord.TextChannel:
@@ -330,7 +346,6 @@ class AlertSystemCog(commands.Cog):
         return await guild.create_text_channel(CHANNEL_NAME, overwrites=overwrites, reason="Wormhole status channel")
 
     def build_alert_panel_embed(self, guild: discord.Guild) -> discord.Embed:
-        # Count opted-in among ARC Security members (best effort)
         role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
         opted_in_count = 0
         if role:
@@ -375,8 +390,16 @@ class AlertSystemCog(commands.Cog):
         alert_msg_id = panel_ids.get("alert")
         status_msg_id = panel_ids.get("status")
 
+        # If the persisted channel id belongs to a different guild/channel, reset and recreate
+        stored_gid = panel_ids.get("guild_id")
+        stored_cid = panel_ids.get("channel_id")
+        if stored_gid and int(stored_gid) != guild.id:
+            alert_msg_id = None
+            status_msg_id = None
+            stored_cid = None
+
         alert_embed = self.build_alert_panel_embed(guild)
-        if alert_msg_id:
+        if alert_msg_id and stored_cid and int(stored_cid) == ch.id:
             try:
                 msg = await ch.fetch_message(int(alert_msg_id))
                 await msg.edit(embed=alert_embed, view=AlertPanelView(self))
@@ -388,7 +411,7 @@ class AlertSystemCog(commands.Cog):
             alert_msg_id = msg.id
 
         status_embed = self.build_status_embed()
-        if status_msg_id:
+        if status_msg_id and stored_cid and int(stored_cid) == ch.id:
             try:
                 msg2 = await ch.fetch_message(int(status_msg_id))
                 await msg2.edit(embed=status_embed, view=WormholeStatusView(self))
@@ -413,6 +436,7 @@ class AlertSystemCog(commands.Cog):
         status_msg_id = panel_ids.get("status")
         if not channel_id or not status_msg_id:
             return
+
         ch = guild.get_channel(int(channel_id))
         if not isinstance(ch, discord.TextChannel):
             return
@@ -438,17 +462,16 @@ class AlertSystemCog(commands.Cog):
             await interaction.response.send_message(f"Role `{ARC_SECURITY_ROLE}` not found.", ephemeral=True)
             return
 
-        # recipients: ARC Security, opted in, not bots
         recipients: List[discord.Member] = []
         recs = self.opt_in_records()
         for m in role.members:
             if m.bot:
                 continue
-            # update username_last_seen (audit)
             if str(m.id) in recs:
                 recs[str(m.id)]["username_last_seen"] = str(m)
             if self.is_opted_in(m.id):
                 recipients.append(m)
+
         self.state["opt_in"] = recs
         await save_state(self.state)
 
@@ -507,12 +530,11 @@ class AlertSystemCog(commands.Cog):
             "message_excerpt": (message[:200] + "…") if len(message) > 200 else message,
             "recipient_target_count": len(recipients),
             "delivered_count": len(deliveries),
-            "deliveries": deliveries,  # successful only
+            "deliveries": deliveries,
             "aborted_due_to_failures": failed >= DM_FAIL_ABORT_THRESHOLD,
             "fail_count": failed,
         })
 
-        # Summary in channel
         try:
             ch = await self.ensure_channel(guild)
             summary = discord.Embed(
@@ -575,7 +597,6 @@ class AlertSystemCog(commands.Cog):
         return "\n".join(lines)
 
     async def _send_report(self, interaction: discord.Interaction, title: str, body_text: str):
-        # Discord embed description limit ~4096
         if len(body_text) <= 3500:
             emb = discord.Embed(
                 title=title,
@@ -639,7 +660,6 @@ class AlertSystemCog(commands.Cog):
             await self._send_report(interaction, "Alert Report — Last Sent", text)
             return
 
-        # timeframe mode
         if not date_from or not date_to:
             await interaction.response.send_message(
                 "For timeframe reports, provide both `date_from` and `date_to` in YYYY-MM-DD format.",
