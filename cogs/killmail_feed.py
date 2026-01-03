@@ -688,9 +688,19 @@ class KillmailFeed(commands.Cog):
         )
         emb.set_footer(text="Source: zKillboard + ESI | Ordering: oldest→newest (ESI time)")
 
+        # --- IMAGE LAYOUT CHANGE ---
+        # Discord embeds only support:
+        # - thumbnail (small, on the side)
+        # - image (large, at the bottom)
+        #
+        # To "move the image from the bottom to the side", we:
+        # - Use the ship RENDER as the thumbnail (side)
+        # - Do NOT set a bottom image
+        #
         if ship_type_id:
-            emb.set_thumbnail(url=victim_ship_icon_url(ship_type_id))
-            emb.set_image(url=type_render_url(ship_type_id))
+            emb.set_thumbnail(url=type_render_url(ship_type_id))
+            # If you prefer the smaller icon instead, swap the line above with:
+            # emb.set_thumbnail(url=victim_ship_icon_url(ship_type_id))
 
         return emb
 
@@ -1029,7 +1039,7 @@ class KillmailFeed(commands.Cog):
         await safe_reply(interaction, msg, ephemeral=True)
 
     @app_commands.command(name="killmail_reload", description="Reload a killmail by kill ID and repost it (admin only).")
-    @require_killmail_admin()
+    @require_killmail_admin()  # Allows CEO_ROLE, COUNCIL_ROLE, LYCAN_ROLE
     async def killmail_reload(self, interaction: discord.Interaction, killmail_id: int):
         await safe_defer(interaction, ephemeral=True)
         kmid = safe_int(killmail_id)
