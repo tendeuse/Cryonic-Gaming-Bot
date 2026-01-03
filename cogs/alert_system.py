@@ -6,7 +6,18 @@
 #   - On bot ready: for every guild, ensure #wormhole-status exists and panels are posted/refreshed
 #   - Persistent Views registered (so buttons keep working after restart)
 #
+# Auto-danger behavior (NO killmail cog modification required):
+#   - Watches messages posted in #kill-mail by THIS bot.
+#   - Parses the killmail embed to detect:
+#       * System name
+#       * Tag (KILL / LOSS)
+#   - If system == "J220215" and tag in {KILL, LOSS}:
+#       * set WH status to "Dangerous"
+#       * ping ARC Security in #wormhole-status
+#       * start/reset a 45-minute timer to revert status to "Normal"
+#
 import os
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -15,7 +26,7 @@ from pathlib import Path
 import json
 import datetime
 import asyncio
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Set
 import io
 
 # =====================
@@ -23,6 +34,7 @@ import io
 # =====================
 
 CHANNEL_NAME = "wormhole-status"
+KILLMAIL_CHANNEL_NAME = "kill-mail"  # must match your killmail_feed.py
 
 ARC_SECURITY_ROLE = "ARC Security"
 
@@ -32,11 +44,16 @@ ALERT_SEND_ROLES = {
     "ARC General",
 }
 
+# Auto-danger config
+HOME_SYSTEM_NAME = "J220215"
+AUTO_DANGER_STATUS_VALUE = "Dangerous"
+AUTO_DANGER_REVERT_VALUE = "Normal"
+AUTO_DANGER_DURATION_SECONDS = 45 * 60  # 45 minutes
+
 # =====================
 # PERSISTENCE (Railway Volume)
 # =====================
-# Mount your Railway Volume at /data.
-# Optionally override with env var PERSIST_ROOT (e.g., "/data").
+
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -68,6 +85,14 @@ def _default_state() -> Dict[str, Any]:
         "broadcasts": [],  # list of broadcasts with delivery logs
         "status": {"value": "Normal", "updated_utc": None, "updated_by": None},
         "panel_message_ids": {"alert": None, "status": None, "channel_id": None, "guild_id": None},
+        "auto_danger": {
+            "active": False,
+            "reset_at_utc": None,
+            "last_trigger_utc": None,
+            "last_trigger_killmail_id": None,
+            "last_trigger_tag": None,
+            "last_trigger_system": None,
+        },
     }
 
 def _safe_read_json(p: Path) -> Dict[str, Any]:
@@ -97,6 +122,7 @@ async def load_state() -> Dict[str, Any]:
         s.setdefault("broadcasts", [])
         s.setdefault("status", {"value": "Normal", "updated_utc": None, "updated_by": None})
         s.setdefault("panel_message_ids", {"alert": None, "status": None, "channel_id": None, "guild_id": None})
+        s.setdefault("auto_danger", _default_state()["auto_danger"])
         return s
 
 async def save_state(state: Dict[str, Any]) -> None:
@@ -107,6 +133,14 @@ def clamp_history(broadcasts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if len(broadcasts) <= MAX_BROADCAST_HISTORY:
         return broadcasts
     return broadcasts[-MAX_BROADCAST_HISTORY:]
+
+def iso_to_dt(s: Optional[str]) -> Optional[datetime.datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 # =====================
 # PERMISSIONS
@@ -124,31 +158,6 @@ def require_alert_sender_roles():
             return False
         return has_any_role(interaction.user, ALERT_SEND_ROLES)
     return app_commands.check(predicate)
-
-# =====================
-# DATE PARSING (YYYY-MM-DD)
-# =====================
-
-def parse_yyyy_mm_dd(s: str) -> datetime.date:
-    try:
-        return datetime.date.fromisoformat(s)
-    except Exception:
-        raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-22).")
-
-def date_range_to_datetimes(d_from: datetime.date, d_to: datetime.date) -> Tuple[datetime.datetime, datetime.datetime]:
-    if d_to < d_from:
-        raise ValueError("End date must be on or after start date.")
-    start_dt = datetime.datetime.combine(d_from, datetime.time.min)
-    end_dt = datetime.datetime.combine(d_to, datetime.time.max)
-    return start_dt, end_dt
-
-def iso_to_dt(s: Optional[str]) -> Optional[datetime.datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.datetime.fromisoformat(s)
-    except Exception:
-        return None
 
 # =====================
 # MODALS
@@ -259,31 +268,227 @@ class AlertSystemCog(commands.Cog):
         self.bot = bot
         self.state: Dict[str, Any] = _default_state()
 
-        # Register persistent views so buttons work after restarts.
-        # (They must use stable custom_id values, which they do.)
         self.bot.add_view(AlertPanelView(self))
         self.bot.add_view(WormholeStatusView(self))
 
         self._send_lock = asyncio.Lock()
-        self._auto_setup_done: Set[int] = set()  # guild_id set
+        self._auto_setup_done: Set[int] = set()
+
+        self._danger_reset_task: Optional[asyncio.Task] = None
 
     async def cog_load(self):
-        # Load persisted state from Railway volume on cog load
         self.state = await load_state()
+        await self._resume_auto_danger_timer_if_needed()
+
+    def cog_unload(self):
+        if self._danger_reset_task and not self._danger_reset_task.done():
+            self._danger_reset_task.cancel()
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # Auto-create/refresh panels in every guild this bot is in.
-        # Safe to run multiple times; we guard per guild.
         for g in self.bot.guilds:
             if g.id in self._auto_setup_done:
                 continue
             try:
                 await self.upsert_panels(g)
             except Exception:
-                # Do not crash bot on missing perms; it can still be run manually via /alert_setup
                 pass
             self._auto_setup_done.add(g.id)
+
+        await self._resume_auto_danger_timer_if_needed()
+
+    # ==========================================================
+    # NO-KILLMAIL-COG-CHANGES INTEGRATION:
+    # Watch bot messages in #kill-mail and parse embeds
+    # ==========================================================
+
+    def _parse_killmail_embed(self, emb: discord.Embed) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+        """
+        Returns (system_name, tag, killmail_id) parsed from your killmail_feed embed.
+        Assumes:
+          - embed.title like: "KILL — Killmail #123" or "LOSS — Killmail #123"
+          - embed.description contains a line like: "**System:** J220215 (Sec: ...)"
+        """
+        tag = None
+        kmid = None
+        system_name = None
+
+        title = (emb.title or "").strip()
+        # Title: "<TAG> — Killmail #<id>"
+        m = re.match(r"^(KILL|LOSS|INVOLVEMENT|UNKNOWN)\s+—\s+Killmail\s+#(\d+)\s*$", title, re.IGNORECASE)
+        if m:
+            tag = m.group(1).upper()
+            try:
+                kmid = int(m.group(2))
+            except Exception:
+                kmid = None
+        else:
+            # fallback: try to find an id anywhere in title
+            m2 = re.search(r"#(\d+)", title)
+            if m2:
+                try:
+                    kmid = int(m2.group(1))
+                except Exception:
+                    kmid = None
+
+        desc = emb.description or ""
+        # Find system line
+        # "**System:** <name> (Sec:"
+        m3 = re.search(r"\*\*System:\*\*\s*([^\n]+?)(?:\s*\(Sec:|\s*$)", desc)
+        if m3:
+            system_name = m3.group(1).strip()
+
+        # If tag wasn't in title, try in desc "**Type:** KILL"
+        if not tag:
+            m4 = re.search(r"\*\*Type:\*\*\s*(KILL|LOSS|INVOLVEMENT|UNKNOWN)", desc, re.IGNORECASE)
+            if m4:
+                tag = m4.group(1).upper()
+
+        return system_name, tag, kmid
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Avoid loops / noise
+        if not message.guild:
+            return
+        if not self.bot.user:
+            return
+        if message.author.id != self.bot.user.id:
+            return
+        if not isinstance(message.channel, discord.TextChannel):
+            return
+        if message.channel.name != KILLMAIL_CHANNEL_NAME:
+            return
+        if not message.embeds:
+            return
+
+        # Parse first embed (your killmail feed sends exactly one embed)
+        emb = message.embeds[0]
+        system_name, tag, kmid = self._parse_killmail_embed(emb)
+        if not system_name or not tag:
+            return
+
+        if system_name != HOME_SYSTEM_NAME:
+            return
+        if tag not in {"KILL", "LOSS"}:
+            return
+
+        await self._trigger_auto_danger(
+            guild=message.guild,
+            system_name=system_name,
+            tag=tag,
+            killmail_id=kmid or 0
+        )
+
+    async def _trigger_auto_danger(self, *, guild: discord.Guild, system_name: str, tag: str, killmail_id: int):
+        reset_at = utcnow() + datetime.timedelta(seconds=AUTO_DANGER_DURATION_SECONDS)
+        reset_at_iso = reset_at.isoformat()
+
+        self.state.setdefault("auto_danger", _default_state()["auto_danger"])
+        self.state["auto_danger"].update({
+            "active": True,
+            "reset_at_utc": reset_at_iso,
+            "last_trigger_utc": utcnow_iso(),
+            "last_trigger_killmail_id": killmail_id,
+            "last_trigger_tag": tag,
+            "last_trigger_system": system_name,
+        })
+
+        await self.set_status(AUTO_DANGER_STATUS_VALUE, f"Auto: {tag} detected in {system_name} (Killmail {killmail_id})")
+        await save_state(self.state)
+
+        if self._danger_reset_task and not self._danger_reset_task.done():
+            self._danger_reset_task.cancel()
+        self._danger_reset_task = asyncio.create_task(self._auto_revert_after_delay(reset_at))
+
+        # Refresh panel + ping role in this guild
+        try:
+            await self.refresh_status_panel(guild)
+        except Exception:
+            pass
+
+        try:
+            await self._send_danger_ping(guild=guild, system_name=system_name, tag=tag, killmail_id=killmail_id, reset_at=reset_at)
+        except Exception:
+            pass
+
+    async def _send_danger_ping(self, *, guild: discord.Guild, system_name: str, tag: str, killmail_id: int, reset_at: datetime.datetime):
+        ch = await self.ensure_channel(guild)
+        role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
+        mention = role.mention if role else f"`{ARC_SECURITY_ROLE}`"
+        reset_in_min = int(AUTO_DANGER_DURATION_SECONDS // 60)
+
+        emb = discord.Embed(
+            title="Wormhole Status Update",
+            description=(
+                f"{mention}\n\n"
+                f"**Auto Status:** `{AUTO_DANGER_STATUS_VALUE}`\n"
+                f"**Trigger:** `{tag}` detected in `{system_name}` (Killmail `{killmail_id}`)\n"
+                f"**Duration:** `{reset_in_min} minutes` (auto-reverts to `{AUTO_DANGER_REVERT_VALUE}`)\n"
+                f"**Revert At (UTC):** `{reset_at.isoformat()}`\n"
+            ),
+            timestamp=utcnow(),
+        )
+        emb.set_footer(text="Cryonic Gaming bot — Auto WH Status")
+
+        await ch.send(content=mention if role else None, embed=emb)
+
+    async def _auto_revert_after_delay(self, reset_at: datetime.datetime):
+        try:
+            delay = (reset_at - utcnow()).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            try:
+                await asyncio.sleep(AUTO_DANGER_DURATION_SECONDS)
+            except Exception:
+                return
+
+        try:
+            ad = self.state.get("auto_danger", {}) or {}
+            if not ad.get("active"):
+                return
+
+            reset_at_utc = iso_to_dt(ad.get("reset_at_utc"))
+            if reset_at_utc and utcnow() < reset_at_utc:
+                return
+
+            self.state["auto_danger"].update({"active": False, "reset_at_utc": None})
+            await self.set_status(AUTO_DANGER_REVERT_VALUE, "Auto: danger timer elapsed")
+            await save_state(self.state)
+
+            for g in self.bot.guilds:
+                try:
+                    await self.refresh_status_panel(g)
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    async def _resume_auto_danger_timer_if_needed(self):
+        ad = self.state.get("auto_danger", {}) or {}
+        if not ad.get("active"):
+            return
+
+        reset_at = iso_to_dt(ad.get("reset_at_utc"))
+        if not reset_at:
+            self.state["auto_danger"]["active"] = False
+            self.state["auto_danger"]["reset_at_utc"] = None
+            await save_state(self.state)
+            return
+
+        if utcnow() >= reset_at:
+            self.state["auto_danger"]["active"] = False
+            self.state["auto_danger"]["reset_at_utc"] = None
+            await self.set_status(AUTO_DANGER_REVERT_VALUE, "Auto: timer expired during downtime")
+            await save_state(self.state)
+            return
+
+        if self._danger_reset_task and not self._danger_reset_task.done():
+            self._danger_reset_task.cancel()
+        self._danger_reset_task = asyncio.create_task(self._auto_revert_after_delay(reset_at))
 
     # -------- Storage ops --------
 
@@ -371,12 +576,18 @@ class AlertSystemCog(commands.Cog):
         updated_utc = st.get("updated_utc") or "Never"
         updated_by = st.get("updated_by") or "N/A"
 
+        ad = self.state.get("auto_danger", {}) or {}
+        ad_line = ""
+        if ad.get("active"):
+            ad_line = f"\n**Auto-Revert (UTC):** `{ad.get('reset_at_utc') or 'Unknown'}`"
+
         emb = discord.Embed(
             title="Wormhole Status",
             description=(
                 f"**Current Status:** `{value}`\n"
                 f"**Last Updated (UTC):** `{updated_utc}`\n"
                 f"**Updated By:** `{updated_by}`\n"
+                f"{ad_line}"
             ),
             timestamp=utcnow(),
         )
@@ -390,7 +601,6 @@ class AlertSystemCog(commands.Cog):
         alert_msg_id = panel_ids.get("alert")
         status_msg_id = panel_ids.get("status")
 
-        # If the persisted channel id belongs to a different guild/channel, reset and recreate
         stored_gid = panel_ids.get("guild_id")
         stored_cid = panel_ids.get("channel_id")
         if stored_gid and int(stored_gid) != guild.id:
@@ -555,7 +765,7 @@ class AlertSystemCog(commands.Cog):
         await self.upsert_panels(guild)
 
     # =====================
-    # REPORT GENERATION
+    # REPORT GENERATION / SLASH COMMANDS (unchanged)
     # =====================
 
     def _format_opt_in_report_lines(self) -> List[str]:
@@ -615,10 +825,6 @@ class AlertSystemCog(commands.Cog):
         )
         await interaction.response.send_message(embed=emb, file=file, ephemeral=True)
 
-    # =====================
-    # SLASH COMMANDS
-    # =====================
-
     @app_commands.command(name="alert_setup", description="Post/refresh the alert and wormhole status panels in #wormhole-status.")
     @require_alert_sender_roles()
     async def alert_setup(self, interaction: discord.Interaction):
@@ -670,7 +876,8 @@ class AlertSystemCog(commands.Cog):
         try:
             d_from = parse_yyyy_mm_dd(date_from)
             d_to = parse_yyyy_mm_dd(date_to)
-            start_dt, end_dt = date_range_to_datetimes(d_from, d_to)
+            start_dt = datetime.datetime.combine(d_from, datetime.time.min)
+            end_dt = datetime.datetime.combine(d_to, datetime.time.max)
         except ValueError as e:
             await interaction.response.send_message(str(e), ephemeral=True)
             return
@@ -695,6 +902,12 @@ class AlertSystemCog(commands.Cog):
             lines.extend(self._format_opt_in_report_lines())
 
         await self._send_report(interaction, "Alert Report — Timeframe", "\n".join(lines))
+
+def parse_yyyy_mm_dd(s: str) -> datetime.date:
+    try:
+        return datetime.date.fromisoformat(s)
+    except Exception:
+        raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-22).")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AlertSystemCog(bot))
