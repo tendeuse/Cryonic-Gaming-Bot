@@ -307,6 +307,52 @@ class KillmailFeed(commands.Cog):
         return f"Missing permissions: {', '.join(missing)}" if missing else None
 
     # -------------------------
+    # zKill link helpers
+    # -------------------------
+
+    def zkill_character_url(self, character_id: Optional[int]) -> Optional[str]:
+        if character_id and character_id > 0:
+            return f"https://zkillboard.com/character/{character_id}/"
+        return None
+
+    def zkill_corporation_url(self, corporation_id: Optional[int]) -> Optional[str]:
+        if corporation_id and corporation_id > 0:
+            return f"https://zkillboard.com/corporation/{corporation_id}/"
+        return None
+
+    def zkill_alliance_url(self, alliance_id: Optional[int]) -> Optional[str]:
+        if alliance_id and alliance_id > 0:
+            return f"https://zkillboard.com/alliance/{alliance_id}/"
+        return None
+
+    def linkify(self, name: str, url: Optional[str]) -> str:
+        # Discord embed markdown supports [text](url)
+        if url and isinstance(name, str) and name and name != "Unknown":
+            return f"[{name}]({url})"
+        return name or "Unknown"
+
+    # -------------------------
+    # Space classification
+    # -------------------------
+
+    def classify_space(self, system_id: Optional[int], sec_status: Optional[float]) -> str:
+        # Wormhole system IDs are in 31000000–31999999
+        if system_id and 31000000 <= system_id < 32000000:
+            return "WH"
+        if sec_status is None:
+            return "Unknown"
+        try:
+            s = float(sec_status)
+        except Exception:
+            return "Unknown"
+        # Standard EVE bands
+        if s >= 0.45:
+            return "HS"
+        if s > 0.0:
+            return "LS"
+        return "NS"
+
+    # -------------------------
     # zKill (page until empty)
     # -------------------------
 
@@ -609,20 +655,31 @@ class KillmailFeed(commands.Cog):
         v_corp_id = safe_int(victim.get("corporation_id"))
         v_alliance_id = safe_int(victim.get("alliance_id"))
 
-        v_char_name = self.name_cache.get(str(v_char_id), "Unknown") if v_char_id else "Unknown"
-        v_corp_name = self.name_cache.get(str(v_corp_id), "Unknown corp") if v_corp_id else "Unknown corp"
-        v_alliance_name = self.name_cache.get(str(v_alliance_id), "None") if v_alliance_id else "None"
+        v_char_name_raw = self.name_cache.get(str(v_char_id), "Unknown") if v_char_id else "Unknown"
+        v_corp_name_raw = self.name_cache.get(str(v_corp_id), "Unknown corp") if v_corp_id else "Unknown corp"
+        v_alliance_name_raw = self.name_cache.get(str(v_alliance_id), "None") if v_alliance_id else "None"
+
+        v_char_name = self.linkify(v_char_name_raw, self.zkill_character_url(v_char_id))
+        v_corp_name = self.linkify(v_corp_name_raw, self.zkill_corporation_url(v_corp_id))
+        v_alliance_name = self.linkify(v_alliance_name_raw, self.zkill_alliance_url(v_alliance_id))
 
         ship_type_id = safe_int(victim.get("ship_type_id"))
         ship_name = self.type_cache.get(str(ship_type_id), "Unknown ship") if ship_type_id else "Unknown ship"
 
         system_id = safe_int(esikm.get("solar_system_id"))
         system_name = "Unknown system"
-        sec_status = None
+        sec_status: Optional[float] = None
         if system_id:
             cached = self.system_cache.get(str(system_id)) or {}
             system_name = cached.get("name") or "Unknown system"
             sec_status = cached.get("security_status")
+            try:
+                sec_status = float(sec_status) if sec_status is not None else None
+            except Exception:
+                sec_status = None
+
+        space = self.classify_space(system_id, sec_status)
+        sec_str = f"{sec_status:.2f}" if isinstance(sec_status, float) else "Unknown"
 
         fb = self.pick_final_blow_attacker(esikm)
         fb_char_id = safe_int(fb.get("character_id"))
@@ -630,9 +687,14 @@ class KillmailFeed(commands.Cog):
         fb_alliance_id = safe_int(fb.get("alliance_id"))
         fb_ship_type_id = safe_int(fb.get("ship_type_id"))
 
-        fb_char_name = self.name_cache.get(str(fb_char_id), "Unknown") if fb_char_id else "Unknown"
-        fb_corp_name = self.name_cache.get(str(fb_corp_id), "Unknown corp") if fb_corp_id else "Unknown corp"
-        fb_alliance_name = self.name_cache.get(str(fb_alliance_id), "None") if fb_alliance_id else "None"
+        fb_char_name_raw = self.name_cache.get(str(fb_char_id), "Unknown") if fb_char_id else "Unknown"
+        fb_corp_name_raw = self.name_cache.get(str(fb_corp_id), "Unknown corp") if fb_corp_id else "Unknown corp"
+        fb_alliance_name_raw = self.name_cache.get(str(fb_alliance_id), "None") if fb_alliance_id else "None"
+
+        fb_char_name = self.linkify(fb_char_name_raw, self.zkill_character_url(fb_char_id))
+        fb_corp_name = self.linkify(fb_corp_name_raw, self.zkill_corporation_url(fb_corp_id))
+        fb_alliance_name = self.linkify(fb_alliance_name_raw, self.zkill_alliance_url(fb_alliance_id))
+
         fb_ship_name = self.type_cache.get(str(fb_ship_type_id), "Unknown ship") if fb_ship_type_id else "Unknown ship"
 
         val = isk_value(zkm)
@@ -657,7 +719,7 @@ class KillmailFeed(commands.Cog):
             f"**Victim Alliance:** {v_alliance_name}",
             "",
             f"**Victim Ship:** {ship_name}",
-            f"**System:** {system_name} (Sec: {sec_status if sec_status is not None else 'Unknown'})",
+            f"**System:** {system_name} ({space}, Sec: {sec_str})",
             f"**Attackers:** {n_atk}",
             "",
             f"**Final Blow:** {fb_char_name}",
@@ -668,7 +730,8 @@ class KillmailFeed(commands.Cog):
 
         if val is not None:
             lines.append("")
-            lines.append(f"**Estimated ISK:** {val:,.0f}")
+            # Requested: show ISK at the end
+            lines.append(f"**Estimated ISK:** {val:,.0f} ISK")
 
         if ktime:
             lines.append(f"**Time:** {ktime}")
@@ -688,18 +751,11 @@ class KillmailFeed(commands.Cog):
         )
         emb.set_footer(text="Source: zKillboard + ESI | Ordering: oldest→newest (ESI time)")
 
-        # --- IMAGE LAYOUT CHANGE ---
-        # Discord embeds only support:
-        # - thumbnail (small, on the side)
-        # - image (large, at the bottom)
-        #
-        # To "move the image from the bottom to the side", we:
-        # - Use the ship RENDER as the thumbnail (side)
-        # - Do NOT set a bottom image
-        #
+        # Side image (thumbnail). Discord does not support a large "side image";
+        # only thumbnail (side) and image (bottom). We keep it on the side.
         if ship_type_id:
             emb.set_thumbnail(url=type_render_url(ship_type_id))
-            # If you prefer the smaller icon instead, swap the line above with:
+            # If you prefer the smaller icon instead:
             # emb.set_thumbnail(url=victim_ship_icon_url(ship_type_id))
 
         return emb
@@ -1039,7 +1095,7 @@ class KillmailFeed(commands.Cog):
         await safe_reply(interaction, msg, ephemeral=True)
 
     @app_commands.command(name="killmail_reload", description="Reload a killmail by kill ID and repost it (admin only).")
-    @require_killmail_admin()  # Allows CEO_ROLE, COUNCIL_ROLE, LYCAN_ROLE
+    @require_killmail_admin()  # CEO_ROLE, COUNCIL_ROLE, LYCAN_ROLE
     async def killmail_reload(self, interaction: discord.Interaction, killmail_id: int):
         await safe_defer(interaction, ephemeral=True)
         kmid = safe_int(killmail_id)
