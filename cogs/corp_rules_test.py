@@ -69,6 +69,31 @@ def message_has_start_button(msg: discord.Message) -> bool:
     return False
 
 
+async def _safe_ephemeral_reply(interaction: discord.Interaction, content: str) -> None:
+    """
+    Safely reply ephemerally whether the interaction has already been acknowledged or not.
+    Prevents 'Unknown interaction' and double-respond issues.
+    """
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True) -> None:
+    """
+    Acknowledge interaction immediately to avoid 10062 Unknown interaction.
+    """
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+    except Exception:
+        pass
+
+
 # =====================
 # QUESTION BANK (from your rules)
 # =====================
@@ -263,7 +288,7 @@ class AnswerSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         view: "PagedQuizView" = self.view  # type: ignore
         view.answers[self.q_index] = int(self.values[0])
-        await interaction.response.send_message(f"Recorded answer for Q{self.q_index + 1}.", ephemeral=True)
+        await _safe_ephemeral_reply(interaction, f"Recorded answer for Q{self.q_index + 1}.")
 
 
 class PagedQuizView(discord.ui.View):
@@ -289,7 +314,7 @@ class PagedQuizView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This test is not for you.", ephemeral=True)
+            await _safe_ephemeral_reply(interaction, "This test is not for you.")
             return False
         return True
 
@@ -338,18 +363,22 @@ class PagedQuizView(discord.ui.View):
                 pass
 
     async def _on_prev(self, interaction: discord.Interaction):
+        await _safe_defer(interaction, ephemeral=True)
         if self.page > 0:
             self.page -= 1
         self._render()
         await self._safe_edit(interaction)
 
     async def _on_next(self, interaction: discord.Interaction):
+        await _safe_defer(interaction, ephemeral=True)
         if self.page < len(self.questions) - 1:
             self.page += 1
         self._render()
         await self._safe_edit(interaction)
 
     async def _on_submit(self, interaction: discord.Interaction):
+        await _safe_defer(interaction, ephemeral=True)
+
         correct = 0
         for i, q in enumerate(self.questions):
             if self.answers.get(i, -1) == q.correct_index:
@@ -364,7 +393,10 @@ class PagedQuizView(discord.ui.View):
 
         # Disable components on quiz message
         try:
-            await interaction.response.edit_message(view=self)
+            if interaction.response.is_done():
+                await interaction.followup.edit_message(message_id=interaction.message.id, view=self)
+            else:
+                await interaction.response.edit_message(view=self)
         except Exception:
             try:
                 await interaction.followup.edit_message(message_id=interaction.message.id, view=self)
@@ -377,9 +409,9 @@ class PagedQuizView(discord.ui.View):
 
         await self.cog.log_result(self.guild_id, self.user_id, passed, correct, total, percent)
 
-        await interaction.followup.send(
-            f"**Result:** {correct}/{total} (**{percent}%**) — {'PASS' if passed else 'FAIL'}\n{role_msg}",
-            ephemeral=True
+        await _safe_ephemeral_reply(
+            interaction,
+            f"**Result:** {correct}/{total} (**{percent}%**) — {'PASS' if passed else 'FAIL'}\n{role_msg}"
         )
 
 
@@ -394,14 +426,17 @@ class StartTestView(discord.ui.View):
     @discord.ui.button(label="Start Test (DM)", style=discord.ButtonStyle.primary, custom_id=START_BUTTON_CUSTOM_ID)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            await _safe_ephemeral_reply(interaction, "This must be used in a server.")
             return
+
+        # ACK immediately to prevent 10062 Unknown interaction
+        await _safe_defer(interaction, ephemeral=True)
 
         # exactly 5 random questions (if bank has >= 5)
         if len(QUESTION_BANK) < QUESTIONS_PER_TEST:
-            await interaction.response.send_message(
+            await _safe_ephemeral_reply(
+                interaction,
                 f"Not enough questions configured. Need **{QUESTIONS_PER_TEST}**, found **{len(QUESTION_BANK)}**.",
-                ephemeral=True,
             )
             return
 
@@ -412,10 +447,13 @@ class StartTestView(discord.ui.View):
             dm = await interaction.user.create_dm()
             await dm.send(quiz_view.content(), view=quiz_view)
         except discord.Forbidden:
-            await interaction.response.send_message("I couldn't DM you. Enable DMs and try again.", ephemeral=True)
+            await _safe_ephemeral_reply(interaction, "I couldn't DM you. Enable DMs and try again.")
+            return
+        except Exception as e:
+            await _safe_ephemeral_reply(interaction, f"Failed to start test: {type(e).__name__}: {e}")
             return
 
-        await interaction.response.send_message("Test sent. Check your DMs.", ephemeral=True)
+        await _safe_ephemeral_reply(interaction, "Test sent. Check your DMs.")
 
 
 # =====================
