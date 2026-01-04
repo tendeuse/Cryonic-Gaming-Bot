@@ -6,6 +6,10 @@
 #   - On bot ready: for every guild, ensure #wormhole-status exists and panels are posted/refreshed
 #   - Persistent Views registered (so buttons keep working after restart)
 #
+# Permissions:
+#   - Alerts (send/setup/report): restricted to ALERT_SEND_ROLES
+#   - Wormhole Status (buttons): restricted to WH_STATUS_ROLES
+#
 # Auto-danger behavior (NO killmail cog modification required):
 #   - Watches messages posted in #kill-mail by THIS bot.
 #   - Parses the killmail embed to detect:
@@ -38,10 +42,20 @@ KILLMAIL_CHANNEL_NAME = "kill-mail"  # must match your killmail_feed.py
 
 ARC_SECURITY_ROLE = "ARC Security"
 
+# Alerts system permissions (KEEP RESTRICTED)
 ALERT_SEND_ROLES = {
     "ARC Security Corporation Leader",
     "ARC Security Administration Council",
     "ARC General",
+}
+
+# Wormhole status permissions (EXPIFDED)
+WH_STATUS_ROLES = {
+    "ARC Security Corporation Leader",
+    "ARC Security Administration Council",
+    "ARC General",
+    "ARC Commander",
+    "ARC Officer",
 }
 
 # Auto-danger config
@@ -193,6 +207,7 @@ class AlertPanelView(View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
             return
+        # Alerts remain restricted to ALERT_SEND_ROLES
         if not has_any_role(interaction.user, ALERT_SEND_ROLES):
             await interaction.response.send_message("You do not have permission to send alerts.", ephemeral=True)
             return
@@ -231,8 +246,12 @@ class WormholeStatusView(View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
             return
-        if not has_any_role(interaction.user, ALERT_SEND_ROLES):
-            await interaction.response.send_message("You do not have permission to update wormhole status.", ephemeral=True)
+        # Wormhole Status restricted to WH_STATUS_ROLES (expanded set)
+        if not has_any_role(interaction.user, WH_STATUS_ROLES):
+            await interaction.response.send_message(
+                "You do not have permission to update wormhole status.",
+                ephemeral=True
+            )
             return
 
         await self.cog.set_status(value, f"{interaction.user} (ID: {interaction.user.id})")
@@ -662,6 +681,7 @@ class AlertSystemCog(commands.Cog):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
             return
+        # Alerts remain restricted to ALERT_SEND_ROLES
         if not has_any_role(interaction.user, ALERT_SEND_ROLES):
             await interaction.response.send_message("You do not have permission to send alerts.", ephemeral=True)
             return
@@ -765,7 +785,8 @@ class AlertSystemCog(commands.Cog):
         await self.upsert_panels(guild)
 
     # =====================
-    # REPORT GENERATION / SLASH COMMANDS (unchanged)
+    # REPORT GENERATION / SLASH COMMANDS
+    # (Alerts remain restricted via @require_alert_sender_roles)
     # =====================
 
     def _format_opt_in_report_lines(self) -> List[str]:
