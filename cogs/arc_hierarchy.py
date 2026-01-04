@@ -43,6 +43,7 @@ PROTECTED_RANK_ROLES = {SECURITY_ROLE, DIRECTOR_ROLE, CEO_ROLE}
 # CHANNELS
 # =====================
 LOG_CH = "arc-hierarchy-log"
+FLOWCHART_CH = "corp-flowchart"
 
 # =====================
 # RANKS
@@ -80,7 +81,7 @@ DEMOTE_TO = {
 # PERSISTENCE
 # =====================
 def _default_data() -> Dict[str, Any]:
-    return {"members": {}, "units": {}}
+    return {"members": {}, "units": {}, "flowchart": {}}
 
 def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
     """
@@ -115,10 +116,14 @@ def load_data() -> Dict[str, Any]:
 
         data.setdefault("members", {})
         data.setdefault("units", {})
+        data.setdefault("flowchart", {})
+
         if not isinstance(data["members"], dict):
             data["members"] = {}
         if not isinstance(data["units"], dict):
             data["units"] = {}
+        if not isinstance(data["flowchart"], dict):
+            data["flowchart"] = {}
 
         return data
 
@@ -166,6 +171,12 @@ async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
     if ch:
         return ch
     return await guild.create_text_channel(LOG_CH)
+
+async def ensure_flowchart_channel(guild: discord.Guild) -> discord.TextChannel:
+    ch = discord.utils.get(guild.text_channels, name=FLOWCHART_CH)
+    if ch:
+        return ch
+    return await guild.create_text_channel(FLOWCHART_CH)
 
 def unit_role_ids(data: Dict[str, Any]) -> List[int]:
     ids: List[int] = []
@@ -337,6 +348,220 @@ async def log_action(guild: discord.Guild, content: str, mention_director_ids: L
     prefix = (" ".join(mentions) + "\n") if mentions else ""
     await ch.send(prefix + content)
 
+def _rank_label(rank: str) -> str:
+    return {
+        RANK_CEO: "CEO",
+        RANK_DIRECTOR: "Director",
+        RANK_GENERAL: "General",
+        RANK_COMMANDER: "Commander",
+        RANK_OFFICER: "Officer",
+        RANK_SECURITY: "Security",
+    }.get(rank, rank)
+
+def _sort_members_casefold(members: List[discord.Member]) -> List[discord.Member]:
+    return sorted(members, key=lambda x: (x.display_name or "").casefold())
+
+def _chunk_lines(lines: List[str], max_len: int = 1900) -> List[str]:
+    """
+    Splits a list of lines into multiple message-safe chunks.
+    Uses max_len < 2000 to leave room for formatting.
+    """
+    chunks: List[str] = []
+    buf: List[str] = []
+    cur = 0
+    for line in lines:
+        add = len(line) + 1
+        if buf and (cur + add) > max_len:
+            chunks.append("\n".join(buf))
+            buf = [line]
+            cur = len(line) + 1
+        else:
+            buf.append(line)
+            cur += add
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+async def update_flowchart(guild: discord.Guild) -> None:
+    """
+    Maintains a single "corp flowchart" message in #corp-flowchart.
+    Updated whenever rosters/units/ranks change.
+    """
+    # Read persisted message/channel ids without doing Discord API calls under lock.
+    async with file_lock:
+        data = load_data()
+        flow = data.setdefault("flowchart", {})
+        stored_channel_id = flow.get("channel_id")
+        stored_message_id = flow.get("message_id")
+        # do not save here unless we change something
+        # (saving on every call is unnecessary I/O)
+
+    # Ensure channel exists
+    ch: Optional[discord.TextChannel] = None
+    try:
+        ch = discord.utils.get(guild.text_channels, name=FLOWCHART_CH)
+        if not ch:
+            ch = await ensure_flowchart_channel(guild)
+    except (discord.Forbidden, discord.HTTPException):
+        return
+
+    # If the stored channel id is different, overwrite it to the current one.
+    if not isinstance(stored_channel_id, int) or stored_channel_id != ch.id:
+        async with file_lock:
+            data = load_data()
+            flow = data.setdefault("flowchart", {})
+            flow["channel_id"] = ch.id
+            save_data(data)
+
+    # Build the flowchart content (text-based tree)
+    async with file_lock:
+        data = load_data()
+
+    # Identify CEO(s)
+    ceos: List[discord.Member] = []
+    ceo_role = get_role(guild, CEO_ROLE)
+    if ceo_role:
+        ceos = _sort_members_casefold([m for m in guild.members if ceo_role in m.roles])
+
+    ceo_line = "CEO: (unassigned)"
+    if ceos:
+        if len(ceos) == 1:
+            ceo_line = f"CEO: {ceos[0].display_name}"
+        else:
+            ceo_line = "CEO(s): " + ", ".join([m.display_name for m in ceos])
+
+    # Directors are "unit owners" from data["units"] (most consistent with your current structure)
+    unit_owner_ids: List[int] = []
+    for k in data.get("units", {}).keys():
+        try:
+            unit_owner_ids.append(int(k))
+        except Exception:
+            pass
+
+    # Also include any Directors who have the Director role but no unit entry (so they still show)
+    directors_role = get_role(guild, DIRECTOR_ROLE)
+    directors_with_role: List[discord.Member] = []
+    if directors_role:
+        directors_with_role = [m for m in guild.members if directors_role in m.roles]
+    for m in directors_with_role:
+        if m.id not in unit_owner_ids:
+            unit_owner_ids.append(m.id)
+
+    # Sort directors by display name when possible
+    director_members: List[discord.Member] = []
+    for did in unit_owner_ids:
+        dm = guild.get_member(did)
+        if dm:
+            director_members.append(dm)
+    director_members = _sort_members_casefold(director_members)
+
+    # Prepare lines (use code block for a clean tree)
+    lines: List[str] = []
+    lines.append("ARC Corporate Flowchart")
+    lines.append("")
+    lines.append(ceo_line)
+    lines.append("")
+
+    if not director_members:
+        lines.append("No Directors found.")
+    else:
+        for d in director_members:
+            unit = data.get("units", {}).get(str(d.id))
+            unit_name = unit.get("unit_name") if isinstance(unit, dict) else None
+            unit_label = f"{d.display_name}" + (f"  [{unit_name}]" if unit_name else "")
+
+            lines.append(f"├─ Director: {unit_label}")
+
+            # Gather roster for this director_id
+            members_for_director: List[Tuple[discord.Member, Dict[str, Any]]] = []
+            for m in guild.members:
+                rec = data.get("members", {}).get(str(m.id))
+                if isinstance(rec, dict) and rec.get("director_id") == d.id:
+                    members_for_director.append((m, rec))
+
+            groups: Dict[str, List[discord.Member]] = {
+                RANK_DIRECTOR: [],
+                RANK_GENERAL: [],
+                RANK_COMMANDER: [],
+                RANK_OFFICER: [],
+                RANK_SECURITY: [],
+            }
+            for m, rec in members_for_director:
+                r = rec.get("rank", RANK_SECURITY)
+                if r not in groups:
+                    r = RANK_SECURITY
+                groups[r].append(m)
+
+            # Ensure director appears in their own roster group if assigned
+            # (many setups store director_id for director; if not, this won't force it)
+            # Sort and print
+            any_listed = False
+            for rank in (RANK_DIRECTOR, RANK_GENERAL, RANK_COMMANDER, RANK_OFFICER, RANK_SECURITY):
+                ms = _sort_members_casefold(groups.get(rank, []))
+                if not ms:
+                    continue
+                any_listed = True
+                lines.append(f"│  ├─ {_rank_label(rank)} ({len(ms)})")
+                for m in ms:
+                    lines.append(f"│  │  • {m.display_name}")
+            if not any_listed:
+                lines.append("│  └─ (No assigned members)")
+
+            lines.append("")
+
+    # Wrap into a single embed; if too large, fall back to file attachment but still keep a single pinned-ish message.
+    # We will keep the message simple: an embed with chunks in fields if needed.
+    content_chunks = _chunk_lines(lines, max_len=1800)  # keep room for code block markers
+
+    embed = discord.Embed(
+        title="Corp Flowchart",
+        description="Auto-updated hierarchy view (CEO → Directors → Unit roster).",
+        color=discord.Color.blurple(),
+    )
+
+    if len(content_chunks) == 1:
+        embed.add_field(name="Flow", value=f"```text\n{content_chunks[0]}\n```", inline=False)
+    else:
+        # Multiple chunks; place them in multiple fields (Discord allows up to 25 fields)
+        for idx, chunk in enumerate(content_chunks[:24], start=1):
+            embed.add_field(name=f"Flow (part {idx})", value=f"```text\n{chunk}\n```", inline=False)
+        if len(content_chunks) > 24:
+            embed.add_field(
+                name="Flow (truncated)",
+                value="```text\nOutput too large to display fully in embed fields.\nConsider splitting units or reducing roster size.\n```",
+                inline=False
+            )
+
+    # Upsert the message (edit if exists, otherwise create)
+    msg: Optional[discord.Message] = None
+    if isinstance(stored_message_id, int):
+        try:
+            msg = await ch.fetch_message(stored_message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            msg = None
+
+    if msg:
+        try:
+            await msg.edit(embed=embed, content=None)
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            # If we cannot edit, try to send a new one
+            msg = None
+
+    # Create a new message
+    try:
+        new_msg = await ch.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        return
+
+    # Persist the new message id
+    async with file_lock:
+        data = load_data()
+        flow = data.setdefault("flowchart", {})
+        flow["channel_id"] = ch.id
+        flow["message_id"] = new_msg.id
+        save_data(data)
+
 # =====================
 # MODAL
 # =====================
@@ -417,6 +642,9 @@ class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
                 ephemeral=False,
             )
 
+            # Update flowchart after a roster/unit change
+            await update_flowchart(guild)
+
         except (discord.Forbidden, discord.HTTPException) as e:
             await interaction.followup.send(
                 f"Unit creation failed due to a permissions/API error.\n`{type(e).__name__}`",
@@ -483,6 +711,9 @@ class ARCHierarchyCog(commands.Cog):
             f"{member.mention} joined **{unit_name}**.",
             ephemeral=False,
         )
+
+        # Update flowchart after roster change
+        await update_flowchart(guild)
 
     # NEW: CEO-only unit ownership transfer (roles, reports, AP attribution via director_id)
     @arc.command(name="transfer_unit")
@@ -576,6 +807,9 @@ class ARCHierarchyCog(commands.Cog):
             ephemeral=True,
         )
 
+        # Update flowchart after unit ownership + roster mapping changes
+        await update_flowchart(guild)
+
     # -----------------
     # PROMOTE / DEMOTE
     # -----------------
@@ -627,6 +861,9 @@ class ARCHierarchyCog(commands.Cog):
             ephemeral=True,
         )
 
+        # Update flowchart after rank changes
+        await update_flowchart(guild)
+
     @arc.command(name="demote")
     @app_commands.describe(member="Member to demote")
     async def demote(self, interaction: discord.Interaction, member: discord.Member):
@@ -674,6 +911,9 @@ class ARCHierarchyCog(commands.Cog):
             f"{member.mention} demoted: **{prev_rank} → {new_rank}**.",
             ephemeral=True,
         )
+
+        # Update flowchart after rank changes
+        await update_flowchart(guild)
 
     # -----------------
     # ROSTER (GROUPED)
@@ -754,6 +994,8 @@ class ARCHierarchyCog(commands.Cog):
     async def on_ready(self):
         for g in self.bot.guilds:
             await ensure_log_channel(g)
+            # Ensure flowchart channel exists and is current on startup
+            await update_flowchart(g)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(ARCHierarchyCog(bot))
