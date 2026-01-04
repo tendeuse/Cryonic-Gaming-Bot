@@ -13,15 +13,11 @@ import asyncio
 # =====================
 # PERSISTENCE (Railway Volume)
 # =====================
-# Mount your Railway Volume at /data.
-# Optionally override with env var PERSIST_ROOT (e.g., "/data").
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Persist hierarchy state on the volume
 DATA_FILE = PERSIST_ROOT / "arc_hierarchy.json"
 
-# Single-process lock to serialize JSON read/write
 file_lock = asyncio.Lock()
 
 # =====================
@@ -36,7 +32,6 @@ SECURITY_ROLE = "ARC Security"  # PROTECTED: NEVER REMOVED BY BOT
 
 UNITLESS_ROLE = "Unitless"
 
-# Rank roles the bot must NEVER remove automatically
 PROTECTED_RANK_ROLES = {SECURITY_ROLE, DIRECTOR_ROLE, CEO_ROLE}
 
 # =====================
@@ -68,7 +63,7 @@ PROMOTE_TO = {
     RANK_SECURITY: RANK_OFFICER,
     RANK_OFFICER: RANK_COMMANDER,
     RANK_COMMANDER: RANK_GENERAL,
-    RANK_GENERAL: None,  # unit cap
+    RANK_GENERAL: None,
 }
 
 DEMOTE_TO = {
@@ -84,12 +79,6 @@ def _default_data() -> Dict[str, Any]:
     return {"members": {}, "units": {}, "flowchart": {}}
 
 def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
-    """
-    Atomic JSON write:
-      - write to .tmp in same directory
-      - replace target
-    Reduces risk of corruption on crash/redeploy.
-    """
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
     payload = json.dumps(data, indent=2)
@@ -97,11 +86,6 @@ def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
     tmp.replace(p)
 
 def load_data() -> Dict[str, Any]:
-    """
-    Robust load:
-      - if missing: default structure
-      - if blank/corrupt: keep a .bak and default
-    """
     try:
         if not DATA_FILE.exists():
             return _default_data()
@@ -128,7 +112,6 @@ def load_data() -> Dict[str, Any]:
         return data
 
     except json.JSONDecodeError:
-        # Keep a backup for inspection, then reset
         try:
             bak = DATA_FILE.with_suffix(DATA_FILE.suffix + ".bak")
             DATA_FILE.replace(bak)
@@ -172,11 +155,23 @@ async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
         return ch
     return await guild.create_text_channel(LOG_CH)
 
-async def ensure_flowchart_channel(guild: discord.Guild) -> discord.TextChannel:
+async def safe_log(guild: discord.Guild, msg: str) -> None:
+    try:
+        ch = await ensure_log_channel(guild)
+        await ch.send(msg[:1900])
+    except Exception:
+        # If logging itself fails, we cannot do more safely.
+        pass
+
+async def ensure_flowchart_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     ch = discord.utils.get(guild.text_channels, name=FLOWCHART_CH)
     if ch:
         return ch
-    return await guild.create_text_channel(FLOWCHART_CH)
+    try:
+        return await guild.create_text_channel(FLOWCHART_CH)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        await safe_log(guild, f"Flowchart: could not create #{FLOWCHART_CH}. Missing perms? `{type(e).__name__}`")
+        return None
 
 def unit_role_ids(data: Dict[str, Any]) -> List[int]:
     ids: List[int] = []
@@ -187,10 +182,6 @@ def unit_role_ids(data: Dict[str, Any]) -> List[int]:
     return ids
 
 def rank_roles_to_strip(guild: discord.Guild) -> List[discord.Role]:
-    """
-    Rank roles that may be stripped during transfers/rank enforcement.
-    IMPORTANT: excludes protected roles (ARC Security + Director + CEO).
-    """
     candidates = [OFFICER_ROLE, COMMANDER_ROLE, GENERAL_ROLE, CEO_ROLE, DIRECTOR_ROLE]
     out: List[discord.Role] = []
     for name in candidates:
@@ -205,11 +196,6 @@ async def strip_member_for_unit_change(
     member: discord.Member,
     data: Dict[str, Any]
 ) -> Tuple[List[discord.Role], List[discord.Role]]:
-    """
-    On unit transfer:
-      - Remove ALL removable rank roles (never remove ARC Security, Director, or CEO)
-      - Remove ALL unit roles
-    """
     guild = member.guild
 
     removed_rank: List[discord.Role] = []
@@ -251,18 +237,6 @@ async def assign_member_to_unit(
     *,
     strip_first: bool = True,
 ) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Shared logic for:
-      - /arc join
-      - director creating a new unit (treated as joining that unit)
-
-    Behavior:
-      - Optionally strips prior ranks + prior unit roles (keeps protected roles)
-      - Adds the unit role
-      - Removes Unitless
-      - Sets director_id
-      - Sets rank to security ONLY if member is not a Director/CEO (protect leadership ranks)
-    """
     guild = member.guild
 
     unit = data.get("units", {}).get(str(director.id))
@@ -274,7 +248,6 @@ async def assign_member_to_unit(
     if strip_first:
         await strip_member_for_unit_change(member, data)
 
-    # Add new unit role
     role = guild.get_role(unit["unit_role_id"])
     if role:
         try:
@@ -282,27 +255,19 @@ async def assign_member_to_unit(
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    # Remove Unitless as soon as someone is in a unit
     await remove_unitless_if_present(member)
 
-    # Storage update
     rec = ensure_member_record(data, member.id)
     rec["director_id"] = director.id
 
-    # Do NOT downgrade protected leadership in storage
     if not (is_director(member) or is_ceo(member)):
         rec["rank"] = RANK_SECURITY
 
     return old_director_id, unit.get("unit_name")
 
 async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str, str]:
-    """
-    Enforces only one rank role at once, never removing protected roles
-    (ARC Security + Director + CEO).
-    """
     guild = member.guild
 
-    # Serialize state updates
     async with file_lock:
         data = load_data()
         rec = ensure_member_record(data, member.id)
@@ -310,7 +275,6 @@ async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str,
         old_rank = rec.get("rank", RANK_SECURITY)
         rec["rank"] = new_rank
 
-        # Remove prior rank roles except protected roles
         to_remove: List[discord.Role] = []
         for role in rank_roles_to_strip(guild):
             if role in member.roles:
@@ -318,7 +282,6 @@ async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str,
         if to_remove:
             await member.remove_roles(*to_remove, reason="ARC rank change: removing prior rank roles")
 
-        # Add the new rank role (if applicable)
         if new_rank in (RANK_OFFICER, RANK_COMMANDER, RANK_GENERAL, RANK_DIRECTOR, RANK_CEO):
             role_name = ROLE_BY_RANK.get(new_rank)
             role_obj = get_role(guild, role_name) if role_name else None
@@ -361,11 +324,8 @@ def _rank_label(rank: str) -> str:
 def _sort_members_casefold(members: List[discord.Member]) -> List[discord.Member]:
     return sorted(members, key=lambda x: (x.display_name or "").casefold())
 
-def _chunk_lines(lines: List[str], max_len: int = 1900) -> List[str]:
-    """
-    Splits a list of lines into multiple message-safe chunks.
-    Uses max_len < 2000 to leave room for formatting.
-    """
+def _chunk_text(text: str, max_len: int = 1900) -> List[str]:
+    lines = text.split("\n")
     chunks: List[str] = []
     buf: List[str] = []
     cur = 0
@@ -382,55 +342,23 @@ def _chunk_lines(lines: List[str], max_len: int = 1900) -> List[str]:
         chunks.append("\n".join(buf))
     return chunks
 
-async def update_flowchart(guild: discord.Guild) -> None:
-    """
-    Maintains a single "corp flowchart" message in #corp-flowchart.
-    Updated whenever rosters/units/ranks change.
-    """
-    # Read persisted message/channel ids without doing Discord API calls under lock.
-    async with file_lock:
-        data = load_data()
-        flow = data.setdefault("flowchart", {})
-        stored_channel_id = flow.get("channel_id")
-        stored_message_id = flow.get("message_id")
-        # do not save here unless we change something
-        # (saving on every call is unnecessary I/O)
-
-    # Ensure channel exists
-    ch: Optional[discord.TextChannel] = None
-    try:
-        ch = discord.utils.get(guild.text_channels, name=FLOWCHART_CH)
-        if not ch:
-            ch = await ensure_flowchart_channel(guild)
-    except (discord.Forbidden, discord.HTTPException):
-        return
-
-    # If the stored channel id is different, overwrite it to the current one.
-    if not isinstance(stored_channel_id, int) or stored_channel_id != ch.id:
-        async with file_lock:
-            data = load_data()
-            flow = data.setdefault("flowchart", {})
-            flow["channel_id"] = ch.id
-            save_data(data)
-
-    # Build the flowchart content (text-based tree)
-    async with file_lock:
-        data = load_data()
-
-    # Identify CEO(s)
-    ceos: List[discord.Member] = []
+def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
+    # CEO(s) by role
     ceo_role = get_role(guild, CEO_ROLE)
+    ceos: List[discord.Member] = []
     if ceo_role:
         ceos = _sort_members_casefold([m for m in guild.members if ceo_role in m.roles])
 
-    ceo_line = "CEO: (unassigned)"
-    if ceos:
-        if len(ceos) == 1:
-            ceo_line = f"CEO: {ceos[0].display_name}"
-        else:
-            ceo_line = "CEO(s): " + ", ".join([m.display_name for m in ceos])
+    header = ["ARC Corporate Flowchart", ""]
+    if not ceos:
+        header.append("CEO: (unassigned)")
+    elif len(ceos) == 1:
+        header.append(f"CEO: {ceos[0].display_name}")
+    else:
+        header.append("CEO(s): " + ", ".join([m.display_name for m in ceos]))
+    header.append("")
 
-    # Directors are "unit owners" from data["units"] (most consistent with your current structure)
+    # Directors: prefer unit owners (data["units"] keys), and include Directors by role even if no unit.
     unit_owner_ids: List[int] = []
     for k in data.get("units", {}).keys():
         try:
@@ -438,16 +366,12 @@ async def update_flowchart(guild: discord.Guild) -> None:
         except Exception:
             pass
 
-    # Also include any Directors who have the Director role but no unit entry (so they still show)
     directors_role = get_role(guild, DIRECTOR_ROLE)
-    directors_with_role: List[discord.Member] = []
     if directors_role:
-        directors_with_role = [m for m in guild.members if directors_role in m.roles]
-    for m in directors_with_role:
-        if m.id not in unit_owner_ids:
-            unit_owner_ids.append(m.id)
+        for m in guild.members:
+            if directors_role in m.roles and m.id not in unit_owner_ids:
+                unit_owner_ids.append(m.id)
 
-    # Sort directors by display name when possible
     director_members: List[discord.Member] = []
     for did in unit_owner_ids:
         dm = guild.get_member(did)
@@ -455,84 +379,90 @@ async def update_flowchart(guild: discord.Guild) -> None:
             director_members.append(dm)
     director_members = _sort_members_casefold(director_members)
 
-    # Prepare lines (use code block for a clean tree)
-    lines: List[str] = []
-    lines.append("ARC Corporate Flowchart")
-    lines.append("")
-    lines.append(ceo_line)
-    lines.append("")
+    lines: List[str] = header[:]
 
     if not director_members:
         lines.append("No Directors found.")
-    else:
-        for d in director_members:
-            unit = data.get("units", {}).get(str(d.id))
-            unit_name = unit.get("unit_name") if isinstance(unit, dict) else None
-            unit_label = f"{d.display_name}" + (f"  [{unit_name}]" if unit_name else "")
+        return "\n".join(lines)
 
-            lines.append(f"├─ Director: {unit_label}")
+    for idx, d in enumerate(director_members):
+        unit = data.get("units", {}).get(str(d.id))
+        unit_name = unit.get("unit_name") if isinstance(unit, dict) else None
+        unit_label = f"{d.display_name}" + (f"  [{unit_name}]" if unit_name else "")
+        lines.append(f"├─ Director: {unit_label}")
 
-            # Gather roster for this director_id
-            members_for_director: List[Tuple[discord.Member, Dict[str, Any]]] = []
-            for m in guild.members:
-                rec = data.get("members", {}).get(str(m.id))
-                if isinstance(rec, dict) and rec.get("director_id") == d.id:
-                    members_for_director.append((m, rec))
+        # Build roster grouped by stored rank
+        members_for_director: List[Tuple[discord.Member, Dict[str, Any]]] = []
+        for m in guild.members:
+            rec = data.get("members", {}).get(str(m.id))
+            if isinstance(rec, dict) and rec.get("director_id") == d.id:
+                members_for_director.append((m, rec))
 
-            groups: Dict[str, List[discord.Member]] = {
-                RANK_DIRECTOR: [],
-                RANK_GENERAL: [],
-                RANK_COMMANDER: [],
-                RANK_OFFICER: [],
-                RANK_SECURITY: [],
-            }
-            for m, rec in members_for_director:
-                r = rec.get("rank", RANK_SECURITY)
-                if r not in groups:
-                    r = RANK_SECURITY
-                groups[r].append(m)
+        groups: Dict[str, List[discord.Member]] = {
+            RANK_DIRECTOR: [],
+            RANK_GENERAL: [],
+            RANK_COMMANDER: [],
+            RANK_OFFICER: [],
+            RANK_SECURITY: [],
+        }
+        for m, rec in members_for_director:
+            r = rec.get("rank", RANK_SECURITY)
+            if r not in groups:
+                r = RANK_SECURITY
+            groups[r].append(m)
 
-            # Ensure director appears in their own roster group if assigned
-            # (many setups store director_id for director; if not, this won't force it)
-            # Sort and print
-            any_listed = False
-            for rank in (RANK_DIRECTOR, RANK_GENERAL, RANK_COMMANDER, RANK_OFFICER, RANK_SECURITY):
-                ms = _sort_members_casefold(groups.get(rank, []))
-                if not ms:
-                    continue
-                any_listed = True
-                lines.append(f"│  ├─ {_rank_label(rank)} ({len(ms)})")
-                for m in ms:
-                    lines.append(f"│  │  • {m.display_name}")
-            if not any_listed:
-                lines.append("│  └─ (No assigned members)")
+        any_listed = False
+        for rank in (RANK_DIRECTOR, RANK_GENERAL, RANK_COMMANDER, RANK_OFFICER, RANK_SECURITY):
+            ms = _sort_members_casefold(groups.get(rank, []))
+            if not ms:
+                continue
+            any_listed = True
+            lines.append(f"│  ├─ {_rank_label(rank)} ({len(ms)})")
+            for m in ms:
+                lines.append(f"│  │  • {m.display_name}")
 
-            lines.append("")
+        if not any_listed:
+            lines.append("│  └─ (No assigned members)")
 
-    # Wrap into a single embed; if too large, fall back to file attachment but still keep a single pinned-ish message.
-    # We will keep the message simple: an embed with chunks in fields if needed.
-    content_chunks = _chunk_lines(lines, max_len=1800)  # keep room for code block markers
+        # spacing between directors
+        lines.append("")
 
-    embed = discord.Embed(
-        title="Corp Flowchart",
-        description="Auto-updated hierarchy view (CEO → Directors → Unit roster).",
-        color=discord.Color.blurple(),
-    )
+    return "\n".join(lines).strip()
 
-    if len(content_chunks) == 1:
-        embed.add_field(name="Flow", value=f"```text\n{content_chunks[0]}\n```", inline=False)
-    else:
-        # Multiple chunks; place them in multiple fields (Discord allows up to 25 fields)
-        for idx, chunk in enumerate(content_chunks[:24], start=1):
-            embed.add_field(name=f"Flow (part {idx})", value=f"```text\n{chunk}\n```", inline=False)
-        if len(content_chunks) > 24:
-            embed.add_field(
-                name="Flow (truncated)",
-                value="```text\nOutput too large to display fully in embed fields.\nConsider splitting units or reducing roster size.\n```",
-                inline=False
+async def update_flowchart(guild: discord.Guild) -> None:
+    """
+    Posts/updates a single flowchart message in #corp-flowchart.
+    Uses plain text (code block) to avoid needing Embed Links permission.
+    """
+    # Ensure channel exists
+    ch = await ensure_flowchart_channel(guild)
+    if not ch:
+        return
+
+    me = guild.me
+    if me:
+        perms = ch.permissions_for(me)
+        if not perms.view_channel or not perms.send_messages:
+            await safe_log(
+                guild,
+                f"Flowchart: cannot post in #{FLOWCHART_CH}. "
+                f"Need View Channel + Send Messages. Current: view={perms.view_channel}, send={perms.send_messages}"
             )
+            return
 
-    # Upsert the message (edit if exists, otherwise create)
+    # Load state and stored message pointer
+    async with file_lock:
+        data = load_data()
+        flow = data.setdefault("flowchart", {})
+        stored_message_id = flow.get("message_id")
+
+    text = build_flowchart_text(guild, data)
+
+    # If too long, send as multiple messages but still keep the first message tracked and updateable.
+    # First message holds part 1, subsequent parts are sent fresh each time (best-effort).
+    parts = _chunk_text(f"```text\n{text}\n```", max_len=1900)
+
+    # Try fetch existing tracked message
     msg: Optional[discord.Message] = None
     if isinstance(stored_message_id, int):
         try:
@@ -540,27 +470,27 @@ async def update_flowchart(guild: discord.Guild) -> None:
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             msg = None
 
-    if msg:
-        try:
-            await msg.edit(embed=embed, content=None)
-            return
-        except (discord.Forbidden, discord.HTTPException):
-            # If we cannot edit, try to send a new one
-            msg = None
-
-    # Create a new message
     try:
-        new_msg = await ch.send(embed=embed)
-    except (discord.Forbidden, discord.HTTPException):
-        return
+        if msg:
+            await msg.edit(content=parts[0])
+        else:
+            msg = await ch.send(parts[0])
+            async with file_lock:
+                data = load_data()
+                flow = data.setdefault("flowchart", {})
+                flow["channel_id"] = ch.id
+                flow["message_id"] = msg.id
+                save_data(data)
 
-    # Persist the new message id
-    async with file_lock:
-        data = load_data()
-        flow = data.setdefault("flowchart", {})
-        flow["channel_id"] = ch.id
-        flow["message_id"] = new_msg.id
-        save_data(data)
+        # Post additional parts (best effort, do not persist their ids)
+        for p in parts[1:]:
+            try:
+                await ch.send(p)
+            except (discord.Forbidden, discord.HTTPException):
+                break
+
+    except (discord.Forbidden, discord.HTTPException) as e:
+        await safe_log(guild, f"Flowchart: failed to send/edit message in #{FLOWCHART_CH}. `{type(e).__name__}`")
 
 # =====================
 # MODAL
@@ -576,7 +506,6 @@ class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
         guild = interaction.guild
         director = interaction.user
 
-        # Validate quickly BEFORE deferring
         if not is_director(director):
             await interaction.response.send_message("Only Directors may create units.", ephemeral=True)
             return
@@ -586,7 +515,6 @@ class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
             await interaction.response.send_message("You already own a unit.", ephemeral=True)
             return
 
-        # Defer immediately to avoid Unknown interaction (10062)
         await interaction.response.defer(ephemeral=False, thinking=True)
 
         try:
@@ -604,14 +532,12 @@ class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
             text_ch = await guild.create_text_channel("unit-chat", category=category)
             voice_ch = await guild.create_voice_channel("unit-voice", category=category)
 
-            # Persist unit first so assign_member_to_unit can find it
             data["units"][str(director.id)] = {
                 "unit_name": name,
                 "unit_role_id": role.id,
                 "category_id": category.id,
             }
 
-            # Treat creation as joining: strip removable roles + remove Unitless + add unit role
             old_director_id, _unit_name = await assign_member_to_unit(
                 director,
                 director,
@@ -619,7 +545,6 @@ class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
                 strip_first=True,
             )
 
-            # Ensure director record is correct (role itself is protected)
             rec = ensure_member_record(data, director.id)
             rec["rank"] = RANK_DIRECTOR
             rec["director_id"] = director.id
@@ -642,7 +567,6 @@ class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
                 ephemeral=False,
             )
 
-            # Update flowchart after a roster/unit change
             await update_flowchart(guild)
 
         except (discord.Forbidden, discord.HTTPException) as e:
@@ -650,6 +574,7 @@ class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
                 f"Unit creation failed due to a permissions/API error.\n`{type(e).__name__}`",
                 ephemeral=True,
             )
+            await safe_log(guild, f"Create unit failed: `{type(e).__name__}`")
 
 # =====================
 # COG
@@ -661,6 +586,20 @@ class ARCHierarchyCog(commands.Cog):
     arc = app_commands.Group(name="arc", description="ARC hierarchy commands")
 
     # -----------------
+    # FLOWCHART
+    # -----------------
+    @arc.command(name="flowchart_refresh", description="Force refresh the corp flowchart in #corp-flowchart")
+    async def flowchart_refresh(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        actor = interaction.user
+        if not isinstance(actor, discord.Member) or not can_manage(actor):
+            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
+            return
+
+        await update_flowchart(interaction.guild)
+        await interaction.followup.send("✅ Flowchart refreshed.", ephemeral=True)
+
+    # -----------------
     # UNIT MGMT
     # -----------------
     @arc.command(name="create_unit")
@@ -670,7 +609,6 @@ class ARCHierarchyCog(commands.Cog):
     @arc.command(name="join")
     @app_commands.describe(director="Director you want to join")
     async def join(self, interaction: discord.Interaction, director: discord.Member):
-        # Join can do multiple role operations; defer to avoid Unknown interaction.
         await interaction.response.defer(ephemeral=False, thinking=True)
 
         guild = interaction.guild
@@ -712,17 +650,14 @@ class ARCHierarchyCog(commands.Cog):
             ephemeral=False,
         )
 
-        # Update flowchart after roster change
         await update_flowchart(guild)
 
-    # NEW: CEO-only unit ownership transfer (roles, reports, AP attribution via director_id)
     @arc.command(name="transfer_unit")
     @app_commands.describe(
         from_director="Director currently owning the unit",
         to_director="Director who will receive the unit"
     )
     async def transfer_unit(self, interaction: discord.Interaction, from_director: discord.Member, to_director: discord.Member):
-        # I/O + multiple operations; defer to avoid Unknown interaction.
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         actor = interaction.user
@@ -747,40 +682,33 @@ class ARCHierarchyCog(commands.Cog):
         moved_count = 0
         unit: Dict[str, Any] = {}
 
-        # Serialize JSON update (prevents races with join/promote/demote)
         async with file_lock:
             data = load_data()
 
-            # Validate: source unit exists
             unit = data.get("units", {}).get(str(from_director.id))
             if not unit:
                 await interaction.followup.send("That source Director has no unit to transfer.", ephemeral=True)
                 return
 
-            # Validate: destination director does NOT already own a unit
             if str(to_director.id) in data.get("units", {}):
                 await interaction.followup.send("The destination Director already owns a unit.", ephemeral=True)
                 return
 
-            # Move the unit entry (ownership transfer)
             data["units"][str(to_director.id)] = unit
             data["units"].pop(str(from_director.id), None)
 
-            # Update all members assigned to the old unit → new director_id
             members = data.get("members", {})
             for _uid, rec in members.items():
                 if isinstance(rec, dict) and rec.get("director_id") == from_director.id:
                     rec["director_id"] = to_director.id
                     moved_count += 1
 
-            # Ensure destination director record exists and is correct
             to_rec = ensure_member_record(data, to_director.id)
             to_rec["rank"] = RANK_DIRECTOR
             to_rec["director_id"] = to_director.id
 
             save_data(data)
 
-        # Ensure destination director has the unit role so they can access the unit category/channels
         try:
             role_id = unit.get("unit_role_id")
             role_obj = guild.get_role(role_id) if isinstance(role_id, int) else None
@@ -807,7 +735,6 @@ class ARCHierarchyCog(commands.Cog):
             ephemeral=True,
         )
 
-        # Update flowchart after unit ownership + roster mapping changes
         await update_flowchart(guild)
 
     # -----------------
@@ -816,7 +743,6 @@ class ARCHierarchyCog(commands.Cog):
     @arc.command(name="promote")
     @app_commands.describe(member="Member to promote")
     async def promote(self, interaction: discord.Interaction, member: discord.Member):
-        # Role changes + logging; defer for safety.
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         actor = interaction.user
@@ -855,19 +781,16 @@ class ARCHierarchyCog(commands.Cog):
             mention_director_ids=mention_ids,
         )
 
-        # Promote result: ephemeral keeps channels clean; change to False if you want public.
         await interaction.followup.send(
             f"{member.mention} promoted: **{prev_rank} → {new_rank}**.",
             ephemeral=True,
         )
 
-        # Update flowchart after rank changes
         await update_flowchart(guild)
 
     @arc.command(name="demote")
     @app_commands.describe(member="Member to demote")
     async def demote(self, interaction: discord.Interaction, member: discord.Member):
-        # Role changes + logging; defer for safety.
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         actor = interaction.user
@@ -906,13 +829,11 @@ class ARCHierarchyCog(commands.Cog):
             mention_director_ids=mention_ids,
         )
 
-        # Demote result: ephemeral keeps channels clean; change to False if you want public.
         await interaction.followup.send(
             f"{member.mention} demoted: **{prev_rank} → {new_rank}**.",
             ephemeral=True,
         )
 
-        # Update flowchart after rank changes
         await update_flowchart(guild)
 
     # -----------------
@@ -921,7 +842,6 @@ class ARCHierarchyCog(commands.Cog):
     @arc.command(name="roster")
     @app_commands.describe(director="Director whose unit roster you want to view")
     async def roster(self, interaction: discord.Interaction, director: discord.Member):
-        # FIX: ACK immediately so the interaction doesn't expire (Unknown interaction 10062)
         await interaction.response.defer(ephemeral=False, thinking=True)
 
         data = load_data()
@@ -977,7 +897,6 @@ class ARCHierarchyCog(commands.Cog):
 
         text = "\n".join(lines)
 
-        # FIX: avoid hitting Discord 2000 character limit
         if len(text) <= 1900:
             await interaction.followup.send(text, ephemeral=False)
             return
@@ -992,9 +911,10 @@ class ARCHierarchyCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
+        # Give Discord a brief moment so channels/guild caches are stable
+        await asyncio.sleep(2)
         for g in self.bot.guilds:
             await ensure_log_channel(g)
-            # Ensure flowchart channel exists and is current on startup
             await update_flowchart(g)
 
 async def setup(bot: commands.Bot):
