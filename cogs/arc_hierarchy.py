@@ -1,759 +1,934 @@
-# cogs/arc_hierarchy.py
-
+# cogs/alert_system.py
+#
+# Alert System + Wormhole Status
+# Railway persistence via /data volume (or PERSIST_ROOT override).
+# Auto-load behavior:
+#   - On bot ready: for every guild, ensure #wormhole-status exists and panels are posted/refreshed
+#   - Persistent Views registered (so buttons keep working after restart)
+#
+# Permissions:
+#   - Alerts (send/setup/report): restricted to ALERT_SEND_ROLES
+#   - Wormhole Status (buttons): restricted to WH_STATUS_ROLES
+#
+# Auto-danger behavior (NO killmail cog modification required):
+#   - Watches messages posted in #kill-mail by THIS bot.
+#   - Parses the killmail embed to detect:
+#       * System name
+#       * Tag (KILL / LOSS)
+#   - If system == "J220215" and tag in {KILL, LOSS}:
+#       * set WH status to "Dangerous"
+#       * ping ARC Security in #wormhole-status
+#       * start/reset a 45-minute timer to revert status to "Normal"
+#
 import os
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
-import json
+from discord.ui import View, Button, Modal, TextInput
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
-import io
+import json
+import datetime
 import asyncio
+from typing import Dict, Any, Optional, List, Tuple, Set
+import io
+
+# =====================
+# CONFIG
+# =====================
+
+CHANNEL_NAME = "wormhole-status"
+KILLMAIL_CHANNEL_NAME = "kill-mail"  # must match your killmail_feed.py
+
+ARC_SECURITY_ROLE = "ARC Security"
+
+# Alerts system permissions (KEEP RESTRICTED)
+ALERT_SEND_ROLES = {
+    "ARC Security Corporation Leader",
+    "ARC Security Administration Council",
+    "ARC General",
+}
+
+# Wormhole status permissions (EXPIFDED)
+WH_STATUS_ROLES = {
+    "ARC Security Corporation Leader",
+    "ARC Security Administration Council",
+    "ARC General",
+    "ARC Commander",
+    "ARC Officer",
+}
+
+# Auto-danger config
+HOME_SYSTEM_NAME = "J220215"
+AUTO_DANGER_STATUS_VALUE = "Dangerous"
+AUTO_DANGER_REVERT_VALUE = "Normal"
+AUTO_DANGER_DURATION_SECONDS = 45 * 60  # 45 minutes
 
 # =====================
 # PERSISTENCE (Railway Volume)
 # =====================
-# Mount your Railway Volume at /data.
-# Optionally override with env var PERSIST_ROOT (e.g., "/data").
+
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Persist hierarchy state on the volume
-DATA_FILE = PERSIST_ROOT / "arc_hierarchy.json"
+DATA_FILE = PERSIST_ROOT / "alert_system.json"
 
-# Single-process lock to serialize JSON read/write
-file_lock = asyncio.Lock()
+# DM pacing / safety
+DM_DELAY_SECONDS = 1.2
+DM_FAIL_ABORT_THRESHOLD = 25
+DM_CONCURRENCY = 1
 
-# =====================
-# ROLES
-# =====================
-CEO_ROLE = "ARC Security Corporation Leader"            # PROTECTED: NEVER REMOVED BY BOT
-DIRECTOR_ROLE = "ARC Security Administration Council"   # PROTECTED: NEVER REMOVED BY BOT
-GENERAL_ROLE = "ARC General"
-COMMANDER_ROLE = "ARC Commander"
-OFFICER_ROLE = "ARC Officer"
-SECURITY_ROLE = "ARC Security"  # PROTECTED: NEVER REMOVED BY BOT
-
-UNITLESS_ROLE = "Unitless"
-
-# Rank roles the bot must NEVER remove automatically
-PROTECTED_RANK_ROLES = {SECURITY_ROLE, DIRECTOR_ROLE, CEO_ROLE}
+# How many broadcasts to keep in storage
+MAX_BROADCAST_HISTORY = 250
 
 # =====================
-# CHANNELS
+# STORAGE HELPERS
 # =====================
-LOG_CH = "arc-hierarchy-log"
 
-# =====================
-# RANKS
-# =====================
-RANK_SECURITY = "security"
-RANK_OFFICER = "officer"
-RANK_COMMANDER = "commander"
-RANK_GENERAL = "general"
-RANK_DIRECTOR = "director"
-RANK_CEO = "ceo"
+_file_lock = asyncio.Lock()
 
-ROLE_BY_RANK = {
-    RANK_SECURITY: SECURITY_ROLE,
-    RANK_OFFICER: OFFICER_ROLE,
-    RANK_COMMANDER: COMMANDER_ROLE,
-    RANK_GENERAL: GENERAL_ROLE,
-    RANK_DIRECTOR: DIRECTOR_ROLE,
-    RANK_CEO: CEO_ROLE,
-}
+def utcnow() -> datetime.datetime:
+    return datetime.datetime.utcnow()
 
-PROMOTE_TO = {
-    RANK_SECURITY: RANK_OFFICER,
-    RANK_OFFICER: RANK_COMMANDER,
-    RANK_COMMANDER: RANK_GENERAL,
-    RANK_GENERAL: None,  # unit cap
-}
+def utcnow_iso() -> str:
+    return utcnow().isoformat()
 
-DEMOTE_TO = {
-    RANK_GENERAL: RANK_COMMANDER,
-    RANK_COMMANDER: RANK_OFFICER,
-    RANK_OFFICER: RANK_SECURITY,
-}
+def _default_state() -> Dict[str, Any]:
+    return {
+        "opt_in": {},  # user_id -> {current: bool, opted_in_at, opted_out_at, username_last_seen}
+        "broadcasts": [],  # list of broadcasts with delivery logs
+        "status": {"value": "Normal", "updated_utc": None, "updated_by": None},
+        "panel_message_ids": {"alert": None, "status": None, "channel_id": None, "guild_id": None},
+        "auto_danger": {
+            "active": False,
+            "reset_at_utc": None,
+            "last_trigger_utc": None,
+            "last_trigger_killmail_id": None,
+            "last_trigger_tag": None,
+            "last_trigger_system": None,
+        },
+    }
 
-# =====================
-# PERSISTENCE
-# =====================
-def _default_data() -> Dict[str, Any]:
-    return {"members": {}, "units": {}}
+def _safe_read_json(p: Path) -> Dict[str, Any]:
+    try:
+        if not p.exists():
+            return {}
+        txt = p.read_text(encoding="utf-8").strip()
+        if not txt:
+            return {}
+        return json.loads(txt)
+    except Exception:
+        return {}
 
-def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
-    """
-    Atomic JSON write:
-      - write to .tmp in same directory
-      - replace target
-    Reduces risk of corruption on crash/redeploy.
-    """
+def _atomic_write_json(p: Path, d: Dict[str, Any]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    payload = json.dumps(data, indent=2)
-    tmp.write_text(payload, encoding="utf-8")
+    tmp.write_text(json.dumps(d, indent=4), encoding="utf-8")
     tmp.replace(p)
 
-def load_data() -> Dict[str, Any]:
-    """
-    Robust load:
-      - if missing: default structure
-      - if blank/corrupt: keep a .bak and default
-    """
+async def load_state() -> Dict[str, Any]:
+    async with _file_lock:
+        s = _safe_read_json(DATA_FILE)
+        if not isinstance(s, dict) or not s:
+            s = _default_state()
+
+        s.setdefault("opt_in", {})
+        s.setdefault("broadcasts", [])
+        s.setdefault("status", {"value": "Normal", "updated_utc": None, "updated_by": None})
+        s.setdefault("panel_message_ids", {"alert": None, "status": None, "channel_id": None, "guild_id": None})
+        s.setdefault("auto_danger", _default_state()["auto_danger"])
+        return s
+
+async def save_state(state: Dict[str, Any]) -> None:
+    async with _file_lock:
+        _atomic_write_json(DATA_FILE, state)
+
+def clamp_history(broadcasts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if len(broadcasts) <= MAX_BROADCAST_HISTORY:
+        return broadcasts
+    return broadcasts[-MAX_BROADCAST_HISTORY:]
+
+def iso_to_dt(s: Optional[str]) -> Optional[datetime.datetime]:
+    if not s:
+        return None
     try:
-        if not DATA_FILE.exists():
-            return _default_data()
-
-        txt = DATA_FILE.read_text(encoding="utf-8").strip()
-        if not txt:
-            return _default_data()
-
-        data = json.loads(txt)
-        if not isinstance(data, dict):
-            return _default_data()
-
-        data.setdefault("members", {})
-        data.setdefault("units", {})
-        if not isinstance(data["members"], dict):
-            data["members"] = {}
-        if not isinstance(data["units"], dict):
-            data["units"] = {}
-
-        return data
-
-    except json.JSONDecodeError:
-        # Keep a backup for inspection, then reset
-        try:
-            bak = DATA_FILE.with_suffix(DATA_FILE.suffix + ".bak")
-            DATA_FILE.replace(bak)
-        except Exception:
-            pass
-        return _default_data()
+        return datetime.datetime.fromisoformat(s)
     except Exception:
-        return _default_data()
-
-def save_data(data: Dict[str, Any]) -> None:
-    _atomic_write_json(DATA_FILE, data)
+        return None
 
 # =====================
-# HELPERS
+# PERMISSIONS
 # =====================
-def get_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
-    return discord.utils.get(guild.roles, name=name)
+
+def has_any_role(member: discord.Member, role_names: set) -> bool:
+    return any(r.name in role_names for r in getattr(member, "roles", []))
 
 def has_role(member: discord.Member, role_name: str) -> bool:
-    return discord.utils.get(member.roles, name=role_name) is not None
+    return any(r.name == role_name for r in getattr(member, "roles", []))
 
-def is_director(member: discord.Member) -> bool:
-    return has_role(member, DIRECTOR_ROLE)
-
-def is_ceo(member: discord.Member) -> bool:
-    return has_role(member, CEO_ROLE)
-
-def can_manage(member: discord.Member) -> bool:
-    return is_ceo(member) or is_director(member)
-
-def ensure_member_record(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
-    return data.setdefault("members", {}).setdefault(str(user_id), {
-        "rank": RANK_SECURITY,
-        "director_id": None,
-        "supervisor_id": None,
-    })
-
-async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
-    ch = discord.utils.get(guild.text_channels, name=LOG_CH)
-    if ch:
-        return ch
-    return await guild.create_text_channel(LOG_CH)
-
-def unit_role_ids(data: Dict[str, Any]) -> List[int]:
-    ids: List[int] = []
-    for u in data.get("units", {}).values():
-        rid = u.get("unit_role_id")
-        if isinstance(rid, int):
-            ids.append(rid)
-    return ids
-
-def rank_roles_to_strip(guild: discord.Guild) -> List[discord.Role]:
-    """
-    Rank roles that may be stripped during transfers/rank enforcement.
-    IMPORTANT: excludes protected roles (ARC Security + Director + CEO).
-    """
-    candidates = [OFFICER_ROLE, COMMANDER_ROLE, GENERAL_ROLE, CEO_ROLE, DIRECTOR_ROLE]
-    out: List[discord.Role] = []
-    for name in candidates:
-        if name in PROTECTED_RANK_ROLES:
-            continue
-        r = get_role(guild, name)
-        if r:
-            out.append(r)
-    return out
-
-async def strip_member_for_unit_change(
-    member: discord.Member,
-    data: Dict[str, Any]
-) -> Tuple[List[discord.Role], List[discord.Role]]:
-    """
-    On unit transfer:
-      - Remove ALL removable rank roles (never remove ARC Security, Director, or CEO)
-      - Remove ALL unit roles
-    """
-    guild = member.guild
-
-    removed_rank: List[discord.Role] = []
-    for role in rank_roles_to_strip(guild):
-        if role in member.roles:
-            removed_rank.append(role)
-    if removed_rank:
-        await member.remove_roles(*removed_rank, reason="ARC unit transfer: stripping prior ranks")
-
-    removed_unit: List[discord.Role] = []
-    for rid in unit_role_ids(data):
-        r = guild.get_role(rid)
-        if r and r in member.roles:
-            removed_unit.append(r)
-    if removed_unit:
-        await member.remove_roles(*removed_unit, reason="ARC unit transfer: stripping prior unit role(s)")
-
-    return removed_rank, removed_unit
-
-async def remove_unitless_if_present(member: discord.Member) -> None:
-    role = get_role(member.guild, UNITLESS_ROLE)
-    if role and role in member.roles:
-        try:
-            await member.remove_roles(role, reason="ARC unit assignment: removing Unitless")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-def get_member_unit_director_id(data: Dict[str, Any], member_id: int) -> Optional[int]:
-    rec = data.get("members", {}).get(str(member_id))
-    if not rec:
-        return None
-    did = rec.get("director_id")
-    return did if isinstance(did, int) else None
-
-async def assign_member_to_unit(
-    member: discord.Member,
-    director: discord.Member,
-    data: Dict[str, Any],
-    *,
-    strip_first: bool = True,
-) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Shared logic for:
-      - /arc join
-      - director creating a new unit (treated as joining that unit)
-
-    Behavior:
-      - Optionally strips prior ranks + prior unit roles (keeps protected roles)
-      - Adds the unit role
-      - Removes Unitless
-      - Sets director_id
-      - Sets rank to security ONLY if member is not a Director/CEO (protect leadership ranks)
-    """
-    guild = member.guild
-
-    unit = data.get("units", {}).get(str(director.id))
-    if not unit:
-        return None, None
-
-    old_director_id = get_member_unit_director_id(data, member.id)
-
-    if strip_first:
-        await strip_member_for_unit_change(member, data)
-
-    # Add new unit role
-    role = guild.get_role(unit["unit_role_id"])
-    if role:
-        try:
-            await member.add_roles(role, reason="ARC unit assignment: assigning unit role")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    # Remove Unitless as soon as someone is in a unit
-    await remove_unitless_if_present(member)
-
-    # Storage update
-    rec = ensure_member_record(data, member.id)
-    rec["director_id"] = director.id
-
-    # Do NOT downgrade protected leadership in storage
-    if not (is_director(member) or is_ceo(member)):
-        rec["rank"] = RANK_SECURITY
-
-    return old_director_id, unit.get("unit_name")
-
-async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str, str]:
-    """
-    Enforces only one rank role at once, never removing protected roles
-    (ARC Security + Director + CEO).
-    """
-    guild = member.guild
-
-    # Serialize state updates
-    async with file_lock:
-        data = load_data()
-        rec = ensure_member_record(data, member.id)
-
-        old_rank = rec.get("rank", RANK_SECURITY)
-        rec["rank"] = new_rank
-
-        # Remove prior rank roles except protected roles
-        to_remove: List[discord.Role] = []
-        for role in rank_roles_to_strip(guild):
-            if role in member.roles:
-                to_remove.append(role)
-        if to_remove:
-            await member.remove_roles(*to_remove, reason="ARC rank change: removing prior rank roles")
-
-        # Add the new rank role (if applicable)
-        if new_rank in (RANK_OFFICER, RANK_COMMANDER, RANK_GENERAL, RANK_DIRECTOR, RANK_CEO):
-            role_name = ROLE_BY_RANK.get(new_rank)
-            role_obj = get_role(guild, role_name) if role_name else None
-            if role_obj and role_obj not in member.roles:
-                try:
-                    await member.add_roles(role_obj, reason=f"ARC rank change: set to {new_rank}")
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
-
-        save_data(data)
-        return old_rank, new_rank
-
-async def log_action(guild: discord.Guild, content: str, mention_director_ids: List[int]) -> None:
-    ch = await ensure_log_channel(guild)
-
-    uniq: List[int] = []
-    for i in mention_director_ids:
-        if isinstance(i, int) and i not in uniq:
-            uniq.append(i)
-
-    mentions = []
-    for did in uniq:
-        m = guild.get_member(did)
-        if m:
-            mentions.append(m.mention)
-
-    prefix = (" ".join(mentions) + "\n") if mentions else ""
-    await ch.send(prefix + content)
+def require_alert_sender_roles():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member):
+            return False
+        return has_any_role(interaction.user, ALERT_SEND_ROLES)
+    return app_commands.check(predicate)
 
 # =====================
-# MODAL
+# MODALS
 # =====================
-class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
-    unit_name = discord.ui.TextInput(label="Unit Name", max_length=64)
 
-    def __init__(self, cog: "ARCHierarchyCog"):
-        super().__init__()
+class AlertMessageModal(Modal):
+    def __init__(self, cog: "AlertSystemCog"):
+        super().__init__(title="Send Alert to ARC Security (DM)")
         self.cog = cog
+        self.msg = TextInput(
+            label="Alert message",
+            placeholder="Keep it short, clear, and operational.",
+            required=True,
+            max_length=1500,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(self.msg)
 
     async def on_submit(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        director = interaction.user
+        await self.cog.handle_send_alert(interaction, str(self.msg.value))
 
-        # Validate quickly BEFORE deferring
-        if not is_director(director):
-            await interaction.response.send_message("Only Directors may create units.", ephemeral=True)
+# =====================
+# VIEWS
+# =====================
+
+class AlertPanelView(View):
+    def __init__(self, cog: "AlertSystemCog"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="Alert", style=discord.ButtonStyle.danger, custom_id="arc_alert:send")
+    async def alert_send(self, interaction: discord.Interaction, button: Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            return
+        # Alerts remain restricted to ALERT_SEND_ROLES
+        if not has_any_role(interaction.user, ALERT_SEND_ROLES):
+            await interaction.response.send_message("You do not have permission to send alerts.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AlertMessageModal(self.cog))
+
+    @discord.ui.button(label="Enable DMs", style=discord.ButtonStyle.success, custom_id="arc_alert:optin")
+    async def opt_in(self, interaction: discord.Interaction, button: Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            return
+        if not has_role(interaction.user, ARC_SECURITY_ROLE):
+            await interaction.response.send_message(f"Only members with `{ARC_SECURITY_ROLE}` can opt in.", ephemeral=True)
             return
 
-        data = load_data()
-        if str(director.id) in data["units"]:
-            await interaction.response.send_message("You already own a unit.", ephemeral=True)
+        await self.cog.set_opt_in(interaction.user, True)
+        await interaction.response.send_message("You are now opted-in to ARC Security DM alerts.", ephemeral=True)
+
+    @discord.ui.button(label="Disable DMs", style=discord.ButtonStyle.secondary, custom_id="arc_alert:optout")
+    async def opt_out(self, interaction: discord.Interaction, button: Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            return
+        if not has_role(interaction.user, ARC_SECURITY_ROLE):
+            await interaction.response.send_message(f"Only members with `{ARC_SECURITY_ROLE}` can opt out.", ephemeral=True)
             return
 
-        # Defer immediately to avoid Unknown interaction (10062)
-        await interaction.response.defer(ephemeral=False, thinking=True)
+        await self.cog.set_opt_in(interaction.user, False)
+        await interaction.response.send_message("You are now opted-out of ARC Security DM alerts.", ephemeral=True)
 
-        try:
-            name = self.unit_name.value.strip()
-            role = await guild.create_role(name=name)
+class WormholeStatusView(View):
+    def __init__(self, cog: "AlertSystemCog"):
+        super().__init__(timeout=None)
+        self.cog = cog
 
-            category = await guild.create_category(
-                f"Unit - {name}",
-                overwrites={
-                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                    role: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-                },
+    async def _set(self, interaction: discord.Interaction, value: str):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            return
+        # Wormhole Status restricted to WH_STATUS_ROLES (expanded set)
+        if not has_any_role(interaction.user, WH_STATUS_ROLES):
+            await interaction.response.send_message(
+                "You do not have permission to update wormhole status.",
+                ephemeral=True
             )
+            return
 
-            text_ch = await guild.create_text_channel("unit-chat", category=category)
-            voice_ch = await guild.create_voice_channel("unit-voice", category=category)
+        await self.cog.set_status(value, f"{interaction.user} (ID: {interaction.user.id})")
+        await self.cog.refresh_status_panel(interaction.guild)
+        await interaction.response.send_message(f"Wormhole status set to `{value}`.", ephemeral=True)
 
-            # Persist unit first so assign_member_to_unit can find it
-            data["units"][str(director.id)] = {
-                "unit_name": name,
-                "unit_role_id": role.id,
-                "category_id": category.id,
-            }
+    @discord.ui.button(label="Normal", style=discord.ButtonStyle.success, custom_id="wh_status:normal")
+    async def normal(self, interaction: discord.Interaction, button: Button):
+        await self._set(interaction, "Normal")
 
-            # Treat creation as joining: strip removable roles + remove Unitless + add unit role
-            old_director_id, _unit_name = await assign_member_to_unit(
-                director,
-                director,
-                data,
-                strip_first=True,
-            )
+    @discord.ui.button(label="Dangerous", style=discord.ButtonStyle.primary, custom_id="wh_status:dangerous")
+    async def dangerous(self, interaction: discord.Interaction, button: Button):
+        await self._set(interaction, "Dangerous")
 
-            # Ensure director record is correct (role itself is protected)
-            rec = ensure_member_record(data, director.id)
-            rec["rank"] = RANK_DIRECTOR
-            rec["director_id"] = director.id
+    @discord.ui.button(label="Enemy Fleet Spotted", style=discord.ButtonStyle.danger, custom_id="wh_status:enemy")
+    async def enemy(self, interaction: discord.Interaction, button: Button):
+        await self._set(interaction, "Enemy Fleet Spotted")
 
-            save_data(data)
+    @discord.ui.button(label="Lock-down", style=discord.ButtonStyle.secondary, custom_id="wh_status:lockdown")
+    async def lockdown(self, interaction: discord.Interaction, button: Button):
+        await self._set(interaction, "Lock-down")
 
-            mention_ids: List[int] = []
-            if isinstance(old_director_id, int):
-                mention_ids.append(old_director_id)
-            mention_ids.append(director.id)
-
-            await log_action(
-                guild,
-                f"Unit created: **{name}** by {director.mention}.",
-                mention_director_ids=mention_ids,
-            )
-
-            await interaction.followup.send(
-                f"Unit **{name}** created.\nChannels: {text_ch.mention}, {voice_ch.mention}",
-                ephemeral=False,
-            )
-
-        except (discord.Forbidden, discord.HTTPException) as e:
-            await interaction.followup.send(
-                f"Unit creation failed due to a permissions/API error.\n`{type(e).__name__}`",
-                ephemeral=True,
-            )
+    @discord.ui.button(label="Under attack", style=discord.ButtonStyle.danger, custom_id="wh_status:attack")
+    async def attack(self, interaction: discord.Interaction, button: Button):
+        await self._set(interaction, "Under attack")
 
 # =====================
 # COG
 # =====================
-class ARCHierarchyCog(commands.Cog):
+
+class AlertSystemCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.state: Dict[str, Any] = _default_state()
 
-    arc = app_commands.Group(name="arc", description="ARC hierarchy commands")
+        self.bot.add_view(AlertPanelView(self))
+        self.bot.add_view(WormholeStatusView(self))
 
-    # -----------------
-    # UNIT MGMT
-    # -----------------
-    @arc.command(name="create_unit")
-    async def create_unit(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(CreateUnitModal(self))
+        self._send_lock = asyncio.Lock()
+        self._auto_setup_done: Set[int] = set()
 
-    @arc.command(name="join")
-    @app_commands.describe(director="Director you want to join")
-    async def join(self, interaction: discord.Interaction, director: discord.Member):
-        # Join can do multiple role operations; defer to avoid Unknown interaction.
-        await interaction.response.defer(ephemeral=False, thinking=True)
+        self._danger_reset_task: Optional[asyncio.Task] = None
 
-        guild = interaction.guild
-        member = interaction.user
-        data = load_data()
+    async def cog_load(self):
+        self.state = await load_state()
+        await self._resume_auto_danger_timer_if_needed()
 
-        if not is_director(director):
-            await interaction.followup.send("Target must be a Director.", ephemeral=True)
-            return
-
-        unit = data["units"].get(str(director.id))
-        if not unit:
-            await interaction.followup.send("That Director has no unit.", ephemeral=True)
-            return
-
-        old_director_id, unit_name = await assign_member_to_unit(
-            member,
-            director,
-            data,
-            strip_first=True,
-        )
-        save_data(data)
-
-        mention_ids: List[int] = []
-        if isinstance(old_director_id, int):
-            mention_ids.append(old_director_id)
-        mention_ids.append(director.id)
-        if can_manage(member):
-            mention_ids.append(member.id)
-
-        await log_action(
-            guild,
-            f"Unit transfer: {member.mention} joined **{unit_name}** (Director: {director.mention}).",
-            mention_director_ids=mention_ids,
-        )
-
-        await interaction.followup.send(
-            f"{member.mention} joined **{unit_name}**.",
-            ephemeral=False,
-        )
-
-    # NEW: CEO-only unit ownership transfer (roles, reports, AP attribution via director_id)
-    @arc.command(name="transfer_unit")
-    @app_commands.describe(
-        from_director="Director currently owning the unit",
-        to_director="Director who will receive the unit"
-    )
-    async def transfer_unit(self, interaction: discord.Interaction, from_director: discord.Member, to_director: discord.Member):
-        # I/O + multiple operations; defer to avoid Unknown interaction.
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        actor = interaction.user
-        guild = interaction.guild
-
-        if not isinstance(actor, discord.Member) or not is_ceo(actor):
-            await interaction.followup.send("Only the CEO may use this command.", ephemeral=True)
-            return
-
-        if not is_director(from_director):
-            await interaction.followup.send("`from_director` must be a Director.", ephemeral=True)
-            return
-
-        if not is_director(to_director):
-            await interaction.followup.send("`to_director` must be a Director.", ephemeral=True)
-            return
-
-        if from_director.id == to_director.id:
-            await interaction.followup.send("Source and destination Directors are the same.", ephemeral=True)
-            return
-
-        moved_count = 0
-        unit: Dict[str, Any] = {}
-
-        # Serialize JSON update (prevents races with join/promote/demote)
-        async with file_lock:
-            data = load_data()
-
-            # Validate: source unit exists
-            unit = data.get("units", {}).get(str(from_director.id))
-            if not unit:
-                await interaction.followup.send("That source Director has no unit to transfer.", ephemeral=True)
-                return
-
-            # Validate: destination director does NOT already own a unit
-            if str(to_director.id) in data.get("units", {}):
-                await interaction.followup.send("The destination Director already owns a unit.", ephemeral=True)
-                return
-
-            # Move the unit entry (ownership transfer)
-            data["units"][str(to_director.id)] = unit
-            data["units"].pop(str(from_director.id), None)
-
-            # Update all members assigned to the old unit → new director_id
-            members = data.get("members", {})
-            for _uid, rec in members.items():
-                if isinstance(rec, dict) and rec.get("director_id") == from_director.id:
-                    rec["director_id"] = to_director.id
-                    moved_count += 1
-
-            # Ensure destination director record exists and is correct
-            to_rec = ensure_member_record(data, to_director.id)
-            to_rec["rank"] = RANK_DIRECTOR
-            to_rec["director_id"] = to_director.id
-
-            save_data(data)
-
-        # Ensure destination director has the unit role so they can access the unit category/channels
-        try:
-            role_id = unit.get("unit_role_id")
-            role_obj = guild.get_role(role_id) if isinstance(role_id, int) else None
-            if role_obj and role_obj not in to_director.roles:
-                await to_director.add_roles(role_obj, reason="ARC unit transfer: new Director receiving unit role")
-            await remove_unitless_if_present(to_director)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-        await log_action(
-            guild,
-            (
-                f"Unit transferred: **{unit.get('unit_name', 'Unnamed Unit')}**\n"
-                f"From Director: {from_director.mention}\n"
-                f"To Director: {to_director.mention}\n"
-                f"Moved member records: **{moved_count}**"
-            ),
-            mention_director_ids=[from_director.id, to_director.id, actor.id],
-        )
-
-        await interaction.followup.send(
-            f"✅ Transferred unit **{unit.get('unit_name', 'Unnamed Unit')}** from {from_director.mention} to {to_director.mention}.\n"
-            f"Updated **{moved_count}** member record(s).",
-            ephemeral=True,
-        )
-
-    # -----------------
-    # PROMOTE / DEMOTE
-    # -----------------
-    @arc.command(name="promote")
-    @app_commands.describe(member="Member to promote")
-    async def promote(self, interaction: discord.Interaction, member: discord.Member):
-        # Role changes + logging; defer for safety.
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        actor = interaction.user
-        guild = interaction.guild
-
-        if not can_manage(actor):
-            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
-            return
-
-        data = load_data()
-        rec = ensure_member_record(data, member.id)
-        old_rank = rec.get("rank", RANK_SECURITY)
-
-        nxt = PROMOTE_TO.get(old_rank)
-        if not nxt:
-            await interaction.followup.send(
-                f"{member.display_name} cannot be promoted further from **{old_rank}**.",
-                ephemeral=True
-            )
-            return
-
-        prev_rank, new_rank = await apply_rank_change(member, nxt)
-
-        data = load_data()
-        director_id = get_member_unit_director_id(data, member.id)
-
-        mention_ids: List[int] = []
-        if isinstance(director_id, int):
-            mention_ids.append(director_id)
-        if can_manage(actor):
-            mention_ids.append(actor.id)
-
-        await log_action(
-            guild,
-            f"Promotion: {member.mention} **{prev_rank} → {new_rank}** by {actor.mention}.",
-            mention_director_ids=mention_ids,
-        )
-
-        # Promote result: ephemeral keeps channels clean; change to False if you want public.
-        await interaction.followup.send(
-            f"{member.mention} promoted: **{prev_rank} → {new_rank}**.",
-            ephemeral=True,
-        )
-
-    @arc.command(name="demote")
-    @app_commands.describe(member="Member to demote")
-    async def demote(self, interaction: discord.Interaction, member: discord.Member):
-        # Role changes + logging; defer for safety.
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        actor = interaction.user
-        guild = interaction.guild
-
-        if not can_manage(actor):
-            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
-            return
-
-        data = load_data()
-        rec = ensure_member_record(data, member.id)
-        old_rank = rec.get("rank", RANK_SECURITY)
-
-        nxt = DEMOTE_TO.get(old_rank)
-        if not nxt:
-            await interaction.followup.send(
-                f"{member.display_name} cannot be demoted from **{old_rank}**.",
-                ephemeral=True
-            )
-            return
-
-        prev_rank, new_rank = await apply_rank_change(member, nxt)
-
-        data = load_data()
-        director_id = get_member_unit_director_id(data, member.id)
-
-        mention_ids: List[int] = []
-        if isinstance(director_id, int):
-            mention_ids.append(director_id)
-        if can_manage(actor):
-            mention_ids.append(actor.id)
-
-        await log_action(
-            guild,
-            f"Demotion: {member.mention} **{prev_rank} → {new_rank}** by {actor.mention}.",
-            mention_director_ids=mention_ids,
-        )
-
-        # Demote result: ephemeral keeps channels clean; change to False if you want public.
-        await interaction.followup.send(
-            f"{member.mention} demoted: **{prev_rank} → {new_rank}**.",
-            ephemeral=True,
-        )
-
-    # -----------------
-    # ROSTER (GROUPED)
-    # -----------------
-    @arc.command(name="roster")
-    @app_commands.describe(director="Director whose unit roster you want to view")
-    async def roster(self, interaction: discord.Interaction, director: discord.Member):
-        # FIX: ACK immediately so the interaction doesn't expire (Unknown interaction 10062)
-        await interaction.response.defer(ephemeral=False, thinking=True)
-
-        data = load_data()
-        unit = data["units"].get(str(director.id))
-        if not unit:
-            await interaction.followup.send("No unit found for that Director.", ephemeral=True)
-            return
-
-        members: List[Tuple[discord.Member, Dict[str, Any]]] = []
-        for m in interaction.guild.members:
-            rec = data.get("members", {}).get(str(m.id))
-            if rec and rec.get("director_id") == director.id:
-                members.append((m, rec))
-
-        groups: Dict[str, List[Tuple[discord.Member, Dict[str, Any]]]] = {
-            RANK_DIRECTOR: [],
-            RANK_GENERAL: [],
-            RANK_COMMANDER: [],
-            RANK_OFFICER: [],
-            RANK_SECURITY: [],
-        }
-
-        for m, rec in members:
-            r = rec.get("rank", RANK_SECURITY)
-            if r not in groups:
-                r = RANK_SECURITY
-            groups[r].append((m, rec))
-
-        def fmt_group(rank: str, title: str) -> List[str]:
-            items = groups.get(rank, [])
-            if not items:
-                return [f"**{title} (0)**", "- None"]
-            items.sort(key=lambda x: x[0].display_name.lower())
-            lines = [f"**{title} ({len(items)})**"]
-            for m, _rec in items:
-                lines.append(f"- {m.display_name}")
-            return lines
-
-        lines: List[str] = []
-        lines.append(f"**Unit:** {unit['unit_name']}")
-        lines.append(f"**Director:** {director.mention}")
-        lines.append("")
-
-        lines.extend(fmt_group(RANK_DIRECTOR, "Directors"))
-        lines.append("")
-        lines.extend(fmt_group(RANK_GENERAL, "Generals"))
-        lines.append("")
-        lines.extend(fmt_group(RANK_COMMANDER, "Commanders"))
-        lines.append("")
-        lines.extend(fmt_group(RANK_OFFICER, "Officers"))
-        lines.append("")
-        lines.extend(fmt_group(RANK_SECURITY, "Security"))
-
-        text = "\n".join(lines)
-
-        # FIX: avoid hitting Discord 2000 character limit
-        if len(text) <= 1900:
-            await interaction.followup.send(text, ephemeral=False)
-            return
-
-        fp = io.BytesIO(text.encode("utf-8"))
-        file = discord.File(fp, filename=f"roster_{unit['unit_name']}.txt")
-        await interaction.followup.send(
-            content="Roster is too large for a single message; attached as a file.",
-            file=file,
-            ephemeral=False,
-        )
+    def cog_unload(self):
+        if self._danger_reset_task and not self._danger_reset_task.done():
+            self._danger_reset_task.cancel()
 
     @commands.Cog.listener()
     async def on_ready(self):
         for g in self.bot.guilds:
-            await ensure_log_channel(g)
+            if g.id in self._auto_setup_done:
+                continue
+            try:
+                await self.upsert_panels(g)
+            except Exception:
+                pass
+            self._auto_setup_done.add(g.id)
+
+        await self._resume_auto_danger_timer_if_needed()
+
+    # ==========================================================
+    # NO-KILLMAIL-COG-CHANGES INTEGRATION:
+    # Watch bot messages in #kill-mail and parse embeds
+    # ==========================================================
+
+    def _parse_killmail_embed(self, emb: discord.Embed) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+        """
+        Returns (system_name, tag, killmail_id) parsed from your killmail_feed embed.
+        Assumes:
+          - embed.title like: "KILL — Killmail #123" or "LOSS — Killmail #123"
+          - embed.description contains a line like: "**System:** J220215 (Sec: ...)"
+        """
+        tag = None
+        kmid = None
+        system_name = None
+
+        title = (emb.title or "").strip()
+        # Title: "<TAG> — Killmail #<id>"
+        m = re.match(r"^(KILL|LOSS|INVOLVEMENT|UNKNOWN)\s+—\s+Killmail\s+#(\d+)\s*$", title, re.IGNORECASE)
+        if m:
+            tag = m.group(1).upper()
+            try:
+                kmid = int(m.group(2))
+            except Exception:
+                kmid = None
+        else:
+            # fallback: try to find an id anywhere in title
+            m2 = re.search(r"#(\d+)", title)
+            if m2:
+                try:
+                    kmid = int(m2.group(1))
+                except Exception:
+                    kmid = None
+
+        desc = emb.description or ""
+        # Find system line
+        # "**System:** <name> (Sec:"
+        m3 = re.search(r"\*\*System:\*\*\s*([^\n]+?)(?:\s*\(Sec:|\s*$)", desc)
+        if m3:
+            system_name = m3.group(1).strip()
+
+        # If tag wasn't in title, try in desc "**Type:** KILL"
+        if not tag:
+            m4 = re.search(r"\*\*Type:\*\*\s*(KILL|LOSS|INVOLVEMENT|UNKNOWN)", desc, re.IGNORECASE)
+            if m4:
+                tag = m4.group(1).upper()
+
+        return system_name, tag, kmid
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Avoid loops / noise
+        if not message.guild:
+            return
+        if not self.bot.user:
+            return
+        if message.author.id != self.bot.user.id:
+            return
+        if not isinstance(message.channel, discord.TextChannel):
+            return
+        if message.channel.name != KILLMAIL_CHANNEL_NAME:
+            return
+        if not message.embeds:
+            return
+
+        # Parse first embed (your killmail feed sends exactly one embed)
+        emb = message.embeds[0]
+        system_name, tag, kmid = self._parse_killmail_embed(emb)
+        if not system_name or not tag:
+            return
+
+        if system_name != HOME_SYSTEM_NAME:
+            return
+        if tag not in {"KILL", "LOSS"}:
+            return
+
+        await self._trigger_auto_danger(
+            guild=message.guild,
+            system_name=system_name,
+            tag=tag,
+            killmail_id=kmid or 0
+        )
+
+    async def _trigger_auto_danger(self, *, guild: discord.Guild, system_name: str, tag: str, killmail_id: int):
+        reset_at = utcnow() + datetime.timedelta(seconds=AUTO_DANGER_DURATION_SECONDS)
+        reset_at_iso = reset_at.isoformat()
+
+        self.state.setdefault("auto_danger", _default_state()["auto_danger"])
+        self.state["auto_danger"].update({
+            "active": True,
+            "reset_at_utc": reset_at_iso,
+            "last_trigger_utc": utcnow_iso(),
+            "last_trigger_killmail_id": killmail_id,
+            "last_trigger_tag": tag,
+            "last_trigger_system": system_name,
+        })
+
+        await self.set_status(AUTO_DANGER_STATUS_VALUE, f"Auto: {tag} detected in {system_name} (Killmail {killmail_id})")
+        await save_state(self.state)
+
+        if self._danger_reset_task and not self._danger_reset_task.done():
+            self._danger_reset_task.cancel()
+        self._danger_reset_task = asyncio.create_task(self._auto_revert_after_delay(reset_at))
+
+        # Refresh panel + ping role in this guild
+        try:
+            await self.refresh_status_panel(guild)
+        except Exception:
+            pass
+
+        try:
+            await self._send_danger_ping(guild=guild, system_name=system_name, tag=tag, killmail_id=killmail_id, reset_at=reset_at)
+        except Exception:
+            pass
+
+    async def _send_danger_ping(self, *, guild: discord.Guild, system_name: str, tag: str, killmail_id: int, reset_at: datetime.datetime):
+        ch = await self.ensure_channel(guild)
+        role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
+        mention = role.mention if role else f"`{ARC_SECURITY_ROLE}`"
+        reset_in_min = int(AUTO_DANGER_DURATION_SECONDS // 60)
+
+        emb = discord.Embed(
+            title="Wormhole Status Update",
+            description=(
+                f"{mention}\n\n"
+                f"**Auto Status:** `{AUTO_DANGER_STATUS_VALUE}`\n"
+                f"**Trigger:** `{tag}` detected in `{system_name}` (Killmail `{killmail_id}`)\n"
+                f"**Duration:** `{reset_in_min} minutes` (auto-reverts to `{AUTO_DANGER_REVERT_VALUE}`)\n"
+                f"**Revert At (UTC):** `{reset_at.isoformat()}`\n"
+            ),
+            timestamp=utcnow(),
+        )
+        emb.set_footer(text="Cryonic Gaming bot — Auto WH Status")
+
+        await ch.send(content=mention if role else None, embed=emb)
+
+    async def _auto_revert_after_delay(self, reset_at: datetime.datetime):
+        try:
+            delay = (reset_at - utcnow()).total_seconds()
+            if delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            try:
+                await asyncio.sleep(AUTO_DANGER_DURATION_SECONDS)
+            except Exception:
+                return
+
+        try:
+            ad = self.state.get("auto_danger", {}) or {}
+            if not ad.get("active"):
+                return
+
+            reset_at_utc = iso_to_dt(ad.get("reset_at_utc"))
+            if reset_at_utc and utcnow() < reset_at_utc:
+                return
+
+            self.state["auto_danger"].update({"active": False, "reset_at_utc": None})
+            await self.set_status(AUTO_DANGER_REVERT_VALUE, "Auto: danger timer elapsed")
+            await save_state(self.state)
+
+            for g in self.bot.guilds:
+                try:
+                    await self.refresh_status_panel(g)
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    async def _resume_auto_danger_timer_if_needed(self):
+        ad = self.state.get("auto_danger", {}) or {}
+        if not ad.get("active"):
+            return
+
+        reset_at = iso_to_dt(ad.get("reset_at_utc"))
+        if not reset_at:
+            self.state["auto_danger"]["active"] = False
+            self.state["auto_danger"]["reset_at_utc"] = None
+            await save_state(self.state)
+            return
+
+        if utcnow() >= reset_at:
+            self.state["auto_danger"]["active"] = False
+            self.state["auto_danger"]["reset_at_utc"] = None
+            await self.set_status(AUTO_DANGER_REVERT_VALUE, "Auto: timer expired during downtime")
+            await save_state(self.state)
+            return
+
+        if self._danger_reset_task and not self._danger_reset_task.done():
+            self._danger_reset_task.cancel()
+        self._danger_reset_task = asyncio.create_task(self._auto_revert_after_delay(reset_at))
+
+    # -------- Storage ops --------
+
+    def opt_in_records(self) -> Dict[str, Any]:
+        return self.state.get("opt_in", {}) or {}
+
+    def is_opted_in(self, user_id: int) -> bool:
+        rec = self.opt_in_records().get(str(user_id))
+        return bool(rec and rec.get("current") is True)
+
+    async def set_opt_in(self, member: discord.Member, enabled: bool):
+        recs = self.opt_in_records()
+        uid = str(member.id)
+        now = utcnow_iso()
+
+        rec = recs.get(uid) or {
+            "current": False,
+            "opted_in_at": None,
+            "opted_out_at": None,
+            "username_last_seen": str(member),
+        }
+
+        rec["username_last_seen"] = str(member)
+        if enabled:
+            if rec.get("current") is not True:
+                rec["current"] = True
+                rec["opted_in_at"] = now
+        else:
+            if rec.get("current") is True:
+                rec["current"] = False
+                rec["opted_out_at"] = now
+
+        recs[uid] = rec
+        self.state["opt_in"] = recs
+        await save_state(self.state)
+
+    async def set_status(self, value: str, updated_by: str):
+        self.state["status"] = {"value": value, "updated_utc": utcnow_iso(), "updated_by": updated_by}
+        await save_state(self.state)
+
+    async def add_broadcast(self, broadcast: Dict[str, Any]):
+        b = self.state.get("broadcasts", []) or []
+        b.append(broadcast)
+        self.state["broadcasts"] = clamp_history(b)
+        await save_state(self.state)
+
+    # -------- Channel / Panels --------
+
+    async def ensure_channel(self, guild: discord.Guild) -> discord.TextChannel:
+        ch = discord.utils.get(guild.text_channels, name=CHANNEL_NAME)
+        if ch:
+            return ch
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(send_messages=False, add_reactions=False),
+        }
+        if guild.me:
+            overwrites[guild.me] = discord.PermissionOverwrite(send_messages=True, embed_links=True, read_messages=True)
+
+        return await guild.create_text_channel(CHANNEL_NAME, overwrites=overwrites, reason="Wormhole status channel")
+
+    def build_alert_panel_embed(self, guild: discord.Guild) -> discord.Embed:
+        role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
+        opted_in_count = 0
+        if role:
+            for m in role.members:
+                if not m.bot and self.is_opted_in(m.id):
+                    opted_in_count += 1
+
+        emb = discord.Embed(
+            title="ARC Security Alert System",
+            description=(
+                "**Leadership:** Use `Alert` to DM an operational alert.\n"
+                f"**Recipients:** Members with `{ARC_SECURITY_ROLE}` who have opted in.\n\n"
+                f"**Opted-in recipients (current):** `{opted_in_count}`\n"
+            ),
+            timestamp=utcnow(),
+        )
+        emb.set_footer(text="Cryonic Gaming bot — Alerts")
+        return emb
+
+    def build_status_embed(self) -> discord.Embed:
+        st = self.state.get("status", {}) or {}
+        value = st.get("value", "Normal")
+        updated_utc = st.get("updated_utc") or "Never"
+        updated_by = st.get("updated_by") or "N/A"
+
+        ad = self.state.get("auto_danger", {}) or {}
+        ad_line = ""
+        if ad.get("active"):
+            ad_line = f"\n**Auto-Revert (UTC):** `{ad.get('reset_at_utc') or 'Unknown'}`"
+
+        emb = discord.Embed(
+            title="Wormhole Status",
+            description=(
+                f"**Current Status:** `{value}`\n"
+                f"**Last Updated (UTC):** `{updated_utc}`\n"
+                f"**Updated By:** `{updated_by}`\n"
+                f"{ad_line}"
+            ),
+            timestamp=utcnow(),
+        )
+        emb.set_footer(text="Cryonic Gaming bot — Wormhole Status")
+        return emb
+
+    async def upsert_panels(self, guild: discord.Guild):
+        ch = await self.ensure_channel(guild)
+
+        panel_ids = self.state.get("panel_message_ids", {}) or {}
+        alert_msg_id = panel_ids.get("alert")
+        status_msg_id = panel_ids.get("status")
+
+        stored_gid = panel_ids.get("guild_id")
+        stored_cid = panel_ids.get("channel_id")
+        if stored_gid and int(stored_gid) != guild.id:
+            alert_msg_id = None
+            status_msg_id = None
+            stored_cid = None
+
+        alert_embed = self.build_alert_panel_embed(guild)
+        if alert_msg_id and stored_cid and int(stored_cid) == ch.id:
+            try:
+                msg = await ch.fetch_message(int(alert_msg_id))
+                await msg.edit(embed=alert_embed, view=AlertPanelView(self))
+            except Exception:
+                msg = await ch.send(embed=alert_embed, view=AlertPanelView(self))
+                alert_msg_id = msg.id
+        else:
+            msg = await ch.send(embed=alert_embed, view=AlertPanelView(self))
+            alert_msg_id = msg.id
+
+        status_embed = self.build_status_embed()
+        if status_msg_id and stored_cid and int(stored_cid) == ch.id:
+            try:
+                msg2 = await ch.fetch_message(int(status_msg_id))
+                await msg2.edit(embed=status_embed, view=WormholeStatusView(self))
+            except Exception:
+                msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
+                status_msg_id = msg2.id
+        else:
+            msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
+            status_msg_id = msg2.id
+
+        self.state["panel_message_ids"] = {
+            "guild_id": guild.id,
+            "channel_id": ch.id,
+            "alert": alert_msg_id,
+            "status": status_msg_id,
+        }
+        await save_state(self.state)
+
+    async def refresh_status_panel(self, guild: discord.Guild):
+        panel_ids = self.state.get("panel_message_ids", {}) or {}
+        channel_id = panel_ids.get("channel_id")
+        status_msg_id = panel_ids.get("status")
+        if not channel_id or not status_msg_id:
+            return
+
+        ch = guild.get_channel(int(channel_id))
+        if not isinstance(ch, discord.TextChannel):
+            return
+        try:
+            msg = await ch.fetch_message(int(status_msg_id))
+            await msg.edit(embed=self.build_status_embed(), view=WormholeStatusView(self))
+        except Exception:
+            pass
+
+    # -------- Alert broadcast --------
+
+    async def handle_send_alert(self, interaction: discord.Interaction, message: str):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            return
+        # Alerts remain restricted to ALERT_SEND_ROLES
+        if not has_any_role(interaction.user, ALERT_SEND_ROLES):
+            await interaction.response.send_message("You do not have permission to send alerts.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
+        if role is None:
+            await interaction.response.send_message(f"Role `{ARC_SECURITY_ROLE}` not found.", ephemeral=True)
+            return
+
+        recipients: List[discord.Member] = []
+        recs = self.opt_in_records()
+        for m in role.members:
+            if m.bot:
+                continue
+            if str(m.id) in recs:
+                recs[str(m.id)]["username_last_seen"] = str(m)
+            if self.is_opted_in(m.id):
+                recipients.append(m)
+
+        self.state["opt_in"] = recs
+        await save_state(self.state)
+
+        if not recipients:
+            await interaction.response.send_message(
+                f"No opted-in members found in `{ARC_SECURITY_ROLE}`. They must click `Enable DMs` first.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Sending alert to `{len(recipients)}` opted-in `{ARC_SECURITY_ROLE}` members...",
+            ephemeral=True,
+        )
+
+        dm_embed = discord.Embed(
+            title="ARC Security Alert",
+            description=message,
+            timestamp=utcnow(),
+        )
+        dm_embed.add_field(name="Sent By", value=f"{interaction.user} (ID: {interaction.user.id})", inline=False)
+        dm_embed.add_field(name="Server", value=guild.name, inline=False)
+        dm_embed.set_footer(text="Cryonic Gaming bot — Alerts")
+
+        broadcast_id = utcnow_iso()
+        deliveries: List[Dict[str, Any]] = []
+
+        async with self._send_lock:
+            sem = asyncio.Semaphore(DM_CONCURRENCY)
+            failed = 0
+
+            async def send_one(member: discord.Member):
+                nonlocal failed
+                async with sem:
+                    try:
+                        await member.send(embed=dm_embed)
+                        deliveries.append({
+                            "user_id": member.id,
+                            "username": str(member),
+                            "sent_utc": utcnow_iso(),
+                        })
+                    except (discord.Forbidden, discord.HTTPException):
+                        failed += 1
+                    await asyncio.sleep(DM_DELAY_SECONDS)
+
+            for member in recipients:
+                await send_one(member)
+                if failed >= DM_FAIL_ABORT_THRESHOLD:
+                    break
+
+        await self.add_broadcast({
+            "broadcast_id": broadcast_id,
+            "created_utc": broadcast_id,
+            "sender": f"{interaction.user} (ID: {interaction.user.id})",
+            "guild_id": guild.id,
+            "message_excerpt": (message[:200] + "…") if len(message) > 200 else message,
+            "recipient_target_count": len(recipients),
+            "delivered_count": len(deliveries),
+            "deliveries": deliveries,
+            "aborted_due_to_failures": failed >= DM_FAIL_ABORT_THRESHOLD,
+            "fail_count": failed,
+        })
+
+        try:
+            ch = await self.ensure_channel(guild)
+            summary = discord.Embed(
+                title="Alert Dispatch Summary",
+                description=(
+                    f"**Sender:** {interaction.user.mention}\n"
+                    f"**Recipients (opted-in target):** `{len(recipients)}`\n"
+                    f"**Delivered (successful):** `{len(deliveries)}`\n"
+                    f"**Failed (DMs closed / errors):** `{failed}`\n"
+                    f"**Broadcast ID (UTC):** `{broadcast_id}`"
+                ),
+                timestamp=utcnow(),
+            )
+            await ch.send(embed=summary)
+        except Exception:
+            pass
+
+        await self.upsert_panels(guild)
+
+    # =====================
+    # REPORT GENERATION / SLASH COMMANDS
+    # (Alerts remain restricted via @require_alert_sender_roles)
+    # =====================
+
+    def _format_opt_in_report_lines(self) -> List[str]:
+        recs = self.opt_in_records()
+        lines = []
+        for uid, rec in recs.items():
+            lines.append(
+                f"{rec.get('username_last_seen','unknown')} | ID={uid} | "
+                f"current={rec.get('current')} | opted_in_at={rec.get('opted_in_at')} | opted_out_at={rec.get('opted_out_at')}"
+            )
+        lines.sort()
+        return lines
+
+    def _filter_broadcasts_by_range(self, start_dt: datetime.datetime, end_dt: datetime.datetime) -> List[Dict[str, Any]]:
+        out = []
+        for b in (self.state.get("broadcasts", []) or []):
+            dt = iso_to_dt(b.get("created_utc"))
+            if not dt:
+                continue
+            if start_dt <= dt <= end_dt:
+                out.append(b)
+        return out
+
+    def _build_broadcast_text(self, b: Dict[str, Any], include_deliveries: bool = True) -> str:
+        lines = []
+        lines.append(f"Broadcast ID (UTC): {b.get('broadcast_id')}")
+        lines.append(f"Created UTC: {b.get('created_utc')}")
+        lines.append(f"Sender: {b.get('sender')}")
+        lines.append(f"Target recipients (opted-in): {b.get('recipient_target_count')}")
+        lines.append(f"Delivered (successful): {b.get('delivered_count')}")
+        lines.append(f"Failures: {b.get('fail_count')} | Aborted: {b.get('aborted_due_to_failures')}")
+        lines.append(f"Message excerpt: {b.get('message_excerpt')}")
+        lines.append("")
+        if include_deliveries:
+            lines.append("Successful deliveries:")
+            deliveries = b.get("deliveries", []) or []
+            for d in deliveries:
+                lines.append(f"  - {d.get('username')} (ID: {d.get('user_id')}) @ {d.get('sent_utc')} UTC")
+        return "\n".join(lines)
+
+    async def _send_report(self, interaction: discord.Interaction, title: str, body_text: str):
+        if len(body_text) <= 3500:
+            emb = discord.Embed(
+                title=title,
+                description=body_text,
+                timestamp=utcnow(),
+            )
+            await interaction.response.send_message(embed=emb, ephemeral=True)
+            return
+
+        data = body_text.encode("utf-8")
+        file = discord.File(io.BytesIO(data), filename="alert_report.txt")
+        emb = discord.Embed(
+            title=title,
+            description="Report is attached as a text file (too long for an embed).",
+            timestamp=utcnow(),
+        )
+        await interaction.response.send_message(embed=emb, file=file, ephemeral=True)
+
+    @app_commands.command(name="alert_setup", description="Post/refresh the alert and wormhole status panels in #wormhole-status.")
+    @require_alert_sender_roles()
+    async def alert_setup(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            return
+        await self.upsert_panels(interaction.guild)
+        await interaction.response.send_message("Panels posted/refreshed in #wormhole-status.", ephemeral=True)
+
+    @app_commands.command(name="alert_report", description="Generate alert delivery + opt-in audit report.")
+    @require_alert_sender_roles()
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="last_sent", value="last_sent"),
+            app_commands.Choice(name="timeframe", value="timeframe"),
+        ]
+    )
+    async def alert_report(
+        self,
+        interaction: discord.Interaction,
+        mode: app_commands.Choice[str],
+        date_from: Optional[str] = None,  # YYYY-MM-DD
+        date_to: Optional[str] = None,    # YYYY-MM-DD
+        include_opt_in_audit: Optional[bool] = True,
+    ):
+        broadcasts = self.state.get("broadcasts", []) or []
+
+        if mode.value == "last_sent":
+            if not broadcasts:
+                await interaction.response.send_message("No broadcasts have been sent yet.", ephemeral=True)
+                return
+            b = broadcasts[-1]
+            text = self._build_broadcast_text(b, include_deliveries=True)
+
+            if include_opt_in_audit:
+                text += "\n\n---\nOpt-in audit (current + timestamps):\n"
+                text += "\n".join(self._format_opt_in_report_lines())
+
+            await self._send_report(interaction, "Alert Report — Last Sent", text)
+            return
+
+        if not date_from or not date_to:
+            await interaction.response.send_message(
+                "For timeframe reports, provide both `date_from` and `date_to` in YYYY-MM-DD format.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            d_from = parse_yyyy_mm_dd(date_from)
+            d_to = parse_yyyy_mm_dd(date_to)
+            start_dt = datetime.datetime.combine(d_from, datetime.time.min)
+            end_dt = datetime.datetime.combine(d_to, datetime.time.max)
+        except ValueError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
+        filtered = self._filter_broadcasts_by_range(start_dt, end_dt)
+        if not filtered:
+            await interaction.response.send_message("No broadcasts found in that timeframe.", ephemeral=True)
+            return
+
+        lines = []
+        lines.append("Alert Report — Timeframe")
+        lines.append(f"From (UTC): {start_dt.isoformat()}  To (UTC): {end_dt.isoformat()}")
+        lines.append(f"Broadcasts found: {len(filtered)}")
+        lines.append("")
+
+        for b in filtered:
+            lines.append(self._build_broadcast_text(b, include_deliveries=True))
+            lines.append("\n" + ("-" * 60) + "\n")
+
+        if include_opt_in_audit:
+            lines.append("Opt-in audit (current + timestamps):")
+            lines.extend(self._format_opt_in_report_lines())
+
+        await self._send_report(interaction, "Alert Report — Timeframe", "\n".join(lines))
+
+def parse_yyyy_mm_dd(s: str) -> datetime.date:
+    try:
+        return datetime.date.fromisoformat(s)
+    except Exception:
+        raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-22).")
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(ARCHierarchyCog(bot))
+    await bot.add_cog(AlertSystemCog(bot))
