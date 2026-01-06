@@ -2,23 +2,17 @@
 #
 # Alert System + Wormhole Status
 # Railway persistence via /data volume (or PERSIST_ROOT override).
-# Auto-load behavior:
-#   - On bot ready: for every guild, ensure #wormhole-status exists and panels are posted/refreshed
-#   - Persistent Views registered (so buttons keep working after restart)
 #
-# Permissions:
-#   - Alerts (send/setup/report): restricted to ALERT_SEND_ROLES
-#   - Wormhole Status (buttons): restricted to WH_STATUS_ROLES
+# Key behavior:
+# - On bot ready: for every guild, ensure #wormhole-status exists and panels are posted/refreshed
+# - Persistent Views registered (so buttons keep working after restart)
 #
-# Auto-danger behavior (NO killmail cog modification required):
-#   - Watches messages posted in #kill-mail by THIS bot.
-#   - Parses the killmail embed to detect:
-#       * System name
-#       * Tag (KILL / LOSS)
-#   - If system == "J220215" and tag in {KILL, LOSS}:
-#       * set WH status to "Dangerous"
-#       * ping ARC Security in #wormhole-status
-#       * start/reset a 45-minute timer to revert status to "Normal"
+# Updates in this version (per your request):
+# 1) Fix auto-danger parsing so it matches your killmail embed format (e.g., "System: J220215 ...", not only "**System:** ...")
+# 2) Every status change pings the "ARC Security" role
+# 3) Ensure only ONE bot "ping/tag" message exists in #wormhole-status at any time:
+#    - delete the previous ping message, then send the new one (so it pings again)
+# 4) Increase apparent size of status text by putting the status into the embed TITLE (largest embed text)
 #
 import os
 import re
@@ -49,7 +43,7 @@ ALERT_SEND_ROLES = {
     "ARC General",
 }
 
-# Wormhole status permissions (EXPIFDED)
+# Wormhole status permissions (EXPANDED)
 WH_STATUS_ROLES = {
     "ARC Security Corporation Leader",
     "ARC Security Administration Council",
@@ -98,7 +92,14 @@ def _default_state() -> Dict[str, Any]:
         "opt_in": {},  # user_id -> {current: bool, opted_in_at, opted_out_at, username_last_seen}
         "broadcasts": [],  # list of broadcasts with delivery logs
         "status": {"value": "Normal", "updated_utc": None, "updated_by": None},
-        "panel_message_ids": {"alert": None, "status": None, "channel_id": None, "guild_id": None},
+        # Track panel messages + the single "ping/tag" message used for status change announcements
+        "panel_message_ids": {
+            "alert": None,
+            "status": None,
+            "status_ping": None,  # <-- only one tag message in channel
+            "channel_id": None,
+            "guild_id": None,
+        },
         "auto_danger": {
             "active": False,
             "reset_at_utc": None,
@@ -135,8 +136,12 @@ async def load_state() -> Dict[str, Any]:
         s.setdefault("opt_in", {})
         s.setdefault("broadcasts", [])
         s.setdefault("status", {"value": "Normal", "updated_utc": None, "updated_by": None})
-        s.setdefault("panel_message_ids", {"alert": None, "status": None, "channel_id": None, "guild_id": None})
+        s.setdefault("panel_message_ids", _default_state()["panel_message_ids"])
         s.setdefault("auto_danger", _default_state()["auto_danger"])
+
+        # Ensure new key exists for older saved files
+        s["panel_message_ids"].setdefault("status_ping", None)
+
         return s
 
 async def save_state(state: Dict[str, Any]) -> None:
@@ -207,7 +212,6 @@ class AlertPanelView(View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
             return
-        # Alerts remain restricted to ALERT_SEND_ROLES
         if not has_any_role(interaction.user, ALERT_SEND_ROLES):
             await interaction.response.send_message("You do not have permission to send alerts.", ephemeral=True)
             return
@@ -246,7 +250,6 @@ class WormholeStatusView(View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
             return
-        # Wormhole Status restricted to WH_STATUS_ROLES (expanded set)
         if not has_any_role(interaction.user, WH_STATUS_ROLES):
             await interaction.response.send_message(
                 "You do not have permission to update wormhole status.",
@@ -254,8 +257,14 @@ class WormholeStatusView(View):
             )
             return
 
-        await self.cog.set_status(value, f"{interaction.user} (ID: {interaction.user.id})")
-        await self.cog.refresh_status_panel(interaction.guild)
+        # Every status change should ping ARC Security, with exactly one ping message existing.
+        await self.cog.update_status(
+            guild=interaction.guild,
+            value=value,
+            updated_by=f"{interaction.user} (ID: {interaction.user.id})",
+            ping_role=True,
+            context_note="Manual status change",
+        )
         await interaction.response.send_message(f"Wormhole status set to `{value}`.", ephemeral=True)
 
     @discord.ui.button(label="Normal", style=discord.ButtonStyle.success, custom_id="wh_status:normal")
@@ -287,6 +296,7 @@ class AlertSystemCog(commands.Cog):
         self.bot = bot
         self.state: Dict[str, Any] = _default_state()
 
+        # Persistent views so buttons work after restart
         self.bot.add_view(AlertPanelView(self))
         self.bot.add_view(WormholeStatusView(self))
 
@@ -317,22 +327,24 @@ class AlertSystemCog(commands.Cog):
         await self._resume_auto_danger_timer_if_needed()
 
     # ==========================================================
-    # NO-KILLMAIL-COG-CHANGES INTEGRATION:
-    # Watch bot messages in #kill-mail and parse embeds
+    # Killmail integration: watch bot messages in #kill-mail and parse embeds
     # ==========================================================
 
     def _parse_killmail_embed(self, emb: discord.Embed) -> Tuple[Optional[str], Optional[str], Optional[int]]:
         """
         Returns (system_name, tag, killmail_id) parsed from your killmail_feed embed.
-        Assumes:
-          - embed.title like: "KILL — Killmail #123" or "LOSS — Killmail #123"
-          - embed.description contains a line like: "**System:** J220215 (Sec: ...)"
+
+        Supports your observed formatting:
+          Title: "LOSS — Killmail #132426586"
+          Description lines may include: "System: J220215 (WH, Sec: -0.99)"
+          Also supports previous bold format: "**System:** J220215 (Sec: ...)"
         """
-        tag = None
-        kmid = None
-        system_name = None
+        tag: Optional[str] = None
+        kmid: Optional[int] = None
+        system_name: Optional[str] = None
 
         title = (emb.title or "").strip()
+
         # Title: "<TAG> — Killmail #<id>"
         m = re.match(r"^(KILL|LOSS|INVOLVEMENT|UNKNOWN)\s+—\s+Killmail\s+#(\d+)\s*$", title, re.IGNORECASE)
         if m:
@@ -349,19 +361,43 @@ class AlertSystemCog(commands.Cog):
                     kmid = int(m2.group(1))
                 except Exception:
                     kmid = None
+            # fallback tag if it appears at the start
+            mtag = re.match(r"^(KILL|LOSS|INVOLVEMENT|UNKNOWN)\b", title, re.IGNORECASE)
+            if mtag:
+                tag = mtag.group(1).upper()
+
+        # Prefer fields if present (some killmail cogs put System into fields)
+        try:
+            for f in (emb.fields or []):
+                if (f.name or "").strip().lower() == "system":
+                    # Field value might include extra data; take first token up to whitespace or '('
+                    raw = (f.value or "").strip()
+                    mfs = re.match(r"^([^\s(]+)", raw)
+                    if mfs:
+                        system_name = mfs.group(1).strip()
+                        break
+        except Exception:
+            pass
 
         desc = emb.description or ""
-        # Find system line
-        # "**System:** <name> (Sec:"
-        m3 = re.search(r"\*\*System:\*\*\s*([^\n]+?)(?:\s*\(Sec:|\s*$)", desc)
-        if m3:
-            system_name = m3.group(1).strip()
 
-        # If tag wasn't in title, try in desc "**Type:** KILL"
-        if not tag:
-            m4 = re.search(r"\*\*Type:\*\*\s*(KILL|LOSS|INVOLVEMENT|UNKNOWN)", desc, re.IGNORECASE)
+        # Bold format: "**System:** <name> (Sec:"
+        if not system_name:
+            m3 = re.search(r"\*\*System:\*\*\s*([^\n]+?)(?:\s*\(|\s*$)", desc, re.IGNORECASE)
+            if m3:
+                system_name = m3.group(1).strip()
+
+        # Plain format: "System: J220215 (WH, Sec: -0.99)"
+        if not system_name:
+            m4 = re.search(r"^System:\s*([^\s(]+)", desc, re.IGNORECASE | re.MULTILINE)
             if m4:
-                tag = m4.group(1).upper()
+                system_name = m4.group(1).strip()
+
+        # If tag wasn't in title, try in desc "Type: LOSS"
+        if not tag:
+            m5 = re.search(r"^Type:\s*(KILL|LOSS|INVOLVEMENT|UNKNOWN)\s*$", desc, re.IGNORECASE | re.MULTILINE)
+            if m5:
+                tag = m5.group(1).upper()
 
         return system_name, tag, kmid
 
@@ -381,7 +417,6 @@ class AlertSystemCog(commands.Cog):
         if not message.embeds:
             return
 
-        # Parse first embed (your killmail feed sends exactly one embed)
         emb = message.embeds[0]
         system_name, tag, kmid = self._parse_killmail_embed(emb)
         if not system_name or not tag:
@@ -412,45 +447,20 @@ class AlertSystemCog(commands.Cog):
             "last_trigger_tag": tag,
             "last_trigger_system": system_name,
         })
-
-        await self.set_status(AUTO_DANGER_STATUS_VALUE, f"Auto: {tag} detected in {system_name} (Killmail {killmail_id})")
         await save_state(self.state)
 
         if self._danger_reset_task and not self._danger_reset_task.done():
             self._danger_reset_task.cancel()
         self._danger_reset_task = asyncio.create_task(self._auto_revert_after_delay(reset_at))
 
-        # Refresh panel + ping role in this guild
-        try:
-            await self.refresh_status_panel(guild)
-        except Exception:
-            pass
-
-        try:
-            await self._send_danger_ping(guild=guild, system_name=system_name, tag=tag, killmail_id=killmail_id, reset_at=reset_at)
-        except Exception:
-            pass
-
-    async def _send_danger_ping(self, *, guild: discord.Guild, system_name: str, tag: str, killmail_id: int, reset_at: datetime.datetime):
-        ch = await self.ensure_channel(guild)
-        role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
-        mention = role.mention if role else f"`{ARC_SECURITY_ROLE}`"
-        reset_in_min = int(AUTO_DANGER_DURATION_SECONDS // 60)
-
-        emb = discord.Embed(
-            title="Wormhole Status Update",
-            description=(
-                f"{mention}\n\n"
-                f"**Auto Status:** `{AUTO_DANGER_STATUS_VALUE}`\n"
-                f"**Trigger:** `{tag}` detected in `{system_name}` (Killmail `{killmail_id}`)\n"
-                f"**Duration:** `{reset_in_min} minutes` (auto-reverts to `{AUTO_DANGER_REVERT_VALUE}`)\n"
-                f"**Revert At (UTC):** `{reset_at.isoformat()}`\n"
-            ),
-            timestamp=utcnow(),
+        # Set status + ping ARC Security (single ping message policy)
+        await self.update_status(
+            guild=guild,
+            value=AUTO_DANGER_STATUS_VALUE,
+            updated_by=f"Auto: {tag} detected in {system_name} (Killmail {killmail_id})",
+            ping_role=True,
+            context_note=f"Auto-trigger from killmail {killmail_id}",
         )
-        emb.set_footer(text="Cryonic Gaming bot — Auto WH Status")
-
-        await ch.send(content=mention if role else None, embed=emb)
 
     async def _auto_revert_after_delay(self, reset_at: datetime.datetime):
         try:
@@ -475,12 +485,18 @@ class AlertSystemCog(commands.Cog):
                 return
 
             self.state["auto_danger"].update({"active": False, "reset_at_utc": None})
-            await self.set_status(AUTO_DANGER_REVERT_VALUE, "Auto: danger timer elapsed")
             await save_state(self.state)
 
+            # Revert status + ping ARC Security (single ping message policy)
             for g in self.bot.guilds:
                 try:
-                    await self.refresh_status_panel(g)
+                    await self.update_status(
+                        guild=g,
+                        value=AUTO_DANGER_REVERT_VALUE,
+                        updated_by="Auto: danger timer elapsed",
+                        ping_role=True,
+                        context_note="Auto-revert after timer",
+                    )
                 except Exception:
                     continue
         except Exception:
@@ -501,8 +517,19 @@ class AlertSystemCog(commands.Cog):
         if utcnow() >= reset_at:
             self.state["auto_danger"]["active"] = False
             self.state["auto_danger"]["reset_at_utc"] = None
-            await self.set_status(AUTO_DANGER_REVERT_VALUE, "Auto: timer expired during downtime")
             await save_state(self.state)
+            # Timer expired during downtime -> revert status (and ping once)
+            for g in self.bot.guilds:
+                try:
+                    await self.update_status(
+                        guild=g,
+                        value=AUTO_DANGER_REVERT_VALUE,
+                        updated_by="Auto: timer expired during downtime",
+                        ping_role=True,
+                        context_note="Auto-revert after downtime",
+                    )
+                except Exception:
+                    continue
             return
 
         if self._danger_reset_task and not self._danger_reset_task.done():
@@ -544,7 +571,7 @@ class AlertSystemCog(commands.Cog):
         self.state["opt_in"] = recs
         await save_state(self.state)
 
-    async def set_status(self, value: str, updated_by: str):
+    async def set_status_state_only(self, value: str, updated_by: str):
         self.state["status"] = {"value": value, "updated_utc": utcnow_iso(), "updated_by": updated_by}
         await save_state(self.state)
 
@@ -600,10 +627,10 @@ class AlertSystemCog(commands.Cog):
         if ad.get("active"):
             ad_line = f"\n**Auto-Revert (UTC):** `{ad.get('reset_at_utc') or 'Unknown'}`"
 
+        # Put status in TITLE for larger display than description
         emb = discord.Embed(
-            title="Wormhole Status",
+            title=f"Wormhole Status: {value}",
             description=(
-                f"**Current Status:** `{value}`\n"
                 f"**Last Updated (UTC):** `{updated_utc}`\n"
                 f"**Updated By:** `{updated_by}`\n"
                 f"{ad_line}"
@@ -651,11 +678,15 @@ class AlertSystemCog(commands.Cog):
             msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
             status_msg_id = msg2.id
 
+        # Keep existing status_ping id untouched here
+        status_ping_id = panel_ids.get("status_ping")
+
         self.state["panel_message_ids"] = {
             "guild_id": guild.id,
             "channel_id": ch.id,
             "alert": alert_msg_id,
             "status": status_msg_id,
+            "status_ping": status_ping_id,
         }
         await save_state(self.state)
 
@@ -675,13 +706,113 @@ class AlertSystemCog(commands.Cog):
         except Exception:
             pass
 
+    # -------- Single ping/tag message handling --------
+
+    async def _replace_status_ping_message(
+        self,
+        *,
+        guild: discord.Guild,
+        status_value: str,
+        updated_by: str,
+        context_note: Optional[str],
+        ping_role: bool,
+    ):
+        """
+        Enforces: only ONE bot 'tag/ping' message exists in #wormhole-status.
+
+        To ensure the role is actually pinged each time, we DELETE the previous ping message
+        and SEND a new one (editing does not re-ping reliably).
+        """
+        ch = await self.ensure_channel(guild)
+        panel_ids = self.state.get("panel_message_ids", {}) or {}
+        old_ping_id = panel_ids.get("status_ping")
+
+        # Delete previous ping message if present
+        if old_ping_id:
+            try:
+                old_msg = await ch.fetch_message(int(old_ping_id))
+                # Only delete if it is ours
+                if self.bot.user and old_msg.author.id == self.bot.user.id:
+                    await old_msg.delete()
+            except Exception:
+                pass
+
+        role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
+        mention = role.mention if role else f"`{ARC_SECURITY_ROLE}`"
+
+        emb = discord.Embed(
+            title=f"STATUS CHANGE: {status_value}",
+            description=(
+                f"{mention if ping_role else ''}\n\n"
+                f"**New Status:** `{status_value}`\n"
+                f"**Updated By:** `{updated_by}`\n"
+                + (f"**Context:** {context_note}\n" if context_note else "")
+                + f"**Time (UTC):** `{utcnow().isoformat()}`\n"
+            ),
+            timestamp=utcnow(),
+        )
+        emb.set_footer(text="Cryonic Gaming bot — Status Notification")
+
+        content = mention if (ping_role and role) else None
+
+        # Prevent accidental @everyone/@here, allow only the role mention if present
+        allowed = discord.AllowedMentions(roles=[role] if role else [], everyone=False, users=False)
+
+        new_msg = await ch.send(content=content, embed=emb, allowed_mentions=allowed)
+
+        self.state.setdefault("panel_message_ids", _default_state()["panel_message_ids"])
+        self.state["panel_message_ids"]["status_ping"] = new_msg.id
+        await save_state(self.state)
+
+    # -------- Unified status update entrypoint (panel + ping) --------
+
+    async def update_status(
+        self,
+        *,
+        guild: discord.Guild,
+        value: str,
+        updated_by: str,
+        ping_role: bool = True,
+        context_note: Optional[str] = None,
+    ):
+        """
+        Single source of truth for status updates:
+        - save state
+        - refresh panels
+        - replace the single ping message (so ARC Security is pinged each time)
+        """
+        await self.set_status_state_only(value, updated_by)
+
+        # Ensure panels exist (automation resilience)
+        try:
+            await self.upsert_panels(guild)
+        except Exception:
+            pass
+
+        # Refresh status panel (keep buttons live + latest status)
+        try:
+            await self.refresh_status_panel(guild)
+        except Exception:
+            pass
+
+        # Send/replace the single ping message
+        try:
+            await self._replace_status_ping_message(
+                guild=guild,
+                status_value=value,
+                updated_by=updated_by,
+                context_note=context_note,
+                ping_role=ping_role,
+            )
+        except Exception:
+            pass
+
     # -------- Alert broadcast --------
 
     async def handle_send_alert(self, interaction: discord.Interaction, message: str):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
             return
-        # Alerts remain restricted to ALERT_SEND_ROLES
         if not has_any_role(interaction.user, ALERT_SEND_ROLES):
             await interaction.response.send_message("You do not have permission to send alerts.", ephemeral=True)
             return
@@ -786,7 +917,6 @@ class AlertSystemCog(commands.Cog):
 
     # =====================
     # REPORT GENERATION / SLASH COMMANDS
-    # (Alerts remain restricted via @require_alert_sender_roles)
     # =====================
 
     def _format_opt_in_report_lines(self) -> List[str]:
