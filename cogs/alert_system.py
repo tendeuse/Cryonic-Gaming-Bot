@@ -7,18 +7,20 @@
 # - On bot ready: for every guild, ensure #wormhole-status exists and panels are posted/refreshed
 # - Persistent Views registered (so buttons keep working after restart)
 #
-# Updates in this version:
-# 1) Auto-danger parsing supports your observed killmail embed format ("System: J220215 ...")
-# 2) Every status change pings the "ARC Security" role while ensuring ONLY ONE bot ping message exists in the channel
-# 3) Increased apparent size of status text by putting status in embed TITLE
-# 4) Adds "status lights" beside statuses:
-#    - 🟢 Normal
-#    - 🟣 Lock-down
-#    - 🔴 all other statuses
-# 5) Buttons colors aligned:
-#    - Normal = green (success)
-#    - Lock-down = purple (Discord doesn't have purple button; using primary/blue as closest)
-#    - All others = red (danger)
+# IMPORTANT FIXES (rate-limit + correctness):
+# - Per-guild state: each guild has its own panel message IDs + status + ping message ID
+# - Status changes DO NOT call upsert_panels() (which can patch multiple messages)
+# - Debounced status panel refresh to avoid burst PATCH 429s
+#
+# Status lights:
+#   - 🟢 Normal
+#   - 🟣 Lock-down
+#   - 🔴 all other statuses
+#
+# Button colors:
+#   - Normal = success (green)
+#   - Lock-down = primary (closest to purple; Discord does not offer purple)
+#   - All other statuses = danger (red)
 #
 import os
 import re
@@ -64,15 +66,6 @@ AUTO_DANGER_STATUS_VALUE = "Dangerous"
 AUTO_DANGER_REVERT_VALUE = "Normal"
 AUTO_DANGER_DURATION_SECONDS = 45 * 60  # 45 minutes
 
-# =====================
-# PERSISTENCE (Railway Volume)
-# =====================
-
-PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
-PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
-
-DATA_FILE = PERSIST_ROOT / "alert_system.json"
-
 # DM pacing / safety
 DM_DELAY_SECONDS = 1.2
 DM_FAIL_ABORT_THRESHOLD = 25
@@ -82,12 +75,33 @@ DM_CONCURRENCY = 1
 MAX_BROADCAST_HISTORY = 250
 
 # =====================
-# STATUS LIGHTS / STYLES
+# PERSISTENCE (Railway Volume)
+# =====================
+
+PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
+
+DATA_FILE = PERSIST_ROOT / "alert_system.json"
+
+# =====================
+# STATUS LIGHTS / HELPERS
 # =====================
 
 GREEN_LIGHT = "🟢"
 PURPLE_LIGHT = "🟣"
 RED_LIGHT = "🔴"
+
+def utcnow() -> datetime.datetime:
+    return datetime.datetime.utcnow()
+
+def utcnow_iso() -> str:
+    return utcnow().isoformat()
+
+def normalize_status(value: str) -> str:
+    v = (value or "").strip()
+    if v.lower() == "lockdown":
+        return "Lock-down"
+    return v
 
 def status_light(value: str) -> str:
     v = (value or "").strip().lower()
@@ -97,42 +111,33 @@ def status_light(value: str) -> str:
         return PURPLE_LIGHT
     return RED_LIGHT
 
-def normalize_status(value: str) -> str:
-    # Keep canonical spelling consistent with your buttons/labels
-    v = (value or "").strip()
-    if v.lower() == "lockdown":
-        return "Lock-down"
-    return v
+def clamp_history(broadcasts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if len(broadcasts) <= MAX_BROADCAST_HISTORY:
+        return broadcasts
+    return broadcasts[-MAX_BROADCAST_HISTORY:]
 
-def is_normal(value: str) -> bool:
-    return (value or "").strip().lower() == "normal"
-
-def is_lockdown(value: str) -> bool:
-    return (value or "").strip().lower() in {"lock-down", "lockdown"}
+def iso_to_dt(s: Optional[str]) -> Optional[datetime.datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 # =====================
-# STORAGE HELPERS
+# DEFAULT STATE (per-guild)
 # =====================
 
-_file_lock = asyncio.Lock()
-
-def utcnow() -> datetime.datetime:
-    return datetime.datetime.utcnow()
-
-def utcnow_iso() -> str:
-    return utcnow().isoformat()
-
-def _default_state() -> Dict[str, Any]:
+def _default_guild_state() -> Dict[str, Any]:
     return {
-        "opt_in": {},
+        "opt_in": {},  # user_id -> {current, opted_in_at, opted_out_at, username_last_seen}
         "broadcasts": [],
         "status": {"value": "Normal", "updated_utc": None, "updated_by": None},
         "panel_message_ids": {
             "alert": None,
             "status": None,
-            "status_ping": None,  # only one tag message in channel
+            "status_ping": None,  # only one bot tag message in channel
             "channel_id": None,
-            "guild_id": None,
         },
         "auto_danger": {
             "active": False,
@@ -143,6 +148,18 @@ def _default_state() -> Dict[str, Any]:
             "last_trigger_system": None,
         },
     }
+
+def _default_state() -> Dict[str, Any]:
+    # Top-level holds guild-specific data
+    return {
+        "guilds": {}  # str(guild_id) -> _default_guild_state()
+    }
+
+# =====================
+# JSON IO
+# =====================
+
+_file_lock = asyncio.Lock()
 
 def _safe_read_json(p: Path) -> Dict[str, Any]:
     try:
@@ -165,33 +182,42 @@ async def load_state() -> Dict[str, Any]:
     async with _file_lock:
         s = _safe_read_json(DATA_FILE)
         if not isinstance(s, dict) or not s:
-            s = _default_state()
+            return _default_state()
 
-        s.setdefault("opt_in", {})
-        s.setdefault("broadcasts", [])
-        s.setdefault("status", {"value": "Normal", "updated_utc": None, "updated_by": None})
-        s.setdefault("panel_message_ids", _default_state()["panel_message_ids"])
-        s.setdefault("auto_danger", _default_state()["auto_danger"])
+        # Migration: if old schema exists, move into new per-guild structure
+        # Old schema had keys at root: opt_in, broadcasts, status, panel_message_ids, auto_danger
+        if "guilds" not in s:
+            migrated = _default_state()
+            # Try to infer guild_id from old panel_message_ids.guild_id
+            old_panel = (s.get("panel_message_ids") or {})
+            old_gid = old_panel.get("guild_id")
+            gid_key = str(old_gid) if old_gid else "unknown"
 
-        s["panel_message_ids"].setdefault("status_ping", None)
+            gs = _default_guild_state()
+            gs["opt_in"] = s.get("opt_in", {}) or {}
+            gs["broadcasts"] = s.get("broadcasts", []) or []
+            gs["status"] = s.get("status", gs["status"]) or gs["status"]
+            gs["auto_danger"] = s.get("auto_danger", gs["auto_danger"]) or gs["auto_danger"]
+
+            # panel ids (channel_id, alert, status, status_ping)
+            old_pm = s.get("panel_message_ids", {}) or {}
+            gs["panel_message_ids"]["alert"] = old_pm.get("alert")
+            gs["panel_message_ids"]["status"] = old_pm.get("status")
+            gs["panel_message_ids"]["status_ping"] = old_pm.get("status_ping")
+            gs["panel_message_ids"]["channel_id"] = old_pm.get("channel_id")
+
+            migrated["guilds"][gid_key] = gs
+            s = migrated
+
+        s.setdefault("guilds", {})
+        if not isinstance(s["guilds"], dict):
+            s["guilds"] = {}
+
         return s
 
 async def save_state(state: Dict[str, Any]) -> None:
     async with _file_lock:
         _atomic_write_json(DATA_FILE, state)
-
-def clamp_history(broadcasts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if len(broadcasts) <= MAX_BROADCAST_HISTORY:
-        return broadcasts
-    return broadcasts[-MAX_BROADCAST_HISTORY:]
-
-def iso_to_dt(s: Optional[str]) -> Optional[datetime.datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.datetime.fromisoformat(s)
-    except Exception:
-        return None
 
 # =====================
 # PERMISSIONS
@@ -258,7 +284,7 @@ class AlertPanelView(View):
             await interaction.response.send_message(f"Only members with `{ARC_SECURITY_ROLE}` can opt in.", ephemeral=True)
             return
 
-        await self.cog.set_opt_in(interaction.user, True)
+        await self.cog.set_opt_in(interaction.guild, interaction.user, True)
         await interaction.response.send_message("You are now opted-in to ARC Security DM alerts.", ephemeral=True)
 
     @discord.ui.button(label="Disable DMs", style=discord.ButtonStyle.secondary, custom_id="arc_alert:optout")
@@ -270,28 +296,21 @@ class AlertPanelView(View):
             await interaction.response.send_message(f"Only members with `{ARC_SECURITY_ROLE}` can opt out.", ephemeral=True)
             return
 
-        await self.cog.set_opt_in(interaction.user, False)
+        await self.cog.set_opt_in(interaction.guild, interaction.user, False)
         await interaction.response.send_message("You are now opted-out of ARC Security DM alerts.", ephemeral=True)
 
 class WormholeStatusView(View):
     def __init__(self, cog: "AlertSystemCog"):
         super().__init__(timeout=None)
         self.cog = cog
-
-        # NOTE: Discord UI button colors are limited to: primary (blue), secondary (grey),
-        # success (green), danger (red). There is no true purple.
-        # We keep the "purple" concept via 🟣 in labels and embed lights, and use primary (blue)
-        # for Lock-down buttons as the closest supported style.
+        # Note: no true purple button in Discord; primary (blue) is closest.
 
     async def _set(self, interaction: discord.Interaction, value: str):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
             return
         if not has_any_role(interaction.user, WH_STATUS_ROLES):
-            await interaction.response.send_message(
-                "You do not have permission to update wormhole status.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("You do not have permission to update wormhole status.", ephemeral=True)
             return
 
         value = normalize_status(value)
@@ -334,24 +353,62 @@ class AlertSystemCog(commands.Cog):
         self.bot = bot
         self.state: Dict[str, Any] = _default_state()
 
+        # Persistent views (buttons survive restart)
         self.bot.add_view(AlertPanelView(self))
         self.bot.add_view(WormholeStatusView(self))
 
         self._send_lock = asyncio.Lock()
         self._auto_setup_done: Set[int] = set()
 
-        self._danger_reset_task: Optional[asyncio.Task] = None
+        self._danger_reset_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> task
+
+        # Per-guild panel operation locks
+        self._panel_locks: Dict[int, asyncio.Lock] = {}
+
+        # Debounced refresh tasks
+        self._refresh_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> task
+
+    def _gkey(self, guild: discord.Guild) -> str:
+        return str(guild.id)
+
+    def _ensure_guild_state(self, guild: discord.Guild) -> Dict[str, Any]:
+        self.state.setdefault("guilds", {})
+        gs = self.state["guilds"].get(self._gkey(guild))
+        if not isinstance(gs, dict):
+            gs = _default_guild_state()
+            self.state["guilds"][self._gkey(guild)] = gs
+        # Ensure expected keys exist
+        gs.setdefault("opt_in", {})
+        gs.setdefault("broadcasts", [])
+        gs.setdefault("status", {"value": "Normal", "updated_utc": None, "updated_by": None})
+        gs.setdefault("panel_message_ids", _default_guild_state()["panel_message_ids"])
+        gs.setdefault("auto_danger", _default_guild_state()["auto_danger"])
+        gs["panel_message_ids"].setdefault("status_ping", None)
+        gs["panel_message_ids"].setdefault("channel_id", None)
+        return gs
+
+    def _get_panel_lock(self, guild_id: int) -> asyncio.Lock:
+        if guild_id not in self._panel_locks:
+            self._panel_locks[guild_id] = asyncio.Lock()
+        return self._panel_locks[guild_id]
 
     async def cog_load(self):
         self.state = await load_state()
-        await self._resume_auto_danger_timer_if_needed()
+        # Resume timers for guilds
+        for g in self.bot.guilds:
+            await self._resume_auto_danger_timer_if_needed(g)
 
     def cog_unload(self):
-        if self._danger_reset_task and not self._danger_reset_task.done():
-            self._danger_reset_task.cancel()
+        for t in list(self._danger_reset_tasks.values()):
+            if t and not t.done():
+                t.cancel()
+        for t in list(self._refresh_tasks.values()):
+            if t and not t.done():
+                t.cancel()
 
     @commands.Cog.listener()
     async def on_ready(self):
+        # Stagger setup to avoid burst PATCH
         for g in self.bot.guilds:
             if g.id in self._auto_setup_done:
                 continue
@@ -360,22 +417,19 @@ class AlertSystemCog(commands.Cog):
             except Exception:
                 pass
             self._auto_setup_done.add(g.id)
+            await asyncio.sleep(0.8)
 
-        await self._resume_auto_danger_timer_if_needed()
+        for g in self.bot.guilds:
+            try:
+                await self._resume_auto_danger_timer_if_needed(g)
+            except Exception:
+                continue
 
     # ==========================================================
-    # Killmail integration: watch bot messages in #kill-mail and parse embeds
+    # Killmail integration
     # ==========================================================
 
     def _parse_killmail_embed(self, emb: discord.Embed) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-        """
-        Returns (system_name, tag, killmail_id) parsed from your killmail_feed embed.
-
-        Supports observed formatting:
-          Title: "LOSS — Killmail #132426586"
-          Description line: "System: J220215 (WH, Sec: -0.99)"
-          Also supports: "**System:** J220215 ..."
-        """
         tag: Optional[str] = None
         kmid: Optional[int] = None
         system_name: Optional[str] = None
@@ -464,13 +518,13 @@ class AlertSystemCog(commands.Cog):
         )
 
     async def _trigger_auto_danger(self, *, guild: discord.Guild, system_name: str, tag: str, killmail_id: int):
-        reset_at = utcnow() + datetime.timedelta(seconds=AUTO_DANGER_DURATION_SECONDS)
-        reset_at_iso = reset_at.isoformat()
+        gs = self._ensure_guild_state(guild)
 
-        self.state.setdefault("auto_danger", _default_state()["auto_danger"])
-        self.state["auto_danger"].update({
+        reset_at = utcnow() + datetime.timedelta(seconds=AUTO_DANGER_DURATION_SECONDS)
+        gs.setdefault("auto_danger", _default_guild_state()["auto_danger"])
+        gs["auto_danger"].update({
             "active": True,
-            "reset_at_utc": reset_at_iso,
+            "reset_at_utc": reset_at.isoformat(),
             "last_trigger_utc": utcnow_iso(),
             "last_trigger_killmail_id": killmail_id,
             "last_trigger_tag": tag,
@@ -478,9 +532,11 @@ class AlertSystemCog(commands.Cog):
         })
         await save_state(self.state)
 
-        if self._danger_reset_task and not self._danger_reset_task.done():
-            self._danger_reset_task.cancel()
-        self._danger_reset_task = asyncio.create_task(self._auto_revert_after_delay(reset_at))
+        # Reset task
+        old = self._danger_reset_tasks.get(guild.id)
+        if old and not old.done():
+            old.cancel()
+        self._danger_reset_tasks[guild.id] = asyncio.create_task(self._auto_revert_after_delay(guild, reset_at))
 
         await self.update_status(
             guild=guild,
@@ -490,7 +546,7 @@ class AlertSystemCog(commands.Cog):
             context_note=f"Auto-trigger from killmail {killmail_id}",
         )
 
-    async def _auto_revert_after_delay(self, reset_at: datetime.datetime):
+    async def _auto_revert_after_delay(self, guild: discord.Guild, reset_at: datetime.datetime):
         try:
             delay = (reset_at - utcnow()).total_seconds()
             if delay > 0:
@@ -503,112 +559,60 @@ class AlertSystemCog(commands.Cog):
             except Exception:
                 return
 
-        try:
-            ad = self.state.get("auto_danger", {}) or {}
-            if not ad.get("active"):
-                return
-
-            reset_at_utc = iso_to_dt(ad.get("reset_at_utc"))
-            if reset_at_utc and utcnow() < reset_at_utc:
-                return
-
-            self.state["auto_danger"].update({"active": False, "reset_at_utc": None})
-            await save_state(self.state)
-
-            for g in self.bot.guilds:
-                try:
-                    await self.update_status(
-                        guild=g,
-                        value=AUTO_DANGER_REVERT_VALUE,
-                        updated_by="Auto: danger timer elapsed",
-                        ping_role=True,
-                        context_note="Auto-revert after timer",
-                    )
-                except Exception:
-                    continue
-        except Exception:
+        gs = self._ensure_guild_state(guild)
+        ad = gs.get("auto_danger", {}) or {}
+        if not ad.get("active"):
             return
 
-    async def _resume_auto_danger_timer_if_needed(self):
-        ad = self.state.get("auto_danger", {}) or {}
+        reset_at_utc = iso_to_dt(ad.get("reset_at_utc"))
+        if reset_at_utc and utcnow() < reset_at_utc:
+            return
+
+        gs["auto_danger"].update({"active": False, "reset_at_utc": None})
+        await save_state(self.state)
+
+        await self.update_status(
+            guild=guild,
+            value=AUTO_DANGER_REVERT_VALUE,
+            updated_by="Auto: danger timer elapsed",
+            ping_role=True,
+            context_note="Auto-revert after timer",
+        )
+
+    async def _resume_auto_danger_timer_if_needed(self, guild: discord.Guild):
+        gs = self._ensure_guild_state(guild)
+        ad = gs.get("auto_danger", {}) or {}
         if not ad.get("active"):
             return
 
         reset_at = iso_to_dt(ad.get("reset_at_utc"))
         if not reset_at:
-            self.state["auto_danger"]["active"] = False
-            self.state["auto_danger"]["reset_at_utc"] = None
+            gs["auto_danger"]["active"] = False
+            gs["auto_danger"]["reset_at_utc"] = None
             await save_state(self.state)
             return
 
         if utcnow() >= reset_at:
-            self.state["auto_danger"]["active"] = False
-            self.state["auto_danger"]["reset_at_utc"] = None
+            gs["auto_danger"]["active"] = False
+            gs["auto_danger"]["reset_at_utc"] = None
             await save_state(self.state)
-            for g in self.bot.guilds:
-                try:
-                    await self.update_status(
-                        guild=g,
-                        value=AUTO_DANGER_REVERT_VALUE,
-                        updated_by="Auto: timer expired during downtime",
-                        ping_role=True,
-                        context_note="Auto-revert after downtime",
-                    )
-                except Exception:
-                    continue
+            await self.update_status(
+                guild=guild,
+                value=AUTO_DANGER_REVERT_VALUE,
+                updated_by="Auto: timer expired during downtime",
+                ping_role=True,
+                context_note="Auto-revert after downtime",
+            )
             return
 
-        if self._danger_reset_task and not self._danger_reset_task.done():
-            self._danger_reset_task.cancel()
-        self._danger_reset_task = asyncio.create_task(self._auto_revert_after_delay(reset_at))
+        old = self._danger_reset_tasks.get(guild.id)
+        if old and not old.done():
+            old.cancel()
+        self._danger_reset_tasks[guild.id] = asyncio.create_task(self._auto_revert_after_delay(guild, reset_at))
 
-    # -------- Storage ops --------
-
-    def opt_in_records(self) -> Dict[str, Any]:
-        return self.state.get("opt_in", {}) or {}
-
-    def is_opted_in(self, user_id: int) -> bool:
-        rec = self.opt_in_records().get(str(user_id))
-        return bool(rec and rec.get("current") is True)
-
-    async def set_opt_in(self, member: discord.Member, enabled: bool):
-        recs = self.opt_in_records()
-        uid = str(member.id)
-        now = utcnow_iso()
-
-        rec = recs.get(uid) or {
-            "current": False,
-            "opted_in_at": None,
-            "opted_out_at": None,
-            "username_last_seen": str(member),
-        }
-
-        rec["username_last_seen"] = str(member)
-        if enabled:
-            if rec.get("current") is not True:
-                rec["current"] = True
-                rec["opted_in_at"] = now
-        else:
-            if rec.get("current") is True:
-                rec["current"] = False
-                rec["opted_out_at"] = now
-
-        recs[uid] = rec
-        self.state["opt_in"] = recs
-        await save_state(self.state)
-
-    async def set_status_state_only(self, value: str, updated_by: str):
-        value = normalize_status(value)
-        self.state["status"] = {"value": value, "updated_utc": utcnow_iso(), "updated_by": updated_by}
-        await save_state(self.state)
-
-    async def add_broadcast(self, broadcast: Dict[str, Any]):
-        b = self.state.get("broadcasts", []) or []
-        b.append(broadcast)
-        self.state["broadcasts"] = clamp_history(b)
-        await save_state(self.state)
-
-    # -------- Channel / Panels --------
+    # =====================
+    # Channel / Panels
+    # =====================
 
     async def ensure_channel(self, guild: discord.Guild) -> discord.TextChannel:
         ch = discord.utils.get(guild.text_channels, name=CHANNEL_NAME)
@@ -624,11 +628,13 @@ class AlertSystemCog(commands.Cog):
         return await guild.create_text_channel(CHANNEL_NAME, overwrites=overwrites, reason="Wormhole status channel")
 
     def build_alert_panel_embed(self, guild: discord.Guild) -> discord.Embed:
+        gs = self._ensure_guild_state(guild)
+
         role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
         opted_in_count = 0
         if role:
             for m in role.members:
-                if not m.bot and self.is_opted_in(m.id):
+                if not m.bot and self.is_opted_in(guild, m.id):
                     opted_in_count += 1
 
         emb = discord.Embed(
@@ -643,13 +649,14 @@ class AlertSystemCog(commands.Cog):
         emb.set_footer(text="Cryonic Gaming bot — Alerts")
         return emb
 
-    def build_status_embed(self) -> discord.Embed:
-        st = self.state.get("status", {}) or {}
+    def build_status_embed(self, guild: discord.Guild) -> discord.Embed:
+        gs = self._ensure_guild_state(guild)
+        st = gs.get("status", {}) or {}
         value = normalize_status(st.get("value", "Normal"))
         updated_utc = st.get("updated_utc") or "Never"
         updated_by = st.get("updated_by") or "N/A"
 
-        ad = self.state.get("auto_danger", {}) or {}
+        ad = gs.get("auto_danger", {}) or {}
         ad_line = ""
         if ad.get("active"):
             ad_line = f"\n**Auto-Revert (UTC):** `{ad.get('reset_at_utc') or 'Unknown'}`"
@@ -669,71 +676,101 @@ class AlertSystemCog(commands.Cog):
         return emb
 
     async def upsert_panels(self, guild: discord.Guild):
-        ch = await self.ensure_channel(guild)
+        # This function can PATCH multiple messages; lock + use sparingly.
+        lock = self._get_panel_lock(guild.id)
+        async with lock:
+            gs = self._ensure_guild_state(guild)
+            ch = await self.ensure_channel(guild)
 
-        panel_ids = self.state.get("panel_message_ids", {}) or {}
-        alert_msg_id = panel_ids.get("alert")
-        status_msg_id = panel_ids.get("status")
+            pm = gs.get("panel_message_ids", {}) or {}
+            alert_msg_id = pm.get("alert")
+            status_msg_id = pm.get("status")
+            channel_id = pm.get("channel_id")
 
-        stored_gid = panel_ids.get("guild_id")
-        stored_cid = panel_ids.get("channel_id")
-        if stored_gid and int(stored_gid) != guild.id:
-            alert_msg_id = None
-            status_msg_id = None
-            stored_cid = None
+            # If stored channel differs, treat as missing
+            if channel_id and int(channel_id) != ch.id:
+                alert_msg_id = None
+                status_msg_id = None
 
-        alert_embed = self.build_alert_panel_embed(guild)
-        if alert_msg_id and stored_cid and int(stored_cid) == ch.id:
-            try:
-                msg = await ch.fetch_message(int(alert_msg_id))
-                await msg.edit(embed=alert_embed, view=AlertPanelView(self))
-            except Exception:
+            # Alert panel
+            alert_embed = self.build_alert_panel_embed(guild)
+            if alert_msg_id:
+                try:
+                    msg = await ch.fetch_message(int(alert_msg_id))
+                    await msg.edit(embed=alert_embed, view=AlertPanelView(self))
+                except Exception:
+                    msg = await ch.send(embed=alert_embed, view=AlertPanelView(self))
+                    alert_msg_id = msg.id
+            else:
                 msg = await ch.send(embed=alert_embed, view=AlertPanelView(self))
                 alert_msg_id = msg.id
-        else:
-            msg = await ch.send(embed=alert_embed, view=AlertPanelView(self))
-            alert_msg_id = msg.id
 
-        status_embed = self.build_status_embed()
-        if status_msg_id and stored_cid and int(stored_cid) == ch.id:
-            try:
-                msg2 = await ch.fetch_message(int(status_msg_id))
-                await msg2.edit(embed=status_embed, view=WormholeStatusView(self))
-            except Exception:
+            # Status panel
+            status_embed = self.build_status_embed(guild)
+            if status_msg_id:
+                try:
+                    msg2 = await ch.fetch_message(int(status_msg_id))
+                    await msg2.edit(embed=status_embed, view=WormholeStatusView(self))
+                except Exception:
+                    msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
+                    status_msg_id = msg2.id
+            else:
                 msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
                 status_msg_id = msg2.id
-        else:
-            msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
-            status_msg_id = msg2.id
 
-        status_ping_id = panel_ids.get("status_ping")
+            gs["panel_message_ids"] = {
+                "channel_id": ch.id,
+                "alert": alert_msg_id,
+                "status": status_msg_id,
+                "status_ping": pm.get("status_ping"),
+            }
+            self.state["guilds"][self._gkey(guild)] = gs
+            await save_state(self.state)
 
-        self.state["panel_message_ids"] = {
-            "guild_id": guild.id,
-            "channel_id": ch.id,
-            "alert": alert_msg_id,
-            "status": status_msg_id,
-            "status_ping": status_ping_id,
-        }
-        await save_state(self.state)
+    async def _refresh_status_panel_once(self, guild: discord.Guild):
+        lock = self._get_panel_lock(guild.id)
+        async with lock:
+            gs = self._ensure_guild_state(guild)
+            pm = gs.get("panel_message_ids", {}) or {}
+            channel_id = pm.get("channel_id")
+            status_msg_id = pm.get("status")
+            if not channel_id or not status_msg_id:
+                return
 
-    async def refresh_status_panel(self, guild: discord.Guild):
-        panel_ids = self.state.get("panel_message_ids", {}) or {}
-        channel_id = panel_ids.get("channel_id")
-        status_msg_id = panel_ids.get("status")
-        if not channel_id or not status_msg_id:
+            ch = guild.get_channel(int(channel_id))
+            if not isinstance(ch, discord.TextChannel):
+                return
+
+            try:
+                msg = await ch.fetch_message(int(status_msg_id))
+                await msg.edit(embed=self.build_status_embed(guild), view=WormholeStatusView(self))
+            except Exception:
+                # If missing, recreate panels (but not in a tight loop)
+                try:
+                    await self.upsert_panels(guild)
+                except Exception:
+                    pass
+
+    async def refresh_status_panel_debounced(self, guild: discord.Guild, delay_seconds: float = 2.0):
+        # Coalesce multiple refresh requests into one PATCH.
+        existing = self._refresh_tasks.get(guild.id)
+        if existing and not existing.done():
             return
 
-        ch = guild.get_channel(int(channel_id))
-        if not isinstance(ch, discord.TextChannel):
-            return
-        try:
-            msg = await ch.fetch_message(int(status_msg_id))
-            await msg.edit(embed=self.build_status_embed(), view=WormholeStatusView(self))
-        except Exception:
-            pass
+        async def runner():
+            try:
+                await asyncio.sleep(delay_seconds)
+                await self._refresh_status_panel_once(guild)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
 
-    # -------- Single ping/tag message handling --------
+        self._refresh_tasks[guild.id] = asyncio.create_task(runner())
+
+    # =====================
+    # Single ping/tag message (one at a time)
+    # =====================
 
     async def _replace_status_ping_message(
         self,
@@ -744,10 +781,12 @@ class AlertSystemCog(commands.Cog):
         context_note: Optional[str],
         ping_role: bool,
     ):
-        ch = await self.ensure_channel(guild)
-        panel_ids = self.state.get("panel_message_ids", {}) or {}
-        old_ping_id = panel_ids.get("status_ping")
+        gs = self._ensure_guild_state(guild)
+        pm = gs.get("panel_message_ids", {}) or {}
 
+        ch = await self.ensure_channel(guild)
+
+        old_ping_id = pm.get("status_ping")
         if old_ping_id:
             try:
                 old_msg = await ch.fetch_message(int(old_ping_id))
@@ -780,11 +819,15 @@ class AlertSystemCog(commands.Cog):
 
         new_msg = await ch.send(content=content, embed=emb, allowed_mentions=allowed)
 
-        self.state.setdefault("panel_message_ids", _default_state()["panel_message_ids"])
-        self.state["panel_message_ids"]["status_ping"] = new_msg.id
+        pm["status_ping"] = new_msg.id
+        pm.setdefault("channel_id", ch.id)
+        gs["panel_message_ids"] = pm
+        self.state["guilds"][self._gkey(guild)] = gs
         await save_state(self.state)
 
-    # -------- Unified status update entrypoint (panel + ping) --------
+    # =====================
+    # Status update entrypoint
+    # =====================
 
     async def update_status(
         self,
@@ -796,18 +839,12 @@ class AlertSystemCog(commands.Cog):
         context_note: Optional[str] = None,
     ):
         value = normalize_status(value)
-        await self.set_status_state_only(value, updated_by)
+        gs = self._ensure_guild_state(guild)
+        gs["status"] = {"value": value, "updated_utc": utcnow_iso(), "updated_by": updated_by}
+        self.state["guilds"][self._gkey(guild)] = gs
+        await save_state(self.state)
 
-        try:
-            await self.upsert_panels(guild)
-        except Exception:
-            pass
-
-        try:
-            await self.refresh_status_panel(guild)
-        except Exception:
-            pass
-
+        # 1) Replace the ping message (delete old + send new) so only one tag exists
         try:
             await self._replace_status_ping_message(
                 guild=guild,
@@ -819,7 +856,61 @@ class AlertSystemCog(commands.Cog):
         except Exception:
             pass
 
-    # -------- Alert broadcast --------
+        # 2) Debounced panel refresh (single PATCH even if multiple changes occur)
+        await self.refresh_status_panel_debounced(guild, delay_seconds=2.0)
+
+    # =====================
+    # Opt-in + broadcasts
+    # =====================
+
+    def opt_in_records(self, guild: discord.Guild) -> Dict[str, Any]:
+        gs = self._ensure_guild_state(guild)
+        return gs.get("opt_in", {}) or {}
+
+    def is_opted_in(self, guild: discord.Guild, user_id: int) -> bool:
+        rec = self.opt_in_records(guild).get(str(user_id))
+        return bool(rec and rec.get("current") is True)
+
+    async def set_opt_in(self, guild: discord.Guild, member: discord.Member, enabled: bool):
+        gs = self._ensure_guild_state(guild)
+        recs = gs.get("opt_in", {}) or {}
+
+        uid = str(member.id)
+        now = utcnow_iso()
+
+        rec = recs.get(uid) or {
+            "current": False,
+            "opted_in_at": None,
+            "opted_out_at": None,
+            "username_last_seen": str(member),
+        }
+
+        rec["username_last_seen"] = str(member)
+        if enabled:
+            if rec.get("current") is not True:
+                rec["current"] = True
+                rec["opted_in_at"] = now
+        else:
+            if rec.get("current") is True:
+                rec["current"] = False
+                rec["opted_out_at"] = now
+
+        recs[uid] = rec
+        gs["opt_in"] = recs
+        self.state["guilds"][self._gkey(guild)] = gs
+        await save_state(self.state)
+
+    async def add_broadcast(self, guild: discord.Guild, broadcast: Dict[str, Any]):
+        gs = self._ensure_guild_state(guild)
+        b = gs.get("broadcasts", []) or []
+        b.append(broadcast)
+        gs["broadcasts"] = clamp_history(b)
+        self.state["guilds"][self._gkey(guild)] = gs
+        await save_state(self.state)
+
+    # =====================
+    # Alert broadcast handling
+    # =====================
 
     async def handle_send_alert(self, interaction: discord.Interaction, message: str):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -830,22 +921,25 @@ class AlertSystemCog(commands.Cog):
             return
 
         guild = interaction.guild
+
         role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
         if role is None:
             await interaction.response.send_message(f"Role `{ARC_SECURITY_ROLE}` not found.", ephemeral=True)
             return
 
         recipients: List[discord.Member] = []
-        recs = self.opt_in_records()
+        recs = self.opt_in_records(guild)
         for m in role.members:
             if m.bot:
                 continue
             if str(m.id) in recs:
                 recs[str(m.id)]["username_last_seen"] = str(m)
-            if self.is_opted_in(m.id):
+            if self.is_opted_in(guild, m.id):
                 recipients.append(m)
 
-        self.state["opt_in"] = recs
+        gs = self._ensure_guild_state(guild)
+        gs["opt_in"] = recs
+        self.state["guilds"][self._gkey(guild)] = gs
         await save_state(self.state)
 
         if not recipients:
@@ -895,7 +989,7 @@ class AlertSystemCog(commands.Cog):
                 if failed >= DM_FAIL_ABORT_THRESHOLD:
                     break
 
-        await self.add_broadcast({
+        await self.add_broadcast(guild, {
             "broadcast_id": broadcast_id,
             "created_utc": broadcast_id,
             "sender": f"{interaction.user} (ID: {interaction.user.id})",
@@ -925,57 +1019,19 @@ class AlertSystemCog(commands.Cog):
         except Exception:
             pass
 
-        await self.upsert_panels(guild)
+        # Only do panel upsert at the end of alert flow
+        try:
+            await self.upsert_panels(guild)
+        except Exception:
+            pass
 
     # =====================
-    # REPORT GENERATION / SLASH COMMANDS
+    # Slash commands
     # =====================
-
-    def _format_opt_in_report_lines(self) -> List[str]:
-        recs = self.opt_in_records()
-        lines = []
-        for uid, rec in recs.items():
-            lines.append(
-                f"{rec.get('username_last_seen','unknown')} | ID={uid} | "
-                f"current={rec.get('current')} | opted_in_at={rec.get('opted_in_at')} | opted_out_at={rec.get('opted_out_at')}"
-            )
-        lines.sort()
-        return lines
-
-    def _filter_broadcasts_by_range(self, start_dt: datetime.datetime, end_dt: datetime.datetime) -> List[Dict[str, Any]]:
-        out = []
-        for b in (self.state.get("broadcasts", []) or []):
-            dt = iso_to_dt(b.get("created_utc"))
-            if not dt:
-                continue
-            if start_dt <= dt <= end_dt:
-                out.append(b)
-        return out
-
-    def _build_broadcast_text(self, b: Dict[str, Any], include_deliveries: bool = True) -> str:
-        lines = []
-        lines.append(f"Broadcast ID (UTC): {b.get('broadcast_id')}")
-        lines.append(f"Created UTC: {b.get('created_utc')}")
-        lines.append(f"Sender: {b.get('sender')}")
-        lines.append(f"Target recipients (opted-in): {b.get('recipient_target_count')}")
-        lines.append(f"Delivered (successful): {b.get('delivered_count')}")
-        lines.append(f"Failures: {b.get('fail_count')} | Aborted: {b.get('aborted_due_to_failures')}")
-        lines.append(f"Message excerpt: {b.get('message_excerpt')}")
-        lines.append("")
-        if include_deliveries:
-            lines.append("Successful deliveries:")
-            deliveries = b.get("deliveries", []) or []
-            for d in deliveries:
-                lines.append(f"  - {d.get('username')} (ID: {d.get('user_id')}) @ {d.get('sent_utc')} UTC")
-        return "\n".join(lines)
 
     async def _send_report(self, interaction: discord.Interaction, title: str, body_text: str):
         if len(body_text) <= 3500:
-            emb = discord.Embed(
-                title=title,
-                description=body_text,
-                timestamp=utcnow(),
-            )
+            emb = discord.Embed(title=title, description=body_text, timestamp=utcnow())
             await interaction.response.send_message(embed=emb, ephemeral=True)
             return
 
@@ -1013,19 +1069,70 @@ class AlertSystemCog(commands.Cog):
         date_to: Optional[str] = None,
         include_opt_in_audit: Optional[bool] = True,
     ):
-        broadcasts = self.state.get("broadcasts", []) or []
+        if not interaction.guild:
+            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        gs = self._ensure_guild_state(guild)
+        broadcasts = gs.get("broadcasts", []) or []
+
+        def parse_yyyy_mm_dd(s: str) -> datetime.date:
+            try:
+                return datetime.date.fromisoformat(s)
+            except Exception:
+                raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-22).")
+
+        def format_opt_in_report_lines() -> List[str]:
+            recs = self.opt_in_records(guild)
+            lines = []
+            for uid, rec in recs.items():
+                lines.append(
+                    f"{rec.get('username_last_seen','unknown')} | ID={uid} | "
+                    f"current={rec.get('current')} | opted_in_at={rec.get('opted_in_at')} | opted_out_at={rec.get('opted_out_at')}"
+                )
+            lines.sort()
+            return lines
+
+        def iso_to_dt_local(s: Optional[str]) -> Optional[datetime.datetime]:
+            return iso_to_dt(s)
+
+        def filter_broadcasts_by_range(start_dt: datetime.datetime, end_dt: datetime.datetime) -> List[Dict[str, Any]]:
+            out = []
+            for b in broadcasts:
+                dt = iso_to_dt_local(b.get("created_utc"))
+                if not dt:
+                    continue
+                if start_dt <= dt <= end_dt:
+                    out.append(b)
+            return out
+
+        def build_broadcast_text(b: Dict[str, Any], include_deliveries: bool = True) -> str:
+            lines = []
+            lines.append(f"Broadcast ID (UTC): {b.get('broadcast_id')}")
+            lines.append(f"Created UTC: {b.get('created_utc')}")
+            lines.append(f"Sender: {b.get('sender')}")
+            lines.append(f"Target recipients (opted-in): {b.get('recipient_target_count')}")
+            lines.append(f"Delivered (successful): {b.get('delivered_count')}")
+            lines.append(f"Failures: {b.get('fail_count')} | Aborted: {b.get('aborted_due_to_failures')}")
+            lines.append(f"Message excerpt: {b.get('message_excerpt')}")
+            lines.append("")
+            if include_deliveries:
+                lines.append("Successful deliveries:")
+                deliveries = b.get("deliveries", []) or []
+                for d in deliveries:
+                    lines.append(f"  - {d.get('username')} (ID: {d.get('user_id')}) @ {d.get('sent_utc')} UTC")
+            return "\n".join(lines)
 
         if mode.value == "last_sent":
             if not broadcasts:
                 await interaction.response.send_message("No broadcasts have been sent yet.", ephemeral=True)
                 return
             b = broadcasts[-1]
-            text = self._build_broadcast_text(b, include_deliveries=True)
-
+            text = build_broadcast_text(b, include_deliveries=True)
             if include_opt_in_audit:
                 text += "\n\n---\nOpt-in audit (current + timestamps):\n"
-                text += "\n".join(self._format_opt_in_report_lines())
-
+                text += "\n".join(format_opt_in_report_lines())
             await self._send_report(interaction, "Alert Report — Last Sent", text)
             return
 
@@ -1045,7 +1152,7 @@ class AlertSystemCog(commands.Cog):
             await interaction.response.send_message(str(e), ephemeral=True)
             return
 
-        filtered = self._filter_broadcasts_by_range(start_dt, end_dt)
+        filtered = filter_broadcasts_by_range(start_dt, end_dt)
         if not filtered:
             await interaction.response.send_message("No broadcasts found in that timeframe.", ephemeral=True)
             return
@@ -1057,20 +1164,14 @@ class AlertSystemCog(commands.Cog):
         lines.append("")
 
         for b in filtered:
-            lines.append(self._build_broadcast_text(b, include_deliveries=True))
+            lines.append(build_broadcast_text(b, include_deliveries=True))
             lines.append("\n" + ("-" * 60) + "\n")
 
         if include_opt_in_audit:
             lines.append("Opt-in audit (current + timestamps):")
-            lines.extend(self._format_opt_in_report_lines())
+            lines.extend(format_opt_in_report_lines())
 
         await self._send_report(interaction, "Alert Report — Timeframe", "\n".join(lines))
-
-def parse_yyyy_mm_dd(s: str) -> datetime.date:
-    try:
-        return datetime.date.fromisoformat(s)
-    except Exception:
-        raise ValueError("Invalid date format. Use YYYY-MM-DD (e.g., 2025-12-22).")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AlertSystemCog(bot))
