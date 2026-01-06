@@ -7,12 +7,18 @@
 # - On bot ready: for every guild, ensure #wormhole-status exists and panels are posted/refreshed
 # - Persistent Views registered (so buttons keep working after restart)
 #
-# Updates in this version (per your request):
-# 1) Fix auto-danger parsing so it matches your killmail embed format (e.g., "System: J220215 ...", not only "**System:** ...")
-# 2) Every status change pings the "ARC Security" role
-# 3) Ensure only ONE bot "ping/tag" message exists in #wormhole-status at any time:
-#    - delete the previous ping message, then send the new one (so it pings again)
-# 4) Increase apparent size of status text by putting the status into the embed TITLE (largest embed text)
+# Updates in this version:
+# 1) Auto-danger parsing supports your observed killmail embed format ("System: J220215 ...")
+# 2) Every status change pings the "ARC Security" role while ensuring ONLY ONE bot ping message exists in the channel
+# 3) Increased apparent size of status text by putting status in embed TITLE
+# 4) Adds "status lights" beside statuses:
+#    - 🟢 Normal
+#    - 🟣 Lock-down
+#    - 🔴 all other statuses
+# 5) Buttons colors aligned:
+#    - Normal = green (success)
+#    - Lock-down = purple (Discord doesn't have purple button; using primary/blue as closest)
+#    - All others = red (danger)
 #
 import os
 import re
@@ -76,6 +82,35 @@ DM_CONCURRENCY = 1
 MAX_BROADCAST_HISTORY = 250
 
 # =====================
+# STATUS LIGHTS / STYLES
+# =====================
+
+GREEN_LIGHT = "🟢"
+PURPLE_LIGHT = "🟣"
+RED_LIGHT = "🔴"
+
+def status_light(value: str) -> str:
+    v = (value or "").strip().lower()
+    if v == "normal":
+        return GREEN_LIGHT
+    if v in {"lock-down", "lockdown"}:
+        return PURPLE_LIGHT
+    return RED_LIGHT
+
+def normalize_status(value: str) -> str:
+    # Keep canonical spelling consistent with your buttons/labels
+    v = (value or "").strip()
+    if v.lower() == "lockdown":
+        return "Lock-down"
+    return v
+
+def is_normal(value: str) -> bool:
+    return (value or "").strip().lower() == "normal"
+
+def is_lockdown(value: str) -> bool:
+    return (value or "").strip().lower() in {"lock-down", "lockdown"}
+
+# =====================
 # STORAGE HELPERS
 # =====================
 
@@ -89,14 +124,13 @@ def utcnow_iso() -> str:
 
 def _default_state() -> Dict[str, Any]:
     return {
-        "opt_in": {},  # user_id -> {current: bool, opted_in_at, opted_out_at, username_last_seen}
-        "broadcasts": [],  # list of broadcasts with delivery logs
+        "opt_in": {},
+        "broadcasts": [],
         "status": {"value": "Normal", "updated_utc": None, "updated_by": None},
-        # Track panel messages + the single "ping/tag" message used for status change announcements
         "panel_message_ids": {
             "alert": None,
             "status": None,
-            "status_ping": None,  # <-- only one tag message in channel
+            "status_ping": None,  # only one tag message in channel
             "channel_id": None,
             "guild_id": None,
         },
@@ -139,9 +173,7 @@ async def load_state() -> Dict[str, Any]:
         s.setdefault("panel_message_ids", _default_state()["panel_message_ids"])
         s.setdefault("auto_danger", _default_state()["auto_danger"])
 
-        # Ensure new key exists for older saved files
         s["panel_message_ids"].setdefault("status_ping", None)
-
         return s
 
 async def save_state(state: Dict[str, Any]) -> None:
@@ -246,6 +278,11 @@ class WormholeStatusView(View):
         super().__init__(timeout=None)
         self.cog = cog
 
+        # NOTE: Discord UI button colors are limited to: primary (blue), secondary (grey),
+        # success (green), danger (red). There is no true purple.
+        # We keep the "purple" concept via 🟣 in labels and embed lights, and use primary (blue)
+        # for Lock-down buttons as the closest supported style.
+
     async def _set(self, interaction: discord.Interaction, value: str):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
@@ -257,7 +294,8 @@ class WormholeStatusView(View):
             )
             return
 
-        # Every status change should ping ARC Security, with exactly one ping message existing.
+        value = normalize_status(value)
+
         await self.cog.update_status(
             guild=interaction.guild,
             value=value,
@@ -267,23 +305,23 @@ class WormholeStatusView(View):
         )
         await interaction.response.send_message(f"Wormhole status set to `{value}`.", ephemeral=True)
 
-    @discord.ui.button(label="Normal", style=discord.ButtonStyle.success, custom_id="wh_status:normal")
+    @discord.ui.button(label=f"{GREEN_LIGHT} Normal", style=discord.ButtonStyle.success, custom_id="wh_status:normal")
     async def normal(self, interaction: discord.Interaction, button: Button):
         await self._set(interaction, "Normal")
 
-    @discord.ui.button(label="Dangerous", style=discord.ButtonStyle.primary, custom_id="wh_status:dangerous")
+    @discord.ui.button(label=f"{RED_LIGHT} Dangerous", style=discord.ButtonStyle.danger, custom_id="wh_status:dangerous")
     async def dangerous(self, interaction: discord.Interaction, button: Button):
         await self._set(interaction, "Dangerous")
 
-    @discord.ui.button(label="Enemy Fleet Spotted", style=discord.ButtonStyle.danger, custom_id="wh_status:enemy")
+    @discord.ui.button(label=f"{RED_LIGHT} Enemy Fleet Spotted", style=discord.ButtonStyle.danger, custom_id="wh_status:enemy")
     async def enemy(self, interaction: discord.Interaction, button: Button):
         await self._set(interaction, "Enemy Fleet Spotted")
 
-    @discord.ui.button(label="Lock-down", style=discord.ButtonStyle.secondary, custom_id="wh_status:lockdown")
+    @discord.ui.button(label=f"{PURPLE_LIGHT} Lock-down", style=discord.ButtonStyle.primary, custom_id="wh_status:lockdown")
     async def lockdown(self, interaction: discord.Interaction, button: Button):
         await self._set(interaction, "Lock-down")
 
-    @discord.ui.button(label="Under attack", style=discord.ButtonStyle.danger, custom_id="wh_status:attack")
+    @discord.ui.button(label=f"{RED_LIGHT} Under attack", style=discord.ButtonStyle.danger, custom_id="wh_status:attack")
     async def attack(self, interaction: discord.Interaction, button: Button):
         await self._set(interaction, "Under attack")
 
@@ -296,7 +334,6 @@ class AlertSystemCog(commands.Cog):
         self.bot = bot
         self.state: Dict[str, Any] = _default_state()
 
-        # Persistent views so buttons work after restart
         self.bot.add_view(AlertPanelView(self))
         self.bot.add_view(WormholeStatusView(self))
 
@@ -334,10 +371,10 @@ class AlertSystemCog(commands.Cog):
         """
         Returns (system_name, tag, killmail_id) parsed from your killmail_feed embed.
 
-        Supports your observed formatting:
+        Supports observed formatting:
           Title: "LOSS — Killmail #132426586"
-          Description lines may include: "System: J220215 (WH, Sec: -0.99)"
-          Also supports previous bold format: "**System:** J220215 (Sec: ...)"
+          Description line: "System: J220215 (WH, Sec: -0.99)"
+          Also supports: "**System:** J220215 ..."
         """
         tag: Optional[str] = None
         kmid: Optional[int] = None
@@ -345,7 +382,6 @@ class AlertSystemCog(commands.Cog):
 
         title = (emb.title or "").strip()
 
-        # Title: "<TAG> — Killmail #<id>"
         m = re.match(r"^(KILL|LOSS|INVOLVEMENT|UNKNOWN)\s+—\s+Killmail\s+#(\d+)\s*$", title, re.IGNORECASE)
         if m:
             tag = m.group(1).upper()
@@ -354,23 +390,20 @@ class AlertSystemCog(commands.Cog):
             except Exception:
                 kmid = None
         else:
-            # fallback: try to find an id anywhere in title
             m2 = re.search(r"#(\d+)", title)
             if m2:
                 try:
                     kmid = int(m2.group(1))
                 except Exception:
                     kmid = None
-            # fallback tag if it appears at the start
             mtag = re.match(r"^(KILL|LOSS|INVOLVEMENT|UNKNOWN)\b", title, re.IGNORECASE)
             if mtag:
                 tag = mtag.group(1).upper()
 
-        # Prefer fields if present (some killmail cogs put System into fields)
+        # Prefer fields if present
         try:
             for f in (emb.fields or []):
                 if (f.name or "").strip().lower() == "system":
-                    # Field value might include extra data; take first token up to whitespace or '('
                     raw = (f.value or "").strip()
                     mfs = re.match(r"^([^\s(]+)", raw)
                     if mfs:
@@ -381,19 +414,16 @@ class AlertSystemCog(commands.Cog):
 
         desc = emb.description or ""
 
-        # Bold format: "**System:** <name> (Sec:"
         if not system_name:
             m3 = re.search(r"\*\*System:\*\*\s*([^\n]+?)(?:\s*\(|\s*$)", desc, re.IGNORECASE)
             if m3:
                 system_name = m3.group(1).strip()
 
-        # Plain format: "System: J220215 (WH, Sec: -0.99)"
         if not system_name:
             m4 = re.search(r"^System:\s*([^\s(]+)", desc, re.IGNORECASE | re.MULTILINE)
             if m4:
                 system_name = m4.group(1).strip()
 
-        # If tag wasn't in title, try in desc "Type: LOSS"
         if not tag:
             m5 = re.search(r"^Type:\s*(KILL|LOSS|INVOLVEMENT|UNKNOWN)\s*$", desc, re.IGNORECASE | re.MULTILINE)
             if m5:
@@ -403,7 +433,6 @@ class AlertSystemCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # Avoid loops / noise
         if not message.guild:
             return
         if not self.bot.user:
@@ -453,7 +482,6 @@ class AlertSystemCog(commands.Cog):
             self._danger_reset_task.cancel()
         self._danger_reset_task = asyncio.create_task(self._auto_revert_after_delay(reset_at))
 
-        # Set status + ping ARC Security (single ping message policy)
         await self.update_status(
             guild=guild,
             value=AUTO_DANGER_STATUS_VALUE,
@@ -487,7 +515,6 @@ class AlertSystemCog(commands.Cog):
             self.state["auto_danger"].update({"active": False, "reset_at_utc": None})
             await save_state(self.state)
 
-            # Revert status + ping ARC Security (single ping message policy)
             for g in self.bot.guilds:
                 try:
                     await self.update_status(
@@ -518,7 +545,6 @@ class AlertSystemCog(commands.Cog):
             self.state["auto_danger"]["active"] = False
             self.state["auto_danger"]["reset_at_utc"] = None
             await save_state(self.state)
-            # Timer expired during downtime -> revert status (and ping once)
             for g in self.bot.guilds:
                 try:
                     await self.update_status(
@@ -572,6 +598,7 @@ class AlertSystemCog(commands.Cog):
         await save_state(self.state)
 
     async def set_status_state_only(self, value: str, updated_by: str):
+        value = normalize_status(value)
         self.state["status"] = {"value": value, "updated_utc": utcnow_iso(), "updated_by": updated_by}
         await save_state(self.state)
 
@@ -618,7 +645,7 @@ class AlertSystemCog(commands.Cog):
 
     def build_status_embed(self) -> discord.Embed:
         st = self.state.get("status", {}) or {}
-        value = st.get("value", "Normal")
+        value = normalize_status(st.get("value", "Normal"))
         updated_utc = st.get("updated_utc") or "Never"
         updated_by = st.get("updated_by") or "N/A"
 
@@ -627,9 +654,10 @@ class AlertSystemCog(commands.Cog):
         if ad.get("active"):
             ad_line = f"\n**Auto-Revert (UTC):** `{ad.get('reset_at_utc') or 'Unknown'}`"
 
-        # Put status in TITLE for larger display than description
+        light = status_light(value)
+
         emb = discord.Embed(
-            title=f"Wormhole Status: {value}",
+            title=f"{light} Wormhole Status: {value}",
             description=(
                 f"**Last Updated (UTC):** `{updated_utc}`\n"
                 f"**Updated By:** `{updated_by}`\n"
@@ -678,7 +706,6 @@ class AlertSystemCog(commands.Cog):
             msg2 = await ch.send(embed=status_embed, view=WormholeStatusView(self))
             status_msg_id = msg2.id
 
-        # Keep existing status_ping id untouched here
         status_ping_id = panel_ids.get("status_ping")
 
         self.state["panel_message_ids"] = {
@@ -717,21 +744,13 @@ class AlertSystemCog(commands.Cog):
         context_note: Optional[str],
         ping_role: bool,
     ):
-        """
-        Enforces: only ONE bot 'tag/ping' message exists in #wormhole-status.
-
-        To ensure the role is actually pinged each time, we DELETE the previous ping message
-        and SEND a new one (editing does not re-ping reliably).
-        """
         ch = await self.ensure_channel(guild)
         panel_ids = self.state.get("panel_message_ids", {}) or {}
         old_ping_id = panel_ids.get("status_ping")
 
-        # Delete previous ping message if present
         if old_ping_id:
             try:
                 old_msg = await ch.fetch_message(int(old_ping_id))
-                # Only delete if it is ours
                 if self.bot.user and old_msg.author.id == self.bot.user.id:
                     await old_msg.delete()
             except Exception:
@@ -740,8 +759,11 @@ class AlertSystemCog(commands.Cog):
         role = discord.utils.get(guild.roles, name=ARC_SECURITY_ROLE)
         mention = role.mention if role else f"`{ARC_SECURITY_ROLE}`"
 
+        status_value = normalize_status(status_value)
+        light = status_light(status_value)
+
         emb = discord.Embed(
-            title=f"STATUS CHANGE: {status_value}",
+            title=f"{light} STATUS CHANGE: {status_value}",
             description=(
                 f"{mention if ping_role else ''}\n\n"
                 f"**New Status:** `{status_value}`\n"
@@ -754,8 +776,6 @@ class AlertSystemCog(commands.Cog):
         emb.set_footer(text="Cryonic Gaming bot — Status Notification")
 
         content = mention if (ping_role and role) else None
-
-        # Prevent accidental @everyone/@here, allow only the role mention if present
         allowed = discord.AllowedMentions(roles=[role] if role else [], everyone=False, users=False)
 
         new_msg = await ch.send(content=content, embed=emb, allowed_mentions=allowed)
@@ -775,27 +795,19 @@ class AlertSystemCog(commands.Cog):
         ping_role: bool = True,
         context_note: Optional[str] = None,
     ):
-        """
-        Single source of truth for status updates:
-        - save state
-        - refresh panels
-        - replace the single ping message (so ARC Security is pinged each time)
-        """
+        value = normalize_status(value)
         await self.set_status_state_only(value, updated_by)
 
-        # Ensure panels exist (automation resilience)
         try:
             await self.upsert_panels(guild)
         except Exception:
             pass
 
-        # Refresh status panel (keep buttons live + latest status)
         try:
             await self.refresh_status_panel(guild)
         except Exception:
             pass
 
-        # Send/replace the single ping message
         try:
             await self._replace_status_ping_message(
                 guild=guild,
@@ -997,8 +1009,8 @@ class AlertSystemCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         mode: app_commands.Choice[str],
-        date_from: Optional[str] = None,  # YYYY-MM-DD
-        date_to: Optional[str] = None,    # YYYY-MM-DD
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
         include_opt_in_audit: Optional[bool] = True,
     ):
         broadcasts = self.state.get("broadcasts", []) or []
