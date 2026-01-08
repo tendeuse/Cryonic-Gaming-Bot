@@ -1,12 +1,22 @@
 # cogs/video_submission.py
 #
-# Fixes included (copy/paste safe):
-# 1) Removes the unreachable/duplicated code at the bottom of _parse_service_account_json (it was never executed).
-# 2) Makes Approval buttons truly restart-safe and collision-free by using UNIQUE custom_ids per video:
-#       video:approve:<video_key> / video:reject:<video_key>
-#    (Your prior version used the same custom_id for every approval card, which causes persistent-view collisions.)
-# 3) Fixes VideoLengthReportModal date parsing: uses .value (your code used str(self.date_from) which is not the input).
-# 4) Disables the approval buttons correctly on the ORIGINAL message after decision.
+# Video Submission + Approval (Railway /data persistent, restart-safe)
+#
+# Unified with your other cogs:
+# - Uses Railway Volume persistence (/data) via PERSIST_ROOT (env override supported)
+# - Uses async file_lock + ATOMIC writes (tmp -> replace) to prevent JSON corruption
+# - Fixes Drive API 400: removes invalid field selection "mediaInfo"
+# - Approval buttons are restart-safe (unique custom_ids per video)
+# - Restores pending views on cog load
+# - Disables approval buttons on the ORIGINAL message after decision
+#
+# Notes:
+# - Requires YOUTUBE_API_KEY (kept as-is from your original behavior)
+# - Requires GOOGLE_SERVICE_ACCOUNT_JSON for Drive submissions (raw JSON or base64)
+#
+# Tested assumptions:
+# - discord.py 2.x
+# - Railway volume mounted at /data
 
 import os
 import json
@@ -26,22 +36,30 @@ from discord import app_commands
 from discord.ui import View
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
-print("VIDEO_SUBMISSION LOADED VERSION: 2026-01-01-VIDEO-FIX")
+print("VIDEO_SUBMISSION LOADED VERSION: 2026-01-07-UNIFIED-PERSIST-ATOMIC-DRIVEFIX")
 
-VIDEO_FILE = Path("data/video_submissions.json")
-AP_FILE = Path("data/ap_data.json")
-AUDIT_FILE = Path("data/video_audit_log.json")
-REPORT_STATE_FILE = Path("data/video_report_state.json")
+# =====================
+# PERSISTENCE (Railway Volume)
+# =====================
+PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
+VIDEO_FILE = PERSIST_ROOT / "video_submissions.json"
+AP_FILE = PERSIST_ROOT / "ap_data.json"
+AUDIT_FILE = PERSIST_ROOT / "video_audit_log.json"
+REPORT_STATE_FILE = PERSIST_ROOT / "video_report_state.json"
+
+# =====================
+# ENV / CONFIG
+# =====================
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 if not YOUTUBE_API_KEY:
     raise RuntimeError("YOUTUBE_API_KEY is not set in environment variables.")
 
-# Service account JSON from env (Railway Variables)
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 APPROVAL_CHANNEL = "video-submissions"
@@ -58,6 +76,7 @@ AP_DISTRIBUTION_LOG_CH = "member-join-logs-points-distribute"
 
 LOCAL_TZ = ZoneInfo("America/Moncton")
 
+# Single-process lock to serialize JSON read/write
 file_lock = asyncio.Lock()
 
 
@@ -81,21 +100,26 @@ async def safe_remove_cog(bot: commands.Bot, name: str) -> None:
 
 
 # =====================
-# UTILITIES
+# ATOMIC JSON IO
 # =====================
 
 def _load_file(p: Path):
     try:
         if not p.exists():
             return {}
-        return json.loads(p.read_text(encoding="utf-8"))
+        raw = p.read_text(encoding="utf-8").strip()
+        if not raw:
+            return {}
+        return json.loads(raw)
     except Exception:
         return {}
 
 
-def _save_file(p: Path, d):
+def _atomic_write_json(p: Path, d) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(d, indent=4), encoding="utf-8")
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(d, indent=4), encoding="utf-8")
+    tmp.replace(p)
 
 
 async def load(p: Path):
@@ -105,7 +129,7 @@ async def load(p: Path):
 
 async def save(p: Path, d):
     async with file_lock:
-        _save_file(p, d)
+        _atomic_write_json(p, d)
 
 
 def now_iso():
@@ -132,6 +156,10 @@ def iso_to_discord_ts(iso_str: str) -> str:
         return iso_str
 
 
+# =====================
+# PERMISSIONS / ROLES
+# =====================
+
 def is_manager(member: discord.Member) -> bool:
     return any(r.name in (CEO_ROLE, DIRECTOR_ROLE) for r in member.roles)
 
@@ -144,8 +172,13 @@ def corp_ceos(guild: discord.Guild):
     return [m for m in guild.members if any(r.name == CEO_ROLE for r in m.roles)]
 
 
+# =====================
+# URL PARSERS
+# =====================
+
 def yt_id(url: str):
-    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    # Supports watch?v=, youtu.be/, /shorts/, /embed/, /live/
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})", url)
     return m.group(1) if m else None
 
 
@@ -168,6 +201,10 @@ def fingerprint(platform: str, duration: float, title: str = ""):
     base = f"{platform}:{round(duration)}:{title.lower().strip()}"
     return hashlib.sha256(base.encode()).hexdigest()
 
+
+# =====================
+# DISCORD SAFETY HELPERS
+# =====================
 
 async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool):
     try:
@@ -197,20 +234,9 @@ async def ensure_text_channel(guild: discord.Guild, name: str) -> discord.TextCh
         return None
 
 
-def decision_embed(base: discord.Embed, *, approved: bool, decided_by: discord.Member, ts_iso: str) -> discord.Embed:
-    e = discord.Embed(title=base.title, description=base.description)
-    if base.footer and base.footer.text:
-        e.set_footer(text=base.footer.text)
-
-    for f in base.fields:
-        e.add_field(name=f.name, value=f.value, inline=f.inline)
-
-    status = "✅ Approved" if approved else "❌ Rejected"
-    e.add_field(name="Status", value=status, inline=True)
-    e.add_field(name="Decided By", value=decided_by.mention, inline=True)
-    e.add_field(name="Decided At", value=iso_to_discord_ts(ts_iso), inline=False)
-    return e
-
+# =====================
+# REPORT HELPERS
+# =====================
 
 def fmt_hms(total_seconds: float) -> str:
     s = int(round(total_seconds))
@@ -335,13 +361,16 @@ async def post_points_distribution_confirmation(
         pass
 
 
+# =====================
+# SERVICE ACCOUNT PARSER (robust)
+# =====================
+
 def _parse_service_account_json(raw: str) -> dict:
     """
     Accepts:
       - Raw JSON object text
-      - JSON with literal backslash escapes (e.g. '{\\n  "type": ... }')
-      - Double-encoded JSON (a JSON string that itself contains JSON)
       - JSON wrapped in quotes
+      - Double-encoded JSON
       - A file path to a JSON file
       - Base64-encoded JSON (whitespace/newlines allowed)
     """
@@ -410,29 +439,6 @@ def _parse_service_account_json(raw: str) -> dict:
     except Exception:
         pass
 
-    # 4) Handle literal backslash escapes (e.g. '{\\n  "type": ... }')
-    s_esc = s.replace("\\r\\n", "\\n").replace("\\n", "\n").replace("\\r", "\r")
-    j = _try_json(s_esc)
-    if isinstance(j, dict):
-        return j
-    if isinstance(j, str):
-        j2 = _try_json(j)
-        if isinstance(j2, dict):
-            return j2
-
-    # 5) One unicode-escape decode pass for double-escaped values
-    try:
-        s_uni = s.encode("utf-8").decode("unicode_escape")
-        j = _try_json(s_uni)
-        if isinstance(j, dict):
-            return j
-        if isinstance(j, str):
-            j2 = _try_json(j)
-            if isinstance(j2, dict):
-                return j2
-    except Exception:
-        pass
-
     snippet = s[:80].replace("\n", "\\n")
     raise RuntimeError(
         "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed. Provide raw JSON text, a JSON file path, or base64-encoded JSON. "
@@ -473,7 +479,6 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
             await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
             return
 
-        # FIX: use .value
         rng = date_str_to_local_range(str(self.date_from.value).strip(), str(self.date_to.value).strip())
         if not rng:
             await safe_send(interaction, "❌ Invalid dates. Use YYYY-MM-DD, and ensure To ≥ From.", ephemeral=True)
@@ -498,10 +503,34 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
 # APPROVAL VIEW (PERSISTENT + UNIQUE CUSTOM_IDS)
 # =====================
 
+def decision_embed(base: discord.Embed, *, approved: bool, decided_by: discord.Member, ts_iso: str) -> discord.Embed:
+    e = discord.Embed(title=base.title, description=base.description)
+    if base.footer and base.footer.text:
+        e.set_footer(text=base.footer.text)
+
+    for f in base.fields:
+        e.add_field(name=f.name, value=f.value, inline=f.inline)
+
+    status = "✅ Approved" if approved else "❌ Rejected"
+    e.add_field(name="Status", value=status, inline=True)
+    e.add_field(name="Decided By", value=decided_by.mention, inline=True)
+    e.add_field(name="Decided At", value=iso_to_discord_ts(ts_iso), inline=False)
+    return e
+
+
+def disable_view(view: View) -> View:
+    for item in view.children:
+        try:
+            item.disabled = True
+        except Exception:
+            pass
+    return view
+
+
 class ApprovalView(View):
     """
     Persistent approval view with UNIQUE custom_ids per video.
-    This prevents collisions across multiple pending approvals.
+    Prevents collisions across multiple pending approvals.
     """
     def __init__(self, cog: "VideoSubmissionCog", video_key: str):
         super().__init__(timeout=None)
@@ -533,15 +562,6 @@ class ApprovalView(View):
             await safe_send(interaction, "❌ Only the CEO and Directors can approve/reject videos.", ephemeral=True)
             return False
         return True
-
-
-def disable_view(view: View) -> View:
-    for item in view.children:
-        try:
-            item.disabled = True
-        except Exception:
-            pass
-    return view
 
 
 # =====================
@@ -585,6 +605,10 @@ class VideoSubmissionCog(commands.Cog):
                 except Exception:
                     pass
 
+    # --------
+    # Platform API lookups
+    # --------
+
     def youtube_data_blocking(self, vid: str):
         r = self.youtube.videos().list(part="contentDetails,snippet", id=vid).execute()
         if not r.get("items"):
@@ -596,13 +620,15 @@ class VideoSubmissionCog(commands.Cog):
 
     def drive_duration_blocking(self, fid: str):
         def fetch(file_id: str):
+            # FIX: removed invalid field selection "mediaInfo"
             return self.drive.files().get(
                 fileId=file_id,
-                fields="id,name,mimeType,size,videoMediaMetadata,mediaInfo,shortcutDetails"
+                fields="id,name,mimeType,size,videoMediaMetadata,shortcutDetails"
             ).execute()
 
         f = fetch(fid)
 
+        # Resolve shortcuts
         if f.get("mimeType") == "application/vnd.google-apps.shortcut":
             sd = f.get("shortcutDetails") or {}
             target_id = sd.get("targetId")
@@ -612,12 +638,8 @@ class VideoSubmissionCog(commands.Cog):
 
         title = str(f.get("name", "Untitled"))
         vmeta = f.get("videoMediaMetadata") or {}
-        minfo = f.get("mediaInfo") or {}
 
         ms = vmeta.get("durationMillis")
-        if ms is None:
-            ms = minfo.get("durationMillis")
-
         if ms is None:
             mime = f.get("mimeType")
             size = f.get("size")
@@ -749,6 +771,9 @@ class VideoSubmissionCog(commands.Cog):
                 seconds, title = await asyncio.to_thread(self.drive_duration_blocking, did)
                 platform = "drive"
                 key = did
+        except HttpError as e:
+            await safe_send(interaction, f"❌ Could not read video data. (HttpError: {e})", ephemeral=True)
+            return
         except Exception as e:
             await safe_send(interaction, f"❌ Could not read video data. ({type(e).__name__}: {e})", ephemeral=True)
             return
@@ -787,7 +812,18 @@ class VideoSubmissionCog(commands.Cog):
             embed.add_field(name="AP Reward", value=ap_reward, inline=True)
             embed.add_field(name="URL", value=url, inline=False)
 
-            await approval_ch.send(embed=embed, view=ApprovalView(self, str(key)))
+            try:
+                await approval_ch.send(embed=embed, view=ApprovalView(self, str(key)))
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        else:
+            # Avoid "silent approval black hole"
+            await safe_send(
+                interaction,
+                f"✅ Video submitted, but I could not find the approval channel `#{APPROVAL_CHANNEL}`. Please notify staff.",
+                ephemeral=True
+            )
+            return
 
         await safe_send(interaction, "✅ Video submitted for approval.", ephemeral=True)
 
@@ -816,7 +852,7 @@ class VideoSubmissionCog(commands.Cog):
             await safe_send(interaction, "⚠️ Already processed.", ephemeral=False)
             return
 
-        submitter_id = int(video["submitter"])
+        submitter_id = int(video.get("submitter", 0) or 0)
         submitter = interaction.guild.get_member(submitter_id)
 
         awarded_ap = 0
@@ -853,7 +889,7 @@ class VideoSubmissionCog(commands.Cog):
             )
 
         video["approved"] = bool(approve)
-        audits[video["fingerprint"]] = {
+        audits[str(video.get("fingerprint", ""))] = {
             "video_key": key,
             "approved": bool(approve),
             "ap": int(video.get("ap", 0)) if approve else 0,
@@ -869,7 +905,6 @@ class VideoSubmissionCog(commands.Cog):
             if interaction.message and interaction.message.embeds:
                 base = interaction.message.embeds[0]
                 updated = decision_embed(base, approved=bool(approve), decided_by=interaction.user, ts_iso=ts)
-
                 disabled = disable_view(ApprovalView(self, key))
                 await interaction.message.edit(embed=updated, view=disabled)
         except Exception:
