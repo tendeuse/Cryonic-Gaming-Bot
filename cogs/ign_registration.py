@@ -12,18 +12,12 @@ from typing import Dict, Any, List, Optional
 # CONFIG
 # =====================
 
-# Railway volume path:
-# - Default to /data (Railway Volume mount)
-# - Allow override via env var if you ever change mount point
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
 DATA_FILE = PERSIST_ROOT / "ign_registry.json"
 
-# Panel channel where members click Register
 REQUEST_PANEL_CHANNEL_NAME = "request-to-access-locations"
-
-# Staff processing channel where requests are posted
 ACCESS_CHANNEL_NAME = "location_access"
 
 ARC_SECURITY_ROLE = "ARC Security"
@@ -56,16 +50,13 @@ def load_state() -> Dict[str, Any]:
         s.setdefault("users", {})
         s.setdefault("requests", {})
         s.setdefault("leave_warnings", {})
-        s.setdefault("panels", {})  # per-guild panel message tracking
+        s.setdefault("panels", {})
         return s
     except Exception:
         return {"users": {}, "requests": {}, "leave_warnings": {}, "panels": {}}
 
 def save_state(state: Dict[str, Any]) -> None:
-    # Ensure volume directory exists
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    # Atomic write to reduce chance of corruption on restart/deploy
     tmp = DATA_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=4), encoding="utf-8")
     tmp.replace(DATA_FILE)
@@ -113,7 +104,6 @@ def require_roles():
 # =====================
 
 async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -> None:
-    """Ack quickly; prevents 10062 if event loop is busy."""
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=ephemeral)
@@ -127,7 +117,6 @@ async def safe_reply(
     embed: Optional[discord.Embed] = None,
     ephemeral: bool = True,
 ) -> None:
-    """Send a reply regardless of whether we already deferred/responded."""
     try:
         if interaction.response.is_done():
             await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
@@ -154,7 +143,6 @@ class RegisterIGNModal(Modal):
         self.add_item(self.igns)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Modal submission also needs fast ACK
         await safe_defer(interaction, ephemeral=True)
 
         raw = str(self.igns.value)
@@ -171,7 +159,6 @@ class RegisterIGNModal(Modal):
 # =====================
 
 class RegisterPanelView(View):
-    """Persistent panel shown in #request-to-access-locations with a Register button."""
     def __init__(self, cog: "IGNRegistrationCog"):
         super().__init__(timeout=None)
         self.cog = cog
@@ -182,7 +169,6 @@ class RegisterPanelView(View):
         custom_id="ign_panel:register",
     )
     async def open_register(self, interaction: discord.Interaction, button: Button):
-        # Must be immediate; no defer here (modal must be the initial response)
         try:
             if interaction.response.is_done():
                 await safe_reply(interaction, "Please click the button again.", ephemeral=True)
@@ -194,7 +180,6 @@ class RegisterPanelView(View):
             await safe_reply(interaction, "Failed to open the registration modal.", ephemeral=True)
 
 class AccessRequestView(View):
-    """Two-button staff workflow for access requests (Added / Revert)."""
     def __init__(self, cog: "IGNRegistrationCog"):
         super().__init__(timeout=None)
         self.cog = cog
@@ -216,7 +201,6 @@ class AccessRequestView(View):
         await self.cog.handle_access_button(interaction, action="revert")
 
 class LeaveWarningView(View):
-    """Single-button workflow for offboarding warnings (mark removed + purge data)."""
     def __init__(self, cog: "IGNRegistrationCog"):
         super().__init__(timeout=None)
         self.cog = cog
@@ -238,12 +222,10 @@ class IGNRegistrationCog(commands.Cog):
         self.bot = bot
         self.state = load_state()
 
-        # Register persistent views for restart-safe buttons
         self.bot.add_view(RegisterPanelView(self))
         self.bot.add_view(AccessRequestView(self))
         self.bot.add_view(LeaveWarningView(self))
 
-        # Prevent double-run on reconnects within same process
         self._panels_ensured_once: bool = False
 
     # -------------------------
@@ -319,10 +301,6 @@ class IGNRegistrationCog(commands.Cog):
         return panels.setdefault(str(guild_id), {"channel_id": None, "message_id": None, "updated_utc": utcnow_iso()})
 
     async def ensure_register_panel_message(self, guild: discord.Guild) -> None:
-        """
-        Ensures there is exactly one persistent panel message in #request-to-access-locations.
-        Stores message_id in state so we can edit/replace it if deleted.
-        """
         ch = await self.ensure_request_panel_channel(guild)
 
         rec = self.get_panel_record(guild.id)
@@ -334,7 +312,6 @@ class IGNRegistrationCog(commands.Cog):
         )
         embed.set_footer(text="Wormhole Access Registration")
 
-        # Try to reuse existing message if present
         msg_id = rec.get("message_id")
         if msg_id:
             try:
@@ -344,10 +321,8 @@ class IGNRegistrationCog(commands.Cog):
                 save_state(self.state)
                 return
             except Exception:
-                # message missing or cannot be fetched; fall through to recreate
                 pass
 
-        # Create a new panel message
         try:
             msg = await ch.send(embed=embed, view=RegisterPanelView(self))
             rec["message_id"] = msg.id
@@ -418,9 +393,16 @@ class IGNRegistrationCog(commands.Cog):
 
     def get_user_record(self, user_id: int) -> Dict[str, Any]:
         users = self.state.setdefault("users", {})
+        # last_request_* fields are used to delete the previous staff-request message on subsequent registrations
         return users.setdefault(
             str(user_id),
-            {"igns": [], "created_utc": utcnow_iso(), "updated_utc": utcnow_iso()},
+            {
+                "igns": [],
+                "created_utc": utcnow_iso(),
+                "updated_utc": utcnow_iso(),
+                "last_request_message_id": None,
+                "last_request_channel_id": None,
+            },
         )
 
     def add_user_igns(self, user_id: int, new_igns: List[str]) -> List[str]:
@@ -481,6 +463,11 @@ class IGNRegistrationCog(commands.Cog):
     def get_request(self, message_id: int) -> Optional[Dict[str, Any]]:
         return self.state.get("requests", {}).get(str(message_id))
 
+    def delete_request(self, message_id: int) -> None:
+        reqs = self.state.setdefault("requests", {})
+        reqs.pop(str(message_id), None)
+        save_state(self.state)
+
     def update_request_status(self, message_id: int, status: str, actor_id: int) -> None:
         req = self.get_request(message_id)
         if not req:
@@ -507,6 +494,41 @@ class IGNRegistrationCog(commands.Cog):
         lw["updated_utc"] = utcnow_iso()
         self.upsert_leave_warning(message_id, lw)
 
+    async def delete_previous_user_request_message(self, guild: discord.Guild, user_id: int) -> None:
+        """
+        If the user previously submitted a request, delete that old request message
+        so the channel doesn't get cluttered, then remove it from state["requests"].
+        """
+        rec = self.get_user_record(user_id)
+        old_ch_id = rec.get("last_request_channel_id")
+        old_msg_id = rec.get("last_request_message_id")
+
+        if not old_ch_id or not old_msg_id:
+            return
+
+        try:
+            ch = guild.get_channel(int(old_ch_id))
+            if ch is None:
+                ch = await guild.fetch_channel(int(old_ch_id))
+
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    msg = await ch.fetch_message(int(old_msg_id))
+                    await msg.delete()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Clean request record (even if deletion failed)
+        self.delete_request(int(old_msg_id))
+
+        # Clear pointers
+        rec["last_request_channel_id"] = None
+        rec["last_request_message_id"] = None
+        rec["updated_utc"] = utcnow_iso()
+        save_state(self.state)
+
     # -------------------------
     # Core handlers
     # -------------------------
@@ -516,10 +538,15 @@ class IGNRegistrationCog(commands.Cog):
             await safe_reply(interaction, "This must be used in a server.", ephemeral=True)
             return
 
+        # Merge IGNs into the user's list (keeps previously registered alts)
         merged = self.add_user_igns(interaction.user.id, igns)
+
+        # DELETE previous request message (if any) before creating the new consolidated one
+        await self.delete_previous_user_request_message(interaction.guild, interaction.user.id)
 
         ch = await self.ensure_access_channel(interaction.guild)
 
+        # Always create a fresh request message representing the latest full list
         temp_embed = self.build_request_embed(
             discord_user_id=interaction.user.id,
             discord_user_tag=str(interaction.user),
@@ -555,9 +582,16 @@ class IGNRegistrationCog(commands.Cog):
             },
         )
 
+        # Store this as the user's current/last request message so it can be deleted next time
+        urec = self.get_user_record(interaction.user.id)
+        urec["last_request_channel_id"] = ch.id
+        urec["last_request_message_id"] = msg.id
+        urec["updated_utc"] = utcnow_iso()
+        save_state(self.state)
+
         await safe_reply(
             interaction,
-            "IGN registration submitted. Staff will process it in #location_access.",
+            "IGN registration submitted/updated. Staff will process it in #location_access.",
             ephemeral=True,
         )
 
@@ -652,7 +686,6 @@ class IGNRegistrationCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # Ensure the panel exists once per process startup
         if self._panels_ensured_once:
             return
         self._panels_ensured_once = True
@@ -725,7 +758,6 @@ class IGNRegistrationCog(commands.Cog):
     @app_commands.command(name="unregister_ign", description="Remove a member's IGN(s) from their Discord link.")
     @require_roles()
     async def unregister_ign(self, interaction: discord.Interaction, member: discord.Member, ign: Optional[str] = None):
-        # ACK immediately (prevents 10062 under load)
         await safe_defer(interaction, ephemeral=True)
 
         users = self.state.get("users", {})
@@ -757,7 +789,6 @@ class IGNRegistrationCog(commands.Cog):
     @app_commands.command(name="list_ign", description="List the registered IGN(s) for a member.")
     @require_roles()
     async def list_ign(self, interaction: discord.Interaction, member: discord.Member):
-        # ACK immediately (prevents 10062 under load)
         await safe_defer(interaction, ephemeral=True)
 
         rec = self.state.get("users", {}).get(str(member.id))
