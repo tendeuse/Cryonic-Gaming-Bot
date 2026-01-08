@@ -20,6 +20,10 @@ PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
 DATA_FILE = PERSIST_ROOT / "ign_registry.json"
 
+# Panel channel where members click Register
+REQUEST_PANEL_CHANNEL_NAME = "request-to-access-locations"
+
+# Staff processing channel where requests are posted
 ACCESS_CHANNEL_NAME = "location_access"
 
 ARC_SECURITY_ROLE = "ARC Security"
@@ -34,6 +38,9 @@ ALLOWED_ROLES = {
 
 MAX_IGNS_PER_USER = 10
 
+PANEL_EMBED_TEXT = "Please register all the alts that you want to be provided with the Wormhole access"
+PANEL_BUTTON_LABEL = "Register"
+
 # =====================
 # STORAGE
 # =====================
@@ -43,15 +50,16 @@ def utcnow_iso() -> str:
 
 def load_state() -> Dict[str, Any]:
     if not DATA_FILE.exists():
-        return {"users": {}, "requests": {}, "leave_warnings": {}}
+        return {"users": {}, "requests": {}, "leave_warnings": {}, "panels": {}}
     try:
         s = json.loads(DATA_FILE.read_text(encoding="utf-8"))
         s.setdefault("users", {})
         s.setdefault("requests", {})
         s.setdefault("leave_warnings", {})
+        s.setdefault("panels", {})  # per-guild panel message tracking
         return s
     except Exception:
-        return {"users": {}, "requests": {}, "leave_warnings": {}}
+        return {"users": {}, "requests": {}, "leave_warnings": {}, "panels": {}}
 
 def save_state(state: Dict[str, Any]) -> None:
     # Ensure volume directory exists
@@ -162,6 +170,29 @@ class RegisterIGNModal(Modal):
 # UI: PERSISTENT VIEWS
 # =====================
 
+class RegisterPanelView(View):
+    """Persistent panel shown in #request-to-access-locations with a Register button."""
+    def __init__(self, cog: "IGNRegistrationCog"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label=PANEL_BUTTON_LABEL,
+        style=discord.ButtonStyle.primary,
+        custom_id="ign_panel:register",
+    )
+    async def open_register(self, interaction: discord.Interaction, button: Button):
+        # Must be immediate; no defer here (modal must be the initial response)
+        try:
+            if interaction.response.is_done():
+                await safe_reply(interaction, "Please click the button again.", ephemeral=True)
+                return
+            await interaction.response.send_modal(RegisterIGNModal(self.cog))
+        except discord.NotFound:
+            return
+        except Exception:
+            await safe_reply(interaction, "Failed to open the registration modal.", ephemeral=True)
+
 class AccessRequestView(View):
     """Two-button staff workflow for access requests (Added / Revert)."""
     def __init__(self, cog: "IGNRegistrationCog"):
@@ -208,12 +239,46 @@ class IGNRegistrationCog(commands.Cog):
         self.state = load_state()
 
         # Register persistent views for restart-safe buttons
+        self.bot.add_view(RegisterPanelView(self))
         self.bot.add_view(AccessRequestView(self))
         self.bot.add_view(LeaveWarningView(self))
+
+        # Prevent double-run on reconnects within same process
+        self._panels_ensured_once: bool = False
 
     # -------------------------
     # Channel ensure
     # -------------------------
+
+    async def ensure_request_panel_channel(self, guild: discord.Guild) -> discord.TextChannel:
+        ch = discord.utils.get(guild.text_channels, name=REQUEST_PANEL_CHANNEL_NAME)
+        if ch:
+            return ch
+
+        me = guild.me
+        if me is None and self.bot.user is not None:
+            me = guild.get_member(self.bot.user.id)
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                read_messages=True,
+                send_messages=False,
+                add_reactions=False,
+            )
+        }
+        if me is not None:
+            overwrites[me] = discord.PermissionOverwrite(
+                read_messages=True,
+                send_messages=True,
+                embed_links=True,
+                manage_messages=True,
+            )
+
+        return await guild.create_text_channel(
+            REQUEST_PANEL_CHANNEL_NAME,
+            overwrites=overwrites,
+            reason="Channel for location access request panel",
+        )
 
     async def ensure_access_channel(self, guild: discord.Guild) -> discord.TextChannel:
         ch = discord.utils.get(guild.text_channels, name=ACCESS_CHANNEL_NAME)
@@ -244,6 +309,52 @@ class IGNRegistrationCog(commands.Cog):
             overwrites=overwrites,
             reason="Channel for location access list requests",
         )
+
+    # -------------------------
+    # Panel management
+    # -------------------------
+
+    def get_panel_record(self, guild_id: int) -> Dict[str, Any]:
+        panels = self.state.setdefault("panels", {})
+        return panels.setdefault(str(guild_id), {"channel_id": None, "message_id": None, "updated_utc": utcnow_iso()})
+
+    async def ensure_register_panel_message(self, guild: discord.Guild) -> None:
+        """
+        Ensures there is exactly one persistent panel message in #request-to-access-locations.
+        Stores message_id in state so we can edit/replace it if deleted.
+        """
+        ch = await self.ensure_request_panel_channel(guild)
+
+        rec = self.get_panel_record(guild.id)
+        rec["channel_id"] = ch.id
+
+        embed = discord.Embed(
+            description=PANEL_EMBED_TEXT,
+            timestamp=datetime.datetime.utcnow(),
+        )
+        embed.set_footer(text="Wormhole Access Registration")
+
+        # Try to reuse existing message if present
+        msg_id = rec.get("message_id")
+        if msg_id:
+            try:
+                msg = await ch.fetch_message(int(msg_id))
+                await msg.edit(embed=embed, view=RegisterPanelView(self))
+                rec["updated_utc"] = utcnow_iso()
+                save_state(self.state)
+                return
+            except Exception:
+                # message missing or cannot be fetched; fall through to recreate
+                pass
+
+        # Create a new panel message
+        try:
+            msg = await ch.send(embed=embed, view=RegisterPanelView(self))
+            rec["message_id"] = msg.id
+            rec["updated_utc"] = utcnow_iso()
+            save_state(self.state)
+        except Exception:
+            pass
 
     # -------------------------
     # Embeds
@@ -402,7 +513,7 @@ class IGNRegistrationCog(commands.Cog):
 
     async def handle_register_submission(self, interaction: discord.Interaction, igns: List[str]):
         if not interaction.guild:
-            await safe_reply(interaction, "This command must be used in a server.", ephemeral=True)
+            await safe_reply(interaction, "This must be used in a server.", ephemeral=True)
             return
 
         merged = self.add_user_igns(interaction.user.id, igns)
@@ -540,6 +651,19 @@ class IGNRegistrationCog(commands.Cog):
     # -------------------------
 
     @commands.Cog.listener()
+    async def on_ready(self):
+        # Ensure the panel exists once per process startup
+        if self._panels_ensured_once:
+            return
+        self._panels_ensured_once = True
+
+        for guild in list(getattr(self.bot, "guilds", [])):
+            try:
+                await self.ensure_register_panel_message(guild)
+            except Exception:
+                pass
+
+    @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         if not had_role_name(member, ARC_SECURITY_ROLE):
             return
@@ -595,21 +719,8 @@ class IGNRegistrationCog(commands.Cog):
             pass
 
     # -------------------------
-    # Slash commands
+    # Slash commands (staff only)
     # -------------------------
-
-    @app_commands.command(name="register_ign", description="Register your in-game name(s) for access list processing.")
-    async def register_ign(self, interaction: discord.Interaction):
-        # Must be immediate; no defer here (modal must be the initial response)
-        try:
-            if interaction.response.is_done():
-                await safe_reply(interaction, "Please run the command again.", ephemeral=True)
-                return
-            await interaction.response.send_modal(RegisterIGNModal(self))
-        except discord.NotFound:
-            return
-        except Exception:
-            await safe_reply(interaction, "Failed to open the registration modal.", ephemeral=True)
 
     @app_commands.command(name="unregister_ign", description="Remove a member's IGN(s) from their Discord link.")
     @require_roles()
