@@ -6,12 +6,11 @@
 # 3) Message IDs are persisted to disk (shop_message_index.json) so the bot edits existing messages
 #    instead of deleting and reposting everything.
 #
-# Additional fix in THIS version:
-# - Prevents reposting on every redeploy by persisting all shop files to Railway volume (/data by default)
-#   and by rebuilding the index from existing messages if the index is missing/corrupt.
-#
-# Notes:
-# - Make sure your Railway volume is mounted to /data OR set env var PERSIST_ROOT to your mounted path.
+# Additional fixes in THIS version:
+# - Railway persistence on /data (PERSIST_ROOT) for ALL shop files.
+# - Index recovery from existing messages if index missing/corrupt.
+# - ATOMIC JSON writes (tmp -> replace) to avoid corruption on deploy/restart.
+# - Message edit throttling + dedupe to prevent Discord 429 PATCH storms.
 
 import os
 import discord
@@ -46,6 +45,23 @@ ALLOWED_ROLES = {"Shop Steward", "ARC Security Administration Council"}
 SHOP_LOCK = asyncio.Lock()
 
 # ----------------------------
+# Discord edit throttling (prevents 429 PATCH storms)
+# ----------------------------
+EDIT_MIN_INTERVAL_SECONDS = 1.2   # spacing between edits (safe default)
+EDIT_DEDUPE_WINDOW_SECONDS = 3.0  # skip identical payload edits within this window
+
+
+def _embed_hash(embed: discord.Embed | None) -> str:
+    if not embed:
+        return ""
+    try:
+        d = embed.to_dict()
+        return json.dumps(d, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return repr(embed)
+
+
+# ----------------------------
 # Interaction safety helpers
 # ----------------------------
 async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True) -> None:
@@ -54,6 +70,7 @@ async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True
             await interaction.response.defer(ephemeral=ephemeral)
     except Exception:
         pass
+
 
 async def safe_reply(
     interaction: discord.Interaction,
@@ -69,6 +86,7 @@ async def safe_reply(
     except Exception:
         pass
 
+
 async def safe_send_modal(interaction: discord.Interaction, modal: discord.ui.Modal) -> None:
     try:
         if interaction.response.is_done():
@@ -77,7 +95,6 @@ async def safe_send_modal(interaction: discord.Interaction, modal: discord.ui.Mo
             return
         await interaction.response.send_modal(modal)
     except (discord.InteractionResponded, discord.NotFound):
-        # Already responded / interaction expired
         return
     except Exception:
         try:
@@ -85,26 +102,39 @@ async def safe_send_modal(interaction: discord.Interaction, modal: discord.ui.Mo
         except Exception:
             pass
 
+
 # ----------------------------
-# JSON helpers
+# JSON helpers (ATOMIC WRITES)
 # ----------------------------
 def _load_json(path: Path, default):
     try:
         if not path.exists():
             return default
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return default
+        return json.loads(raw)
     except Exception:
         return default
 
+
 def _save_json(path: Path, data) -> None:
+    """
+    Atomic write to reduce chance of JSON corruption on restart/deploy.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    tmp.replace(path)
+
 
 def load_shop() -> dict:
     return _load_json(SHOP_FILE, {})
 
+
 def save_shop(data: dict) -> None:
     _save_json(SHOP_FILE, data)
+
 
 def ensure_shop_schema(data: dict) -> dict:
     if not isinstance(data, dict):
@@ -114,17 +144,22 @@ def ensure_shop_schema(data: dict) -> dict:
         data["items"] = {}
     return data
 
+
 def load_ap() -> dict:
     return _load_json(AP_FILE, {})
+
 
 def save_ap(data: dict) -> None:
     _save_json(AP_FILE, data)
 
+
 def load_orders() -> dict:
     return _load_json(ORDERS_FILE, {"orders": {}})
 
+
 def save_orders(data: dict) -> None:
     _save_json(ORDERS_FILE, data)
+
 
 def load_index() -> dict:
     """
@@ -140,16 +175,20 @@ def load_index() -> dict:
     """
     return _load_json(INDEX_FILE, {})
 
+
 def save_index(data: dict) -> None:
     _save_json(INDEX_FILE, data)
 
+
 def utc_iso() -> str:
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 def is_manager(member: discord.abc.User | discord.Member) -> bool:
     if not isinstance(member, discord.Member):
         return False
     return any(r.name in ALLOWED_ROLES for r in member.roles)
+
 
 # ----------------------------
 # Embed builders
@@ -170,6 +209,7 @@ def build_item_embed(item_id: str, item: dict) -> discord.Embed:
         embed.set_image(url=item["image"])
     embed.set_footer(text=f"Cryonic Gaming Shop | id:{item_id}")
     return embed
+
 
 def build_order_embed(order: dict) -> discord.Embed:
     status = order.get("status", "PENDING")
@@ -195,6 +235,7 @@ def build_order_embed(order: dict) -> discord.Embed:
 
     embed.set_footer(text="Shop Orders")
     return embed
+
 
 # ----------------------------
 # Index recovery (prevents repost storms)
@@ -257,6 +298,7 @@ async def rebuild_index_from_channels(guild: discord.Guild) -> None:
     idx[gkey] = gidx
     save_index(idx)
 
+
 # ----------------------------
 # Undelivered Reason Modal
 # ----------------------------
@@ -305,6 +347,7 @@ class UndeliveredReasonModal(discord.ui.Modal):
             await self.cog.refresh_order_message(interaction.guild, self.order_id)
         await safe_reply(interaction, "✅ Marked as UNDELIVERED.", ephemeral=True)
 
+
 # ----------------------------
 # Persistent Order Buttons
 # ----------------------------
@@ -348,6 +391,7 @@ class DeliveredButton(discord.ui.Button):
             await self.cog.refresh_order_message(interaction.guild, self.order_id)
         await safe_reply(interaction, "✅ Marked as DELIVERED.", ephemeral=True)
 
+
 class UndeliveredButton(discord.ui.Button):
     def __init__(self, cog: "ShopCog", order_id: str):
         super().__init__(
@@ -363,6 +407,7 @@ class UndeliveredButton(discord.ui.Button):
             await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
         await safe_send_modal(interaction, UndeliveredReasonModal(self.cog, self.order_id))
+
 
 class UndoButton(discord.ui.Button):
     def __init__(self, cog: "ShopCog", order_id: str):
@@ -403,12 +448,14 @@ class UndoButton(discord.ui.Button):
             await self.cog.refresh_order_message(interaction.guild, self.order_id)
         await safe_reply(interaction, "✅ Status reset to PENDING.", ephemeral=True)
 
+
 class OrderStatusView(discord.ui.View):
     def __init__(self, cog: "ShopCog", order_id: str):
         super().__init__(timeout=None)
         self.add_item(DeliveredButton(cog, order_id))
         self.add_item(UndeliveredButton(cog, order_id))
         self.add_item(UndoButton(cog, order_id))
+
 
 # ----------------------------
 # Buy modal (Quantity + IGN)
@@ -524,10 +571,11 @@ class BuyItemModal(discord.ui.Modal):
                 orders[order_id]["message_id"] = str(msg.id)
                 save_orders(orders_data)
 
-        # Update this item's embeds without purging
+        # Update this item's embeds without purging (throttled edits)
         await self.cog.update_item_messages(interaction.guild, self.item_id)
 
         await safe_reply(interaction, "✅ Order placed.", ephemeral=True)
+
 
 # ----------------------------
 # Stock / item management modals
@@ -575,6 +623,7 @@ class AdjustStockModal(discord.ui.Modal):
         if interaction.guild:
             await self.cog.update_item_messages(interaction.guild, self.item_id)
         await safe_reply(interaction, "✅ Stock updated.", ephemeral=True)
+
 
 class UpdateItemModal(discord.ui.Modal):
     def __init__(self, cog: "ShopCog", item_id: str, item: dict):
@@ -625,6 +674,7 @@ class UpdateItemModal(discord.ui.Modal):
             await self.cog.update_item_messages(interaction.guild, self.item_id)
         await safe_reply(interaction, "✅ Item updated.", ephemeral=True)
 
+
 class AddNewItemModal(discord.ui.Modal):
     def __init__(self, cog: "ShopCog"):
         super().__init__(title="Add New Item")
@@ -667,10 +717,10 @@ class AddNewItemModal(discord.ui.Modal):
             }
             save_shop(shop)
 
-        # Sync messages without purging
         if interaction.guild:
             await self.cog.sync_shop_messages(interaction.guild)
         await safe_reply(interaction, "✅ New item added.", ephemeral=True)
+
 
 # ----------------------------
 # Persistent Views (restart-safe)
@@ -689,6 +739,7 @@ class BuyView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return True
 
+
 class ManageView(discord.ui.View):
     def __init__(self, cog: "ShopCog", item_id: str):
         super().__init__(timeout=None)
@@ -701,6 +752,7 @@ class ManageView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return True
 
+
 class ShopManagementView(discord.ui.View):
     def __init__(self, cog: "ShopCog"):
         super().__init__(timeout=None)
@@ -709,6 +761,7 @@ class ShopManagementView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return True
+
 
 # ----------------------------
 # App command permission checks
@@ -719,6 +772,7 @@ def has_required_role():
             return False
         return is_manager(interaction.user)
     return app_commands.check(predicate)
+
 
 # ----------------------------
 # Cog
@@ -763,6 +817,61 @@ class ShopCog(commands.Cog):
             await self.sync_order_messages_best_effort(guild)
 
     # ----------------------------
+    # Lazy init edit throttle state (NO __init__ changes required)
+    # ----------------------------
+    def _ensure_edit_state(self) -> None:
+        if not hasattr(self, "_edit_lock"):
+            self._edit_lock = asyncio.Lock()
+        if not hasattr(self, "_last_edit_at"):
+            self._last_edit_at = {}
+        if not hasattr(self, "_last_payload_hash"):
+            self._last_payload_hash = {}
+
+    async def safe_edit_message(
+        self,
+        msg: discord.Message,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        view: discord.ui.View | None = None,
+    ) -> bool:
+        """
+        Throttles + dedupes message edits to avoid Discord 429 PATCH storms.
+        Works even if you cannot modify __init__ (state is created lazily).
+        """
+        try:
+            self._ensure_edit_state()
+
+            now = asyncio.get_running_loop().time()
+            msg_id = int(msg.id)
+
+            payload_hash = f"c:{content or ''}|e:{_embed_hash(embed)}|v:{type(view).__name__ if view else ''}"
+
+            last_hash = self._last_payload_hash.get(msg_id)
+            last_at = float(self._last_edit_at.get(msg_id, 0.0))
+            if last_hash == payload_hash and (now - last_at) < EDIT_DEDUPE_WINDOW_SECONDS:
+                return False
+
+            async with self._edit_lock:
+                now = asyncio.get_running_loop().time()
+                last_hash = self._last_payload_hash.get(msg_id)
+                last_at = float(self._last_edit_at.get(msg_id, 0.0))
+                if last_hash == payload_hash and (now - last_at) < EDIT_DEDUPE_WINDOW_SECONDS:
+                    return False
+
+                wait_for = (last_at + EDIT_MIN_INTERVAL_SECONDS) - now
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+
+                await msg.edit(content=content, embed=embed, view=view)
+
+                self._last_edit_at[msg_id] = asyncio.get_running_loop().time()
+                self._last_payload_hash[msg_id] = payload_hash
+                return True
+        except Exception:
+            return False
+
+    # ----------------------------
     # Persistent interaction router
     # ----------------------------
     @commands.Cog.listener()
@@ -780,7 +889,6 @@ class ShopCog(commands.Cog):
                 return
 
             parts = custom_id.split(":")
-            # shop:<action>[:<item_id>]
             if len(parts) < 2:
                 return
 
@@ -848,7 +956,6 @@ class ShopCog(commands.Cog):
                             idx[str(interaction.guild.id)] = gidx
                             save_index(idx)
 
-                    # Resync messages (edits existing, creates missing)
                     if interaction.guild:
                         await self.sync_shop_messages(interaction.guild)
 
@@ -856,7 +963,6 @@ class ShopCog(commands.Cog):
                     return
 
         except Exception:
-            # Never crash the bot on interaction routing
             return
 
     # ----------------------------
@@ -874,8 +980,6 @@ class ShopCog(commands.Cog):
         self._registered_order_views.add(order_id)
 
     async def sync_order_messages_best_effort(self, guild: discord.Guild):
-        # Order views are registered via bot.add_view(OrderStatusView(...))
-        # and will work for messages that already have those custom_ids.
         return
 
     # ----------------------------
@@ -931,13 +1035,9 @@ class ShopCog(commands.Cog):
                     pass
 
     # ----------------------------
-    # Shop message sync (NO PURGE)
+    # Shop message sync (NO PURGE) + THROTTLED EDITS
     # ----------------------------
     async def sync_shop_messages(self, guild: discord.Guild):
-        """
-        Ensures shop + access channels show current items without purging.
-        Edits existing messages when possible; creates missing ones; stores IDs in INDEX_FILE.
-        """
         shop_ch = discord.utils.get(guild.text_channels, name=SHOP_CHANNEL)
         access_ch = discord.utils.get(guild.text_channels, name=ACCESS_CHANNEL)
         if not shop_ch or not access_ch:
@@ -953,7 +1053,7 @@ class ShopCog(commands.Cog):
             gidx.setdefault("items", {})
             items_idx = gidx["items"]
 
-            # If mapping is empty, try to recover from existing messages before posting new ones
+            # Recover mapping if missing/empty
             if not isinstance(items_idx, dict) or not items_idx:
                 await rebuild_index_from_channels(guild)
                 idx = load_index()
@@ -969,7 +1069,6 @@ class ShopCog(commands.Cog):
                 embed = build_item_embed(item_id, item)
                 out_of_stock = int(item.get("stock", 0)) <= 0
 
-                # --- SHOP message ---
                 shop_msg_id = None
                 access_msg_id = None
                 if item_id in items_idx and isinstance(items_idx[item_id], dict):
@@ -987,7 +1086,11 @@ class ShopCog(commands.Cog):
                     shop_msg = await shop_ch.send(embed=embed, view=BuyView(self, item_id, disabled=out_of_stock))
                     shop_msg_id = shop_msg.id
                 else:
-                    await shop_msg.edit(embed=embed, view=BuyView(self, item_id, disabled=out_of_stock))
+                    await self.safe_edit_message(
+                        shop_msg,
+                        embed=embed,
+                        view=BuyView(self, item_id, disabled=out_of_stock),
+                    )
 
                 # access msg
                 access_msg = None
@@ -1000,11 +1103,15 @@ class ShopCog(commands.Cog):
                     access_msg = await access_ch.send(embed=embed, view=ManageView(self, item_id))
                     access_msg_id = access_msg.id
                 else:
-                    await access_msg.edit(embed=embed, view=ManageView(self, item_id))
+                    await self.safe_edit_message(
+                        access_msg,
+                        embed=embed,
+                        view=ManageView(self, item_id),
+                    )
 
                 items_idx[item_id] = {"shop_msg_id": int(shop_msg_id), "access_msg_id": int(access_msg_id)}
 
-            # Ensure the management message exists in access channel (single message)
+            # Ensure management message exists (single message)
             mgmt_id = gidx.get("management_msg_id")
             mgmt_msg = None
             if mgmt_id:
@@ -1017,7 +1124,11 @@ class ShopCog(commands.Cog):
                 mgmt_msg = await access_ch.send("**Shop Management**", view=ShopManagementView(self))
                 gidx["management_msg_id"] = mgmt_msg.id
             else:
-                await mgmt_msg.edit(content="**Shop Management**", view=ShopManagementView(self))
+                await self.safe_edit_message(
+                    mgmt_msg,
+                    content="**Shop Management**",
+                    view=ShopManagementView(self),
+                )
 
             # Persist index
             gidx["items"] = items_idx
@@ -1025,9 +1136,6 @@ class ShopCog(commands.Cog):
             save_index(idx)
 
     async def update_item_messages(self, guild: discord.Guild, item_id: str):
-        """
-        Updates one item’s shop/access messages. If missing or inconsistent, falls back to sync.
-        """
         shop = ensure_shop_schema(load_shop())
         items = shop["items"]
         if item_id not in items:
@@ -1051,14 +1159,14 @@ class ShopCog(commands.Cog):
 
         try:
             shop_msg = await shop_ch.fetch_message(int(entry["shop_msg_id"]))
-            await shop_msg.edit(embed=embed, view=BuyView(self, item_id, disabled=out_of_stock))
+            await self.safe_edit_message(shop_msg, embed=embed, view=BuyView(self, item_id, disabled=out_of_stock))
         except Exception:
             await self.sync_shop_messages(guild)
             return
 
         try:
             access_msg = await access_ch.fetch_message(int(entry["access_msg_id"]))
-            await access_msg.edit(embed=embed, view=ManageView(self, item_id))
+            await self.safe_edit_message(access_msg, embed=embed, view=ManageView(self, item_id))
         except Exception:
             await self.sync_shop_messages(guild)
             return
@@ -1079,7 +1187,7 @@ class ShopCog(commands.Cog):
             return
 
         self.register_order_view(order_id)
-        await msg.edit(embed=build_order_embed(o), view=OrderStatusView(self, order_id))
+        await self.safe_edit_message(msg, embed=build_order_embed(o), view=OrderStatusView(self, order_id))
 
     # ----------------------------
     # Slash Command
@@ -1102,6 +1210,7 @@ class ShopCog(commands.Cog):
             return
         await safe_reply(interaction, "❌ An error occurred.", ephemeral=True)
         raise error
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(ShopCog(bot))
