@@ -105,54 +105,12 @@ class Question:
 
 
 QUESTION_BANK: List[Question] = [
-    Question(
-        "Home System: What is the rule for combat sites in the Home System?",
-        [
-            "Combat sites are open to all members at any time.",
-            "Combat sites within the Home System are off-limits and reserved for our allied corporation (Spanish Corp).",
-            "Combat sites are allowed if you share loot with leadership.",
-            "Combat sites are allowed only after you pass the corp rules test.",
-        ],
-        1,
-    ),
-    Question(
-        "Lobbies & Wormhole Activity: If another member is actively running combat sites in the area, what must you NOT do?",
-        [
-            "Scan in that wormhole.",
-            "Dock up if you feel unsafe.",
-            "Ask leadership for clarification.",
-            "Run exploration in a different system.",
-        ],
-        0,
-    ),
-    Question(
-        "Lobbies & Wormhole Activity: If another member is actively running combat sites in the area, what is also prohibited?",
-        [
-            "Stealing kills or loot.",
-            "Using corp fits.",
-            "Warping to a safe spot.",
-            "Contracting items for buyback.",
-        ],
-        0,
-    ),
-    Question(
-        "Lobbies & Wormhole Activity: Who may impose additional restrictions when necessary?",
-        [
-            "Leadership.",
-            "Any member with the ⓒ symbol in their ship name.",
-            "Only the allied corporation.",
-            "Only the buyback officer.",
-        ],
-        0,
-    ),
+    # =========================
+    # Ship Identification
+    # =========================
     Question(
         "Ship Identification: What symbol must be included in your ship’s name?",
-        [
-            "ⓒ",
-            "★",
-            "ARC",
-            "#",
-        ],
+        ["ⓒ", "★", "ARC", "#"],
         0,
     ),
     Question(
@@ -161,12 +119,26 @@ QUESTION_BANK: List[Question] = [
             "Loss of buyback access.",
             "Being considered a free target for other corporation members.",
             "Immediate kick from the corporation.",
-            "No access to lobbies.",
+            "No access to wormholes.",
+        ],
+        1,
+    ),
+
+    # =========================
+    # Mandatory Ship Progression & Fits
+    # =========================
+    Question(
+        "Mandatory Ships: What are members required to do regarding the mandatory corporation ships?",
+        [
+            "Only train the skills; owning the ships is optional.",
+            "Skill into, own, and maintain the mandatory corporation ships listed for WH operations.",
+            "Borrow ships from directors as needed.",
+            "Only maintain ships if you run buyback contracts.",
         ],
         1,
     ),
     Question(
-        "Mandatory Ship Progression & Fits: Where can official fits be found?",
+        "Fits: Where can official fits be found?",
         [
             "Corporation Shared Fittings section.",
             "Pinned messages in local chat.",
@@ -176,15 +148,34 @@ QUESTION_BANK: List[Question] = [
         0,
     ),
     Question(
-        "Which ship is listed as a required Frigate?",
-        [
-            "ⓒ.BI.HERON",
-            "ⓒ.FO.RAVEN.PATROL",
-            "ⓒ.TD.OSPREY.BASIC",
-            "ⓒ.FO.DRAKE.D-A1.0",
-        ],
+        "Required Ships: Which ship is listed as a required Frigate?",
+        ["ⓒ.BI.HERON", "ⓒ.FO.RAVEN.PATROL", "ⓒ.TD.OSPREY.BASIC", "ⓒ.FO.DRAKE.D-A1.0"],
         0,
     ),
+    Question(
+        "Required Ships: Which ship is listed as a required Frigate (gas)?",
+        ["ⓒ.BI.VENTURE.GAS", "ⓒ.TD.OSPREY.BASIC", "ⓒ.FO.DRAKE.D-A1.0", "ⓒ.FO.RAVEN.PATROL"],
+        0,
+    ),
+    Question(
+        "Required Ships: Which ship is listed as a required Cruiser?",
+        ["ⓒ.TD.OSPREY.BASIC", "ⓒ.BI.HERON", "ⓒ.FO.RAVEN.PATROL", "ⓒ.BI.VENTURE.GAS"],
+        0,
+    ),
+    Question(
+        "Required Ships: Which ship is listed as a required Battlecruiser?",
+        ["ⓒ.FO.DRAKE.D-A1.0", "ⓒ.FO.RAVEN.PATROL", "ⓒ.TD.OSPREY.BASIC", "ⓒ.BI.HERON"],
+        0,
+    ),
+    Question(
+        "Required Ships: Which ship is listed as a required Battleship / Roller?",
+        ["ⓒ.FO.RAVEN.PATROL", "ⓒ.FO.DRAKE.D-A1.0", "ⓒ.TD.OSPREY.BASIC", "ⓒ.BI.VENTURE.GAS"],
+        0,
+    ),
+
+    # =========================
+    # Local Chat Conduct
+    # =========================
     Question(
         "Local Chat Conduct: When should you engage in local chat?",
         [
@@ -196,6 +187,34 @@ QUESTION_BANK: List[Question] = [
         0,
     ),
     Question(
+        "Local Chat Conduct: Which behavior is expected?",
+        [
+            "Avoid toxic behavior, arguments, or provocation.",
+            "Use local chat to bait fights and trash talk.",
+            "Spam local to draw attention away from allies.",
+            "Only leadership may speak in local, ever.",
+        ],
+        0,
+    ),
+
+    # =========================
+    # Conduct & Behavior
+    # =========================
+    Question(
+        "Conduct & Behavior: What is the core conduct rule?",
+        [
+            "Don’t be an ass; treat members and allies with respect.",
+            "Only directors must follow conduct rules.",
+            "Respect is optional if you are in a fleet.",
+            "It only applies in wormholes, not elsewhere.",
+        ],
+        0,
+    ),
+
+    # =========================
+    # Ideology and Personal Beliefs
+    # =========================
+    Question(
         "Ideology and Personal Beliefs: What must be left outside the game?",
         [
             "Personal ideologies and real-world politics.",
@@ -205,48 +224,37 @@ QUESTION_BANK: List[Question] = [
         ],
         0,
     ),
+
+    # =========================
+    # Buyback Program
+    # =========================
     Question(
         "Buyback: All buyback contracts should be made to who?",
-        [
-            "ARC Tendeuse A",
-            "Any director",
-            "The corporation CEO only",
-            "Spanish Corp",
-        ],
+        ["ARC Tendeuse A", "Any director", "The corporation CEO only", "Spanish Corp"],
         0,
     ),
     Question(
         "Buyback: What is the buyback rate?",
-        [
-            "80% of Jita Buy price.",
-            "100% of Jita Sell price.",
-            "60% of Jita Buy price.",
-            "90% of Jita Sell price.",
-        ],
+        ["80% of Jita Buy price.", "100% of Jita Sell price.", "60% of Jita Buy price.", "90% of Jita Sell price."],
         0,
     ),
     Question(
-        "Buyback: Which is NOT accepted?",
-        [
-            "Reprocessed materials",
-            "Blue Loot",
-            "Gas",
-            "Relic Site Loot",
-        ],
+        "Buyback: Which item is NOT accepted?",
+        ["Reprocessed materials", "Blue Loot", "Gas", "Relic Site Loot"],
         0,
     ),
     Question(
         "Buyback: What must you include in contract notes?",
-        [
-            "Your Discord name",
-            "Your real name",
-            "A screenshot of your wallet",
-            "Your account password",
-        ],
+        ["Your Discord name", "Your real name", "A screenshot of your wallet", "Your account password"],
         0,
     ),
     Question(
-        "Buyback: Ore pricing is calculated based on what?",
+        "Buyback: Contracts must be made in which station?",
+        ["AT1", "Jita 4-4", "Any station in system", "Any Upwell structure"],
+        0,
+    ),
+    Question(
+        "Buyback Pricing: Ore pricing is calculated based on what?",
         [
             "The compressed version of the ore (even if submitted uncompressed).",
             "The uncompressed version only.",
@@ -255,7 +263,198 @@ QUESTION_BANK: List[Question] = [
         ],
         0,
     ),
+    Question(
+        "Buyback: Which is an accepted buyback category?",
+        ["Planetary Interaction Products", "Reprocessed materials", "Ships and fittings", "PLEX"],
+        0,
+    ),
+    Question(
+        "Buyback: General rule of thumb for what is valid for buyback is:",
+        [
+            "If it comes from a wormhole, it’s probably valid for buyback.",
+            "Only ore is accepted.",
+            "Only blue loot is accepted.",
+            "Only items from nullsec are accepted.",
+        ],
+        0,
+    ),
+
+    # =========================
+    # Bookmarking & Site Management Protocol
+    # =========================
+    Question(
+        "Bookmarking: Where must all sites and wormholes be saved?",
+        [
+            "ARC Security Shared Folder.",
+            "Personal bookmarks only.",
+            "Only in the Corp CEO folder.",
+            "In local chat for visibility.",
+        ],
+        0,
+    ),
+    Question(
+        "Bookmarking: Where should you refer for bookmark naming/creation guidance?",
+        [
+            "See #scanning-rules when creating bookmarks.",
+            "Ask in local chat every time.",
+            "Use any naming scheme you prefer.",
+            "Only directors may create bookmarks.",
+        ],
+        0,
+    ),
+    Question(
+        "Bookmarking: Which folder is used for Combat Site Warp-In Points?",
+        ["Sites Folder", "Wormhole Folder", "Safes Folder", "Gas Folder"],
+        0,
+    ),
+    Question(
+        "Bookmarking: Which folder is used for Safe Spots?",
+        ["Safes Folder", "OPS Folder", "Rocks Folder", "Data/Relic Folder"],
+        0,
+    ),
+    Question(
+        "Bookmarking: Which folder is used for MTU locations and Salvage/Loot spots?",
+        ["Salvage Folder", "Gas Folder", "Wormhole Folder", "+POS Folder"],
+        0,
+    ),
+
+    # =========================
+    # AFK Operations Policy (WH)
+    # =========================
+    Question(
+        "AFK Operations (WH): What is the policy regarding AFK activity in wormhole space?",
+        [
+            "AFK activity is allowed if you are cloaked.",
+            "All AFK activity in wormhole space is prohibited (including mining, gas huffing, scanning, or any unattended operation).",
+            "AFK activity is allowed only for scanning.",
+            "AFK activity is allowed if you are on comms.",
+        ],
+        1,
+    ),
+    Question(
+        "AFK Operations (WH): What may happen if you are found AFK in wormhole space?",
+        [
+            "You may be engaged and destroyed by authorized ARC Security leadership and returned to Jita at your own expense.",
+            "You will be awarded bonus AP for being present.",
+            "You will only receive a verbal reminder with no enforcement.",
+            "You will be moved to a different Discord channel.",
+        ],
+        0,
+    ),
+    Question(
+        "AFK Operations (WH): Who is authorized to enforce the AFK Operations policy?",
+        ["Officers and above", "Only Newbros", "Only the buyback officer", "Allies only"],
+        0,
+    ),
+    Question(
+        "AFK Operations (WH): How may compliance be verified?",
+        [
+            "Through random ship name changes to ensure active D-scan monitoring.",
+            "By checking your wallet history.",
+            "By reviewing your contracts.",
+            "By requiring screenshots every 10 minutes.",
+        ],
+        0,
+    ),
+
+    # =========================
+    # Logistics Policy – LS/NS Hauling Prohibition
+    # =========================
+    Question(
+        "Logistics (LS/NS): What is the policy on hauling in Lowsec (LS) and Nullsec (NS)?",
+        [
+            "Allowed anytime as long as you fly tanky ships.",
+            "Prohibited unless approved in advance by an Officer or above (leadership team).",
+            "Allowed only on weekends.",
+            "Allowed if you announce it in Discord.",
+        ],
+        1,
+    ),
+    Question(
+        "Logistics (LS/NS): Unauthorized LS/NS hauling may result in:",
+        [
+            "Wormhole location access being revoked and formal disciplinary action.",
+            "Immediate promotion to Officer.",
+            "Free replacement ships from corp stock.",
+            "No consequences if you survive.",
+        ],
+        0,
+    ),
+    Question(
+        "Logistics (LS/NS): Who is responsible for enforcing the LS/NS hauling policy?",
+        ["Officers and above", "Only Newbros", "Only logistics alts", "Anyone in local chat"],
+        0,
+    ),
+
+    # =========================
+    # Wormhole Voice Comms Requirement
+    # =========================
+    Question(
+        "Voice Comms (WH): What is required when conducting any activity in wormhole space?",
+        [
+            "Be present in the designated Voice Comms (VC). Speaking is not required.",
+            "Only type in text chat every 5 minutes.",
+            "Stream your gameplay at all times.",
+            "Be on VC only when mining.",
+        ],
+        0,
+    ),
+    Question(
+        "Voice Comms (WH): Why is VC presence mandatory?",
+        [
+            "To enable immediate threat notification and response.",
+            "To increase buyback rates.",
+            "To allow access to corp fittings.",
+            "To qualify for ship reimbursement.",
+        ],
+        0,
+    ),
+    Question(
+        "Voice Comms (WH): Failure to comply may result in:",
+        [
+            "Disciplinary action and/or revocation of wormhole access, enforced by Officers and above.",
+            "Automatic ISK fines only.",
+            "A permanent ban from buyback.",
+            "No impact if you are scanning.",
+        ],
+        0,
+    ),
+
+    # =========================
+    # Alt Account Policy
+    # =========================
+    Question(
+        "Alt Policy: What is required at the beginning of all ARC alt character names?",
+        [
+            "The ARC tag (e.g., ARC Solothon).",
+            "The ⓒ symbol only.",
+            "A random number.",
+            "The director’s initials.",
+        ],
+        0,
+    ),
+    Question(
+        "Alt Policy: Alt names must correspond to what for identification?",
+        [
+            "Your Discord username and/or main character name.",
+            "Your real-life name.",
+            "Your corporation wallet balance.",
+            "Your ship hull type.",
+        ],
+        0,
+    ),
+    Question(
+        "Alt Policy: What is the exception regarding ARC tagging?",
+        [
+            "Your main character may be the only non-ARC-tagged character.",
+            "All characters must be ARC-tagged with no exceptions.",
+            "Only industry alts can skip the ARC tag.",
+            "Only directors can have non-ARC-tagged characters.",
+        ],
+        0,
+    ),
 ]
+
 
 # =====================
 # Paged Quiz View (DM)
