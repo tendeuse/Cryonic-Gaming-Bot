@@ -1,153 +1,147 @@
-# cogs/new_member_roles.py
-# discord.py 2.x
-# Handles:
-# 1) Auto-assign "New Member" role 1 hour after join
-# 2) On manual removal of "New Member", if member has "ARC Security",
-#    grant "Scheduling" and "Onboarding"
-# 3) Commands for "ARC Genesis" to remove Scheduling / Onboarding from others
-# 4) Persistent state via /data volume (Railway-compatible)
-
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 import asyncio
-import json
+import sqlite3
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
-PERSIST_ROOT = os.getenv("PERSIST_ROOT", "/data")
-STATE_FILE = os.path.join(PERSIST_ROOT, "new_member_state.json")
-
+DB_PATH = "/data/auto_roles.db"
 NEW_MEMBER_ROLE = "New Member"
 SECURITY_ROLE = "ARC Security"
 SCHEDULING_ROLE = "Scheduling"
 ONBOARDING_ROLE = "Onboarding"
 GENESIS_ROLE = "ARC Genesis"
-
 DELAY_SECONDS = 3600  # 1 hour
 
 
-def utcnow():
-    return datetime.now(timezone.utc)
+def init_db():
+    os.makedirs("/data", exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_members (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                join_time TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        conn.commit()
 
 
-class NewMemberRoles(commands.Cog):
+class AutoRoles(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.state = {"pending": {}}  # guild_id -> user_id -> timestamp
-        self._load_state()
-        self.role_task.start()
+        init_db()
+        self.check_pending.start()
 
     def cog_unload(self):
-        self.role_task.cancel()
-        self._save_state()
+        self.check_pending.cancel()
 
-    # ---------------- Persistence ----------------
-    def _load_state(self):
-        if not os.path.exists(PERSIST_ROOT):
-            os.makedirs(PERSIST_ROOT, exist_ok=True)
-        if os.path.isfile(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    self.state = json.load(f)
-            except Exception:
-                self.state = {"pending": {}}
-
-    def _save_state(self):
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.state, f)
-
-    # ---------------- Helpers ----------------
-    def _get_role(self, guild: discord.Guild, name: str):
-        return discord.utils.get(guild.roles, name=name)
-
-    def _member_has_role(self, member: discord.Member, role_name: str) -> bool:
-        return any(r.name == role_name for r in member.roles)
-
-    # ---------------- Events ----------------
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
-        guild_id = str(member.guild.id)
-        user_id = str(member.id)
-        self.state.setdefault("pending", {}).setdefault(guild_id, {})[user_id] = utcnow().isoformat()
-        self._save_state()
+        join_time = datetime.utcnow().isoformat()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO pending_members VALUES (?, ?, ?)",
+                (member.guild.id, member.id, join_time),
+            )
+            conn.commit()
 
-    @commands.Cog.listener()
-    async def on_member_update(self, before: discord.Member, after: discord.Member):
-        # Detect manual removal of New Member role
-        before_roles = {r.name for r in before.roles}
-        after_roles = {r.name for r in after.roles}
+    @tasks.loop(minutes=1)
+    async def check_pending(self):
+        await self.bot.wait_until_ready()
+        now = datetime.utcnow()
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute("SELECT guild_id, user_id, join_time FROM pending_members").fetchall()
 
-        if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
-            # Role was removed
-            if SECURITY_ROLE in before_roles:
-                sched = self._get_role(after.guild, SCHEDULING_ROLE)
-                onboard = self._get_role(after.guild, ONBOARDING_ROLE)
-                to_add = [r for r in (sched, onboard) if r and r not in after.roles]
-                if to_add:
-                    await after.add_roles(*to_add, reason="ARC Security -> onboarding flow")
-
-    # ---------------- Background Task ----------------
-    @tasks.loop(seconds=60)
-    async def role_task(self):
-        now = utcnow()
-        changed = False
-
-        for guild_id, users in list(self.state.get("pending", {}).items()):
-            guild = self.bot.get_guild(int(guild_id))
+        for guild_id, user_id, join_time in rows:
+            guild = self.bot.get_guild(guild_id)
             if not guild:
                 continue
 
-            role = self._get_role(guild, NEW_MEMBER_ROLE)
-            if not role:
+            member = guild.get_member(user_id)
+            if not member:
+                self._delete_entry(guild_id, user_id)
                 continue
 
-            for user_id, ts in list(users.items()):
-                joined_at = datetime.fromisoformat(ts)
-                if now - joined_at >= timedelta(seconds=DELAY_SECONDS):
-                    member = guild.get_member(int(user_id))
-                    if member and not self._member_has_role(member, NEW_MEMBER_ROLE):
-                        try:
-                            await member.add_roles(role, reason="Automatic New Member assignment")
-                        except discord.Forbidden:
-                            pass
-                    users.pop(user_id, None)
-                    changed = True
+            jt = datetime.fromisoformat(join_time)
+            if (now - jt).total_seconds() >= DELAY_SECONDS:
+                role = discord.utils.get(guild.roles, name=NEW_MEMBER_ROLE)
+                if role and role not in member.roles:
+                    try:
+                        await member.add_roles(role, reason="Auto New Member role after 1h")
+                    except discord.Forbidden:
+                        pass
+                self._delete_entry(guild_id, user_id)
 
-        if changed:
-            self._save_state()
+    def _delete_entry(self, guild_id: int, user_id: int):
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "DELETE FROM pending_members WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            conn.commit()
 
-    @role_task.before_loop
-    async def before_role_task(self):
-        await self.bot.wait_until_ready()
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        before_roles = {r.id for r in before.roles}
+        after_roles = {r.id for r in after.roles}
 
-    # ---------------- Commands ----------------
-    def _genesis_check(self, member: discord.Member) -> bool:
-        return self._member_has_role(member, GENESIS_ROLE)
+        removed = before_roles - after_roles
+        if not removed:
+            return
 
-    @commands.command(name="remove_scheduling")
-    async def remove_scheduling(self, ctx: commands.Context, member: discord.Member):
-        if not self._genesis_check(ctx.author):
-            return await ctx.send("You do not have permission to use this command.")
+        security_role = discord.utils.get(before.guild.roles, name=SECURITY_ROLE)
+        if not security_role or security_role.id not in before_roles:
+            return
 
-        role = self._get_role(ctx.guild, SCHEDULING_ROLE)
+        scheduling = discord.utils.get(before.guild.roles, name=SCHEDULING_ROLE)
+        onboarding = discord.utils.get(before.guild.roles, name=ONBOARDING_ROLE)
+
+        roles_to_add = []
+        if scheduling:
+            roles_to_add.append(scheduling)
+        if onboarding:
+            roles_to_add.append(onboarding)
+
+        if roles_to_add:
+            try:
+                await after.add_roles(*roles_to_add, reason="ARC Security role removal follow-up")
+            except discord.Forbidden:
+                pass
+
+    def _has_genesis(self, member: discord.Member) -> bool:
+        return any(r.name == GENESIS_ROLE for r in member.roles)
+
+    @app_commands.command(name="remove_scheduling", description="Remove Scheduling role from a member")
+    async def remove_scheduling(self, interaction: discord.Interaction, member: discord.Member):
+        if not self._has_genesis(interaction.user):
+            await interaction.response.send_message("Insufficient permissions.", ephemeral=True)
+            return
+
+        role = discord.utils.get(interaction.guild.roles, name=SCHEDULING_ROLE)
         if role and role in member.roles:
-            await member.remove_roles(role, reason="ARC Genesis command")
-            await ctx.send(f"Scheduling role removed from {member.mention}.")
+            await member.remove_roles(role, reason="Removed via slash command")
+            await interaction.response.send_message("Scheduling role removed.", ephemeral=True)
         else:
-            await ctx.send("Member does not have the Scheduling role.")
+            await interaction.response.send_message("Member does not have Scheduling role.", ephemeral=True)
 
-    @commands.command(name="remove_onboarding")
-    async def remove_onboarding(self, ctx: commands.Context, member: discord.Member):
-        if not self._genesis_check(ctx.author):
-            return await ctx.send("You do not have permission to use this command.")
+    @app_commands.command(name="remove_onboarding", description="Remove Onboarding role from a member")
+    async def remove_onboarding(self, interaction: discord.Interaction, member: discord.Member):
+        if not self._has_genesis(interaction.user):
+            await interaction.response.send_message("Insufficient permissions.", ephemeral=True)
+            return
 
-        role = self._get_role(ctx.guild, ONBOARDING_ROLE)
+        role = discord.utils.get(interaction.guild.roles, name=ONBOARDING_ROLE)
         if role and role in member.roles:
-            await member.remove_roles(role, reason="ARC Genesis command")
-            await ctx.send(f"Onboarding role removed from {member.mention}.")
+            await member.remove_roles(role, reason="Removed via slash command")
+            await interaction.response.send_message("Onboarding role removed.", ephemeral=True)
         else:
-            await ctx.send("Member does not have the Onboarding role.")
+            await interaction.response.send_message("Member does not have Onboarding role.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(NewMemberRoles(bot))
+    await bot.add_cog(AutoRoles(bot))
