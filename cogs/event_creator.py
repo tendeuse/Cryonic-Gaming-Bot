@@ -36,9 +36,9 @@ def save_data(data):
         json.dump(data, f, indent=2)
 
 
-# -------------------- MODAL --------------------
+# -------------------- CREATE EVENT MODAL --------------------
 
-class EventModal(discord.ui.Modal, title="Create Event"):
+class CreateEventModal(discord.ui.Modal, title="Create Event"):
     name = discord.ui.TextInput(label="Event Name", max_length=100)
 
     description = discord.ui.TextInput(
@@ -76,7 +76,7 @@ class EventModal(discord.ui.Modal, title="Create Event"):
             ).replace(tzinfo=timezone.utc)
         except ValueError:
             await interaction.response.send_message(
-                "Invalid date format. Use `YYYY-MM-DD HH:MM` (UTC).",
+                "Invalid date format. Use YYYY-MM-DD HH:MM (UTC).",
                 ephemeral=True
             )
             return
@@ -135,7 +135,64 @@ class EventModal(discord.ui.Modal, title="Create Event"):
         )
 
 
-# -------------------- VIEW --------------------
+# -------------------- EDIT EVENT MODAL --------------------
+
+class EditEventModal(discord.ui.Modal, title="Edit Event"):
+    description = discord.ui.TextInput(
+        label="New Description",
+        style=discord.TextStyle.paragraph,
+        max_length=1000
+    )
+
+    datetime_utc = discord.ui.TextInput(
+        label="New Date & Time (UTC)",
+        placeholder="YYYY-MM-DD HH:MM"
+    )
+
+    def __init__(self, event_id):
+        super().__init__()
+        self.event_id = event_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = load_data()
+        event = data[self.event_id]
+
+        try:
+            event_dt = datetime.strptime(
+                self.datetime_utc.value.strip(),
+                "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid date format.",
+                ephemeral=True
+            )
+            return
+
+        event["timestamp"] = int(event_dt.timestamp())
+
+        channel = interaction.guild.get_channel(event["channel"])
+        msg = await channel.fetch_message(event["message"])
+        embed = msg.embeds[0]
+
+        embed.description = self.description.value
+        embed.set_field_at(
+            0,
+            name="🕒 Time",
+            value=f"<t:{event['timestamp']}:F>\n<t:{event['timestamp']}:R>",
+            inline=False
+        )
+
+        await msg.edit(embed=embed)
+        save_data(data)
+
+        await interaction.response.send_message(
+            "Event updated.",
+            ephemeral=True
+        )
+
+
+# -------------------- EVENT VIEW --------------------
 
 class EventView(discord.ui.View):
     def __init__(self, event_id, buttons, redirect_url):
@@ -153,6 +210,8 @@ class EventView(discord.ui.View):
                     style=discord.ButtonStyle.link
                 )
             )
+
+        self.add_item(ManageEventButton())
 
 
 class RSVPButton(discord.ui.Button):
@@ -186,6 +245,32 @@ class RSVPButton(discord.ui.Button):
         )
 
 
+class ManageEventButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="⚙ Manage Event",
+            style=discord.ButtonStyle.secondary
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        data = load_data()
+        event = data[self.view.event_id]
+
+        if (
+            interaction.user.id != event["creator"]
+            and not interaction.user.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You are not authorized to manage this event.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(
+            EditEventModal(self.view.event_id)
+        )
+
+
 # -------------------- COG --------------------
 
 class EventCreator(commands.Cog):
@@ -205,7 +290,7 @@ class EventCreator(commands.Cog):
             return
 
         await interaction.response.send_modal(
-            EventModal(interaction.user.id)
+            CreateEventModal(interaction.user.id)
         )
 
 
