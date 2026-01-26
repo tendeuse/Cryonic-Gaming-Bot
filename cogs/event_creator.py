@@ -9,6 +9,7 @@ import uuid
 DATA_PATH = "/data/events.json"
 ANNOUNCEMENT_CHANNEL = "eve-announcements-as"
 TEMP_ROLE_NAME = "Event Participant"
+SECURITY_PING_ROLE = "ARC Security"
 
 CREATOR_ROLES = {
     "ARC Officer",
@@ -114,6 +115,22 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
             name=ANNOUNCEMENT_CHANNEL
         )
 
+        if not channel:
+            await interaction.response.send_message(
+                "Announcement channel not found.",
+                ephemeral=True
+            )
+            return
+
+        # 🔔 ARC Security Ping (ONCE)
+        security_role = discord.utils.get(
+            interaction.guild.roles,
+            name=SECURITY_PING_ROLE
+        )
+
+        if security_role:
+            await channel.send(security_role.mention)
+
         view = EventView(event_id, selected_buttons, self.redirect_url.value.strip())
         msg = await channel.send(embed=embed, view=view)
 
@@ -130,7 +147,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         save_data(data)
 
         await interaction.response.send_message(
-            "Event created successfully.",
+            "Event created successfully and ARC Security has been notified.",
             ephemeral=True
         )
 
