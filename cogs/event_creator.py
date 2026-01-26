@@ -1,7 +1,7 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import json
 import os
 import uuid
@@ -18,8 +18,8 @@ CREATOR_ROLES = {
     "ARC Security Corporation Leader"
 }
 
-RSVP_TYPES = ["Accept", "Damage", "Logi", "Salvager", "Tentative", "Decline"]
-ROLE_ASSIGN_TYPES = {"Accept", "Damage", "Logi", "Salvager"}
+RSVP_TYPES = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
+ROLE_ASSIGN_TYPES = {"accept", "damage", "logi", "salvager"}
 
 
 # -------------------- Persistence --------------------
@@ -36,76 +36,56 @@ def save_data(data):
         json.dump(data, f, indent=2)
 
 
-# -------------------- UI --------------------
-
-class RSVPSelect(discord.ui.Select):
-    def __init__(self):
-        options = [discord.SelectOption(label=r) for r in RSVP_TYPES]
-        super().__init__(
-            placeholder="Select RSVP buttons to include",
-            min_values=1,
-            max_values=len(options),
-            options=options
-        )
-
-
-class ButtonConfigView(discord.ui.View):
-    def __init__(self):
-        super().__init__()
-        self.rsvp_buttons = []
-        self.redirect = False
-        self.add_item(RSVPSelect())
-
-    @discord.ui.button(label="Add Redirect Button", style=discord.ButtonStyle.secondary)
-    async def redirect_btn(self, interaction, _):
-        self.redirect = True
-        await interaction.response.send_message(
-            "Redirect button enabled. You will be asked for the URL.",
-            ephemeral=True
-        )
-
-    async def interaction_check(self, interaction):
-        if interaction.data.get("values"):
-            self.rsvp_buttons = interaction.data["values"]
-            await interaction.response.defer()
-            self.stop()
-        return True
-
-
-class RedirectModal(discord.ui.Modal, title="Redirect Button URL"):
-    url = discord.ui.TextInput(label="URL", placeholder="https://...")
-
-    def __init__(self):
-        super().__init__()
-        self.value = None
-
-    async def on_submit(self, interaction):
-        self.value = self.url.value
-        await interaction.response.defer()
-        self.stop()
-
-
-# -------------------- MODALS --------------------
+# -------------------- MODAL --------------------
 
 class EventModal(discord.ui.Modal, title="Create Event"):
-    name = discord.ui.TextInput(label="Event Name")
-    description = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph)
+    name = discord.ui.TextInput(label="Event Name", max_length=100)
+
+    description = discord.ui.TextInput(
+        label="Description",
+        style=discord.TextStyle.paragraph,
+        max_length=1000
+    )
+
     datetime_utc = discord.ui.TextInput(
         label="Date & Time (UTC)",
         placeholder="YYYY-MM-DD HH:MM"
     )
 
-    def __init__(self, creator_id, rsvp_buttons, redirect_url):
+    buttons = discord.ui.TextInput(
+        label="Buttons (comma-separated)",
+        placeholder="Accept, Damage, Logi, Salvager, Tentative, Decline",
+        required=False
+    )
+
+    redirect_url = discord.ui.TextInput(
+        label="Redirect URL (optional)",
+        placeholder="https://...",
+        required=False
+    )
+
+    def __init__(self, creator_id):
         super().__init__()
         self.creator_id = creator_id
-        self.rsvp_buttons = rsvp_buttons
-        self.redirect_url = redirect_url
 
-    async def on_submit(self, interaction):
-        event_dt = datetime.strptime(
-            self.datetime_utc.value,
-            "%Y-%m-%d %H:%M"
-        ).replace(tzinfo=timezone.utc)
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            event_dt = datetime.strptime(
+                self.datetime_utc.value.strip(),
+                "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid date format. Use `YYYY-MM-DD HH:MM` (UTC).",
+                ephemeral=True
+            )
+            return
+
+        selected_buttons = {
+            b.strip().lower()
+            for b in self.buttons.value.split(",")
+            if b.strip()
+        } & RSVP_TYPES
 
         event_id = str(uuid.uuid4())
         timestamp = int(event_dt.timestamp())
@@ -122,16 +102,19 @@ class EventModal(discord.ui.Modal, title="Create Event"):
             inline=False
         )
 
-        rsvp_field = "\n".join(f"{k}: 0" for k in self.rsvp_buttons)
-        if rsvp_field:
-            embed.add_field(name="📊 Fleet Signup", value=rsvp_field, inline=False)
+        if selected_buttons:
+            embed.add_field(
+                name="📊 Fleet Signup",
+                value="\n".join(f"{b.title()}: 0" for b in selected_buttons),
+                inline=False
+            )
 
         channel = discord.utils.get(
             interaction.guild.text_channels,
             name=ANNOUNCEMENT_CHANNEL
         )
 
-        view = EventView(event_id, self.rsvp_buttons, self.redirect_url)
+        view = EventView(event_id, selected_buttons, self.redirect_url.value.strip())
         msg = await channel.send(embed=embed, view=view)
 
         data = load_data()
@@ -140,25 +123,27 @@ class EventModal(discord.ui.Modal, title="Create Event"):
             "timestamp": timestamp,
             "channel": channel.id,
             "message": msg.id,
-            "roles": {k: [] for k in self.rsvp_buttons},
-            "redirect_url": self.redirect_url,
-            "reminders": {},
+            "roles": {b.title(): [] for b in selected_buttons},
+            "redirect_url": self.redirect_url.value.strip(),
             "active": True
         }
         save_data(data)
 
-        await interaction.response.send_message("Event created.", ephemeral=True)
+        await interaction.response.send_message(
+            "Event created successfully.",
+            ephemeral=True
+        )
 
 
 # -------------------- VIEW --------------------
 
 class EventView(discord.ui.View):
-    def __init__(self, event_id, rsvp_buttons, redirect_url):
+    def __init__(self, event_id, buttons, redirect_url):
         super().__init__(timeout=None)
         self.event_id = event_id
 
-        for r in rsvp_buttons:
-            self.add_item(RSVPButton(r))
+        for b in buttons:
+            self.add_item(RSVPButton(b.title()))
 
         if redirect_url:
             self.add_item(
@@ -169,18 +154,13 @@ class EventView(discord.ui.View):
                 )
             )
 
-        self.add_item(AdminButton())
-
 
 class RSVPButton(discord.ui.Button):
     def __init__(self, rsvp_type):
-        super().__init__(
-            label=rsvp_type,
-            style=discord.ButtonStyle.primary
-        )
-        self.rsvp_type = rsvp_type
+        super().__init__(label=rsvp_type, style=discord.ButtonStyle.primary)
+        self.rsvp_type = rsvp_type.lower()
 
-    async def callback(self, interaction):
+    async def callback(self, interaction: discord.Interaction):
         data = load_data()
         event = data[self.view.event_id]
         uid = interaction.user.id
@@ -188,11 +168,11 @@ class RSVPButton(discord.ui.Button):
         guild = interaction.guild
         temp_role = discord.utils.get(guild.roles, name=TEMP_ROLE_NAME)
 
-        for lst in event["roles"].values():
-            if uid in lst:
-                lst.remove(uid)
+        for users in event["roles"].values():
+            if uid in users:
+                users.remove(uid)
 
-        event["roles"][self.rsvp_type].append(uid)
+        event["roles"][self.rsvp_type.title()].append(uid)
 
         if self.rsvp_type in ROLE_ASSIGN_TYPES and temp_role:
             await interaction.user.add_roles(temp_role)
@@ -200,75 +180,10 @@ class RSVPButton(discord.ui.Button):
             await interaction.user.remove_roles(temp_role)
 
         save_data(data)
-        await update_embed(interaction, self.view.event_id)
         await interaction.response.send_message(
-            f"Registered as **{self.rsvp_type}**.",
+            f"Registered as **{self.rsvp_type.title()}**.",
             ephemeral=True
         )
-
-
-class AdminButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="⚙ Manage Event", style=discord.ButtonStyle.secondary)
-
-    async def callback(self, interaction):
-        data = load_data()
-        event = data[self.view.event_id]
-
-        if (
-            interaction.user.id != event["creator"]
-            and not interaction.user.guild_permissions.administrator
-        ):
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            "Admin actions:",
-            view=AdminView(self.view.event_id),
-            ephemeral=True
-        )
-
-
-class AdminView(discord.ui.View):
-    def __init__(self, event_id):
-        super().__init__(timeout=60)
-        self.event_id = event_id
-
-    @discord.ui.button(label="Cancel Event", style=discord.ButtonStyle.danger)
-    async def cancel(self, interaction, _):
-        data = load_data()
-        event = data[self.event_id]
-        event["active"] = False
-
-        channel = interaction.guild.get_channel(event["channel"])
-        msg = await channel.fetch_message(event["message"])
-
-        embed = msg.embeds[0]
-        embed.color = discord.Color.red()
-        embed.add_field(name="❌ Status", value="Event cancelled.", inline=False)
-
-        await msg.edit(embed=embed, view=None)
-        save_data(data)
-
-        await interaction.response.send_message("Event cancelled.", ephemeral=True)
-
-
-# -------------------- HELPERS --------------------
-
-async def update_embed(interaction, event_id):
-    data = load_data()
-    event = data[event_id]
-
-    channel = interaction.guild.get_channel(event["channel"])
-    msg = await channel.fetch_message(event["message"])
-
-    embed = msg.embeds[0]
-    value = "\n".join(
-        f"{k}: {len(v)}" for k, v in event["roles"].items()
-    )
-
-    embed.set_field_at(1, name="📊 Fleet Signup", value=value, inline=False)
-    await msg.edit(embed=embed)
 
 
 # -------------------- COG --------------------
@@ -278,10 +193,10 @@ class EventCreator(commands.Cog):
         self.bot = bot
 
     def can_create(self, member):
-        return any(r.name in CREATOR_ROLES for r in member.roles)
+        return any(role.name in CREATOR_ROLES for role in member.roles)
 
-    @app_commands.command(name="create_event")
-    async def create_event(self, interaction):
+    @app_commands.command(name="create_event", description="Create a new event")
+    async def create_event(self, interaction: discord.Interaction):
         if not self.can_create(interaction.user):
             await interaction.response.send_message(
                 "You are not authorized to create events.",
@@ -289,27 +204,8 @@ class EventCreator(commands.Cog):
             )
             return
 
-        config = ButtonConfigView()
-        await interaction.response.send_message(
-            "Configure event buttons:",
-            view=config,
-            ephemeral=True
-        )
-        await config.wait()
-
-        redirect_url = None
-        if config.redirect:
-            modal = RedirectModal()
-            await interaction.followup.send_modal(modal)
-            await modal.wait()
-            redirect_url = modal.value
-
-        await interaction.followup.send_modal(
-            EventModal(
-                interaction.user.id,
-                config.rsvp_buttons,
-                redirect_url
-            )
+        await interaction.response.send_modal(
+            EventModal(interaction.user.id)
         )
 
 
