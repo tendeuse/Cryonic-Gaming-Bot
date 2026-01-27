@@ -277,9 +277,9 @@ class WormholeStatusView(View):
     async def lockdown(self, interaction: discord.Interaction, button: Button):
         await self._set(interaction, "Lock-down")
 
-    @discord.ui.button(label=f"{RED_LIGHT} Under attack", style=discord.ButtonStyle.danger, custom_id="wh_status:attack")
+    @discord.ui.button(label=f"{RED_LIGHT} Station Under attack", style=discord.ButtonStyle.danger, custom_id="wh_status:attack")
     async def attack(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Under attack")
+        await self._set(interaction, "Station Under attack")
 
 class AlertSystemCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
