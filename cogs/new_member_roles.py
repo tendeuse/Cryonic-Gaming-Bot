@@ -15,14 +15,25 @@ SCHEDULING_ROLE = "Scheduling"
 ONBOARDING_ROLE = "Onboarding"
 GENESIS_ROLE = "ARC Genesis"
 
+LOG_CHANNEL_NAME = "roles-log"
+
 DELAY_SECONDS = 3600  # 1 hour
 
+
+# ----------------- Persistence -----------------
 
 def ensure_data():
     os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w") as f:
-            json.dump({"pending": {}, "rewarded": []}, f)
+            json.dump(
+                {
+                    "pending": {},     # user_id -> unix timestamp
+                    "rewarded": []     # [user_id]
+                },
+                f,
+                indent=2
+            )
 
 
 def load_data():
@@ -36,11 +47,14 @@ def save_data(data):
         json.dump(data, f, indent=2)
 
 
+# ----------------- Cog -----------------
+
 class NewMemberRoles(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         ensure_data()
         self.timer_task.start()
+        bot.loop.create_task(self.bootstrap_existing_members())
 
     def cog_unload(self):
         self.timer_task.cancel()
@@ -50,8 +64,36 @@ class NewMemberRoles(commands.Cog):
     def get_role(self, guild: discord.Guild, name: str):
         return discord.utils.get(guild.roles, name=name)
 
-    def has_role(self, member: discord.Member, name: str):
-        return any(r.name == name for r in member.roles)
+    def get_log_channel(self, guild: discord.Guild):
+        return discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+
+    async def log(self, guild: discord.Guild, message: str):
+        channel = self.get_log_channel(guild)
+        if channel:
+            await channel.send(message)
+
+    # ---------- Bootstrap Existing Members ----------
+
+    async def bootstrap_existing_members(self):
+        """Ensure existing members are safely marked to avoid retroactive triggers."""
+        await self.bot.wait_until_ready()
+        data = load_data()
+        changed = False
+
+        for guild in self.bot.guilds:
+            nm_role = self.get_role(guild, NEW_MEMBER_ROLE)
+            if not nm_role:
+                continue
+
+            for member in guild.members:
+                if nm_role in member.roles:
+                    uid = str(member.id)
+                    if uid not in data["rewarded"]:
+                        data["rewarded"].append(uid)
+                        changed = True
+
+        if changed:
+            save_data(data)
 
     # ---------- Member Join Handling ----------
 
@@ -67,11 +109,11 @@ class NewMemberRoles(commands.Cog):
         now = int(time.time())
         changed = False
 
-        for member_id, due in list(data["pending"].items()):
+        for user_id, due in list(data["pending"].items()):
             if now >= due:
                 member = None
                 for guild in self.bot.guilds:
-                    member = guild.get_member(int(member_id))
+                    member = guild.get_member(int(user_id))
                     if member:
                         break
 
@@ -80,10 +122,14 @@ class NewMemberRoles(commands.Cog):
                     if role and role not in member.roles:
                         try:
                             await member.add_roles(role, reason="Auto New Member role")
+                            await self.log(
+                                member.guild,
+                                f"🟢 **New Member added** to {member.mention} (auto)"
+                            )
                         except discord.Forbidden:
                             pass
 
-                del data["pending"][member_id]
+                del data["pending"][user_id]
                 changed = True
 
         if changed:
@@ -97,11 +143,31 @@ class NewMemberRoles(commands.Cog):
         after_roles = {r.name for r in after.roles}
 
         if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
+            # Find who removed the role
+            actor = "Unknown"
+            try:
+                async for entry in after.guild.audit_logs(
+                    limit=5,
+                    action=discord.AuditLogAction.member_role_update
+                ):
+                    if entry.target.id == after.id:
+                        actor = entry.user.mention
+                        break
+            except discord.Forbidden:
+                actor = "Audit log unavailable"
+
+            await self.log(
+                after.guild,
+                f"🔴 **New Member removed** from {after.mention} by {actor}"
+            )
+
             if SECURITY_ROLE not in before_roles:
                 return
 
             data = load_data()
-            if str(after.id) in data["rewarded"]:
+            uid = str(after.id)
+
+            if uid in data["rewarded"]:
                 return
 
             sched = self.get_role(after.guild, SCHEDULING_ROLE)
@@ -111,11 +177,14 @@ class NewMemberRoles(commands.Cog):
 
             if roles_to_add:
                 try:
-                    await after.add_roles(*roles_to_add, reason="Security onboarding reward")
+                    await after.add_roles(
+                        *roles_to_add,
+                        reason="Security onboarding reward"
+                    )
                 except discord.Forbidden:
                     return
 
-            data["rewarded"].append(str(after.id))
+            data["rewarded"].append(uid)
             save_data(data)
 
     # ---------- Permission Check ----------
@@ -127,32 +196,56 @@ class NewMemberRoles(commands.Cog):
 
     # ---------- Slash Commands ----------
 
-    @app_commands.command(name="remove_scheduling", description="Remove Scheduling role from a member")
+    @app_commands.command(
+        name="remove_scheduling",
+        description="Remove Scheduling role from a member"
+    )
     @genesis_only()
-    async def remove_scheduling(self, interaction: discord.Interaction, member: discord.Member):
+    async def remove_scheduling(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member
+    ):
         role = self.get_role(interaction.guild, SCHEDULING_ROLE)
         if role and role in member.roles:
-            await member.remove_roles(role, reason=f"Removed by {interaction.user}")
+            await member.remove_roles(
+                role,
+                reason=f"Removed by {interaction.user}"
+            )
             await interaction.response.send_message(
-                f"Scheduling role removed from {member.mention}.", ephemeral=True
+                f"Scheduling role removed from {member.mention}.",
+                ephemeral=True
             )
         else:
             await interaction.response.send_message(
-                "Member does not have Scheduling role.", ephemeral=True
+                "Member does not have Scheduling role.",
+                ephemeral=True
             )
 
-    @app_commands.command(name="remove_onboarding", description="Remove Onboarding role from a member")
+    @app_commands.command(
+        name="remove_onboarding",
+        description="Remove Onboarding role from a member"
+    )
     @genesis_only()
-    async def remove_onboarding(self, interaction: discord.Interaction, member: discord.Member):
+    async def remove_onboarding(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member
+    ):
         role = self.get_role(interaction.guild, ONBOARDING_ROLE)
         if role and role in member.roles:
-            await member.remove_roles(role, reason=f"Removed by {interaction.user}")
+            await member.remove_roles(
+                role,
+                reason=f"Removed by {interaction.user}"
+            )
             await interaction.response.send_message(
-                f"Onboarding role removed from {member.mention}.", ephemeral=True
+                f"Onboarding role removed from {member.mention}.",
+                ephemeral=True
             )
         else:
             await interaction.response.send_message(
-                "Member does not have Onboarding role.", ephemeral=True
+                "Member does not have Onboarding role.",
+                ephemeral=True
             )
 
 
