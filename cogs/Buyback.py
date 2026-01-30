@@ -14,13 +14,14 @@ class BuybackAuto(commands.Cog):
         self.db.row_factory = sqlite3.Row
         self.create_tables()
         self.processed = set()
+        print("[BUYBACK] Cog loaded, starting poll loop")
         self.poll_contracts.start()
 
     # ================= CONFIG =================
     CORP_ID = 98743131
     BUYBACK_CHARACTER_ID = 2122848297
 
-    AT1_STRUCTURE_ID = 1048840990158  # <-- PUT REAL STRUCTURE ID HERE
+    AT1_STRUCTURE_ID = 1048840990158  # <- Your structure ID
 
     BUYBACK_RATE = 0.80
     PAYOUT_CHANNEL = "buyback-payout"
@@ -54,36 +55,65 @@ class BuybackAuto(commands.Cog):
     @tasks.loop(seconds=CHECK_INTERVAL)
     async def poll_contracts(self):
         await self.bot.wait_until_ready()
+        print("[BUYBACK] Polling contracts...")
 
         async with self.session.get(
             f"{self.ESI}/corporations/{self.CORP_ID}/contracts/"
         ) as resp:
+            print(f"[BUYBACK] ESI status: {resp.status}")
             if resp.status != 200:
                 return
             contracts = await resp.json()
 
+        print(f"[BUYBACK] Contracts returned: {len(contracts)}")
+
         for c in contracts:
             cid = c["contract_id"]
 
+            print(
+                f"[DEBUG] Contract {cid} | "
+                f"type={c['type']} | "
+                f"assignee={c['assignee_id']} | "
+                f"location={c['start_location_id']}"
+            )
+
             if cid in self.processed:
-                continue
-            if c["type"] != "item_exchange":
-                continue
-            if c["assignee_id"] != self.BUYBACK_CHARACTER_ID:
-                continue
-            if c["start_location_id"] != self.AT1_STRUCTURE_ID:
+                print(f"[SKIP] {cid} already processed")
                 continue
 
+            if c["type"] != "item_exchange":
+                print(f"[SKIP] {cid} not item_exchange")
+                continue
+
+            if c["assignee_id"] != self.BUYBACK_CHARACTER_ID:
+                print(
+                    f"[SKIP] {cid} wrong assignee "
+                    f"(got {c['assignee_id']})"
+                )
+                continue
+
+            if c["start_location_id"] != self.AT1_STRUCTURE_ID:
+                print(
+                    f"[SKIP] {cid} wrong structure "
+                    f"(got {c['start_location_id']})"
+                )
+                continue
+
+            print(f"[MATCH] Processing contract {cid}")
             self.processed.add(cid)
             await self.handle_contract(c)
 
     async def handle_contract(self, contract):
         cid = contract["contract_id"]
+        print(f"[HANDLE] Contract {cid}")
 
         # --- Extract Discord from contract note ---
         note = contract.get("title", "")
+        print(f"[NOTE] {note}")
+
         match = re.search(r"discord\s*:\s*([^\n]+)", note, re.I)
         discord_name = match.group(1).strip() if match else None
+        print(f"[DISCORD] Extracted: {discord_name}")
 
         discord_user = None
         if discord_name:
@@ -95,11 +125,16 @@ class BuybackAuto(commands.Cog):
                     discord_user = member
                     break
 
+        print(f"[DISCORD] Resolved user: {discord_user}")
+
         # --- Pull items ---
         async with self.session.get(
             f"{self.ESI}/corporations/{self.CORP_ID}/contracts/{cid}/items/"
         ) as resp:
+            print(f"[ITEMS] Status: {resp.status}")
             items = await resp.json()
+
+        print(f"[ITEMS] Count: {len(items)}")
 
         janice_lines = []
         abyssal = False
@@ -113,6 +148,12 @@ class BuybackAuto(commands.Cog):
             self.bot.get_all_channels(),
             name=self.PAYOUT_CHANNEL
         )
+
+        print(f"[CHANNEL] Found channel: {channel}")
+
+        if not channel:
+            print("[ERROR] buyback-payout channel not found")
+            return
 
         ping = discord_user.mention if discord_user else "⚠ Discord not found"
 
@@ -145,6 +186,8 @@ class BuybackAuto(commands.Cog):
         await channel.send(embed=embed, view=view)
         await channel.send(f"```{chr(10).join(janice_lines)}```")
 
+        print(f"[DONE] Contract {cid} posted")
+
     async def record(self, cid, discord_user, janice_total, status, approver):
         payout = janice_total * self.BUYBACK_RATE if status == "APPROVED" else 0
 
@@ -172,10 +215,14 @@ class BuybackApprovalView(View):
         self.discord_user = discord_user
 
     async def interaction_check(self, interaction):
-        return discord.utils.get(
+        allowed = discord.utils.get(
             interaction.user.roles,
             name=self.cog.APPROVER_ROLE
         ) is not None
+        print(
+            f"[INTERACTION] {interaction.user} allowed={allowed}"
+        )
+        return allowed
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction, button):
