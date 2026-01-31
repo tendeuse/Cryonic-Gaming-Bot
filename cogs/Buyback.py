@@ -85,8 +85,6 @@ class BuybackAuto(commands.Cog):
 
     ESI = "https://esi.evetech.net/latest"
 
-    # IMPORTANT:
-    # Janice 400 was caused by wrong content type. This version uses FORM data.
     JANICE = "https://janice.e-351.com/api/v2/appraisal"
     JANICE_MARKET = "jita"
     JANICE_PRICING = "buy"
@@ -129,7 +127,6 @@ class BuybackAuto(commands.Cog):
 
         This migrates old -> new without losing data.
         """
-        # If no table yet, nothing to migrate
         existing = self.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'"
         ).fetchone()
@@ -140,8 +137,6 @@ class BuybackAuto(commands.Cog):
         if cols == ["contract_id", "issuer_char_id", "issuer_name", "discord_id", "status", "total", "payout", "ts"]:
             return  # already correct
 
-        # If it's already 8 columns but different order, we'll recreate safely anyway.
-        # If it's 7 columns old schema, we migrate ign -> issuer_name, issuer_char_id -> NULL
         print(f"[BUYBACK] Migrating contracts table. Old columns: {cols}")
 
         self.db.execute("ALTER TABLE contracts RENAME TO contracts_old")
@@ -168,11 +163,7 @@ class BuybackAuto(commands.Cog):
             FROM contracts_old
             """)
         else:
-            # Best-effort generic copy: try to map any common fields
             common = set(old_cols)
-            # We can only safely copy contract_id/status/total/payout/ts/discord_id/issuer_name if they exist
-            # Anything else becomes NULL.
-            # issuer_name source preference: issuer_name then ign
             issuer_name_expr = "issuer_name" if "issuer_name" in common else ("ign" if "ign" in common else "NULL")
             issuer_char_expr = "issuer_char_id" if "issuer_char_id" in common else "NULL"
             discord_expr = "discord_id" if "discord_id" in common else "NULL"
@@ -285,10 +276,6 @@ class BuybackAuto(commands.Cog):
         return name
 
     def resolve_discord_from_ign(self, ign: str) -> Optional[int]:
-        """
-        Match EVE character name (IGN) to your IGN registry:
-        state["users"][discord_user_id]["igns"] = [list of character names]
-        """
         if not IGN_FILE.exists():
             return None
         try:
@@ -348,12 +335,10 @@ class BuybackAuto(commands.Cog):
             except Exception:
                 continue
 
-            # already processed?
             if self.db.execute("SELECT 1 FROM contracts WHERE contract_id=?", (cid,)).fetchone():
                 skipped += 1
                 continue
 
-            # filters
             if c.get("type") != "item_exchange":
                 continue
             if int(c.get("assignee_id", 0)) != self.BUYBACK_CHARACTER_ID:
@@ -381,7 +366,6 @@ class BuybackAuto(commands.Cog):
 
         headers = await self.esi_headers()
 
-        # Pull items
         async with self.session.get(
             f"{self.ESI}/corporations/{self.CORP_ID}/contracts/{cid}/items/",
             headers=headers
@@ -389,7 +373,6 @@ class BuybackAuto(commands.Cog):
             text = await r.text()
             if r.status != 200:
                 print(f"[BUYBACK] Failed items for {cid}: {r.status} {text[:500]}")
-                # record as failed so it doesn't re-loop
                 self.upsert_contract(
                     contract_id=cid,
                     issuer_char_id=issuer_char_id,
@@ -418,7 +401,16 @@ class BuybackAuto(commands.Cog):
             janice_lines.append(f"{qty} {name}")
             display_lines.append(f"{qty:,} × {name}")
 
-        if not janice_lines:
+        # -------------------------
+        # Janice payload hardening
+        # -------------------------
+        safe_lines: List[str] = []
+        for line in janice_lines:
+            line = (line or "").replace("\r", " ").replace("\n", " ").strip()
+            if line:
+                safe_lines.append(line)
+
+        if not safe_lines:
             print(f"[BUYBACK] No valid items in contract {cid}")
             self.upsert_contract(
                 contract_id=cid,
@@ -432,76 +424,85 @@ class BuybackAuto(commands.Cog):
             return False
 
         # -------------------------------
-        # JANICE APPRAISAL (FORM DATA)
+        # JANICE APPRAISAL (FORM first, retry JSON on 400)
         # -------------------------------
-        # This fixes the common 400 when posting JSON.
         form = {
             "market": self.JANICE_MARKET,
             "pricing": self.JANICE_PRICING,
-            "items": "\n".join(janice_lines),
+            "items": "\n".join(safe_lines),
         }
 
-        janice_headers = {
+        base_headers = {
             "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "ARC-Buyback-Bot",
         }
 
-        async with self.session.post(self.JANICE, data=form, headers=janice_headers) as r:
-            janice_text = await r.text()
-            if r.status != 200:
-                print(f"[BUYBACK] Janice error for {cid}: {r.status}\n{janice_text[:1500]}")
-                # record as failed so it won't loop forever
-                self.upsert_contract(
-                    contract_id=cid,
-                    issuer_char_id=issuer_char_id,
-                    issuer_name=issuer_name,
-                    discord_id=discord_id,
-                    status="JANICE_FAILED",
-                    total=0,
-                    payout=0,
+        # Try FORM (x-www-form-urlencoded) first
+        status = 0
+        janice_text = ""
+        form_headers = dict(base_headers)
+        form_headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        async with self.session.post(self.JANICE, data=form, headers=form_headers) as r1:
+            janice_text = await r1.text()
+            status = r1.status
+
+        # If 400, retry JSON (some configs expect JSON)
+        if status == 400:
+            async with self.session.post(self.JANICE, json=form, headers=base_headers) as r2:
+                janice_text = await r2.text()
+                status = r2.status
+
+        if status != 200:
+            print(f"[BUYBACK] Janice error for {cid}: {status}\n{(janice_text or '')[:1500]}")
+            self.upsert_contract(
+                contract_id=cid,
+                issuer_char_id=issuer_char_id,
+                issuer_name=issuer_name,
+                discord_id=discord_id,
+                status="JANICE_FAILED",
+                total=0,
+                payout=0,
+            )
+
+            ch = self.get_channel()
+            if ch:
+                emb = discord.Embed(
+                    title="❌ Buyback Contract — Pricing Failed",
+                    description=f"Janice returned HTTP **{status}**.\nSaved as `JANICE_FAILED` so it won't re-loop.",
+                    color=discord.Color.red(),
+                    timestamp=datetime.utcnow(),
                 )
+                emb.add_field(name="Contract ID", value=str(cid), inline=True)
+                emb.add_field(name="Issuer (IGN)", value=issuer_name, inline=True)
+                emb.add_field(name="Discord", value=f"<@{discord_id}>" if discord_id else "Not found", inline=False)
 
-                ch = self.get_channel()
-                if ch:
-                    emb = discord.Embed(
-                        title="❌ Buyback Contract — Pricing Failed",
-                        description=f"Janice returned HTTP **{r.status}**.\nSaved as `JANICE_FAILED` so it won't re-loop.",
-                        color=discord.Color.red(),
-                        timestamp=datetime.utcnow(),
-                    )
-                    emb.add_field(name="Contract ID", value=str(cid), inline=True)
-                    emb.add_field(name="Issuer (IGN)", value=issuer_name, inline=True)
-                    emb.add_field(name="Discord", value=f"<@{discord_id}>" if discord_id else "Not found", inline=False)
-                    # small snippet to help you debug Janice payload issues
-                    snippet = janice_text.strip()
-                    if len(snippet) > 800:
-                        snippet = snippet[:800] + "…"
-                    if snippet:
-                        emb.add_field(name="Janice response (snippet)", value=f"```{snippet}```", inline=False)
-                    await ch.send(embed=emb)
+                snippet = (janice_text or "").strip() or "(empty response body)"
+                if len(snippet) > 900:
+                    snippet = snippet[:900] + "…"
+                emb.add_field(name="Janice response (snippet)", value=f"```{snippet}```", inline=False)
 
-                return False
+                await ch.send(embed=emb)
 
-            # Try parse JSON
-            try:
-                appraisal = json.loads(janice_text)
-            except Exception:
-                print(f"[BUYBACK] Janice returned non-JSON for {cid}: {janice_text[:500]}")
-                self.upsert_contract(
-                    contract_id=cid,
-                    issuer_char_id=issuer_char_id,
-                    issuer_name=issuer_name,
-                    discord_id=discord_id,
-                    status="JANICE_BAD_JSON",
-                    total=0,
-                    payout=0,
-                )
-                return False
+            return False
 
-        # Janice v2 appraisal structure usually has effective_prices.total
-        # If your response shape differs, we log keys to help adjust.
-        total = 0.0
+        # Parse JSON (Janice sometimes returns 200 but body isn't valid JSON behind proxies)
+        try:
+            appraisal = json.loads(janice_text)
+        except Exception:
+            print(f"[BUYBACK] Janice returned non-JSON for {cid}: {(janice_text or '')[:500]}")
+            self.upsert_contract(
+                contract_id=cid,
+                issuer_char_id=issuer_char_id,
+                issuer_name=issuer_name,
+                discord_id=discord_id,
+                status="JANICE_BAD_JSON",
+                total=0,
+                payout=0,
+            )
+            return False
+
+        # Extract total
         try:
             total = float(appraisal["effective_prices"]["total"])
         except Exception:
@@ -519,7 +520,6 @@ class BuybackAuto(commands.Cog):
 
         payout = total * self.BUYBACK_RATE
 
-        # Save contract (PRICED)
         self.upsert_contract(
             contract_id=cid,
             issuer_char_id=issuer_char_id,
