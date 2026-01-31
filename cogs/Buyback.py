@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ui import View
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 # =========================
 # PATHS
@@ -88,6 +88,15 @@ class BuybackAuto(commands.Cog):
     JANICE = "https://janice.e-351.com/api/v2/appraisal"
     JANICE_MARKET = "jita"
     JANICE_PRICING = "buy"
+
+    # Statuses that should be retried on the next scan / retry commands
+    RETRYABLE_STATUSES = {
+        "JANICE_FAILED",
+        "JANICE_BAD_JSON",
+        "JANICE_SHAPE_UNKNOWN",
+        "ITEMS_FAILED",
+        "EMPTY_ITEMS",
+    }
     # ==========================================
 
     def __init__(self, bot: commands.Bot):
@@ -119,13 +128,10 @@ class BuybackAuto(commands.Cog):
 
     def _migrate_contracts_if_needed(self) -> None:
         """
-        You previously had a 7-column contracts table:
-          (contract_id, ign, discord_id, status, total, payout, ts)
-
-        This cog uses an 8-column table:
-          (contract_id, issuer_char_id, issuer_name, discord_id, status, total, payout, ts)
-
-        This migrates old -> new without losing data.
+        Older versions may have fewer columns.
+        Current target columns:
+          (contract_id, issuer_char_id, issuer_name, discord_id, status, total, payout, ts,
+           janice_http, janice_snippet)
         """
         existing = self.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'"
@@ -134,9 +140,24 @@ class BuybackAuto(commands.Cog):
             return
 
         cols = self._table_columns("contracts")
-        if cols == ["contract_id", "issuer_char_id", "issuer_name", "discord_id", "status", "total", "payout", "ts"]:
-            return  # already correct
+        target = [
+            "contract_id",
+            "issuer_char_id",
+            "issuer_name",
+            "discord_id",
+            "status",
+            "total",
+            "payout",
+            "ts",
+            "janice_http",
+            "janice_snippet",
+        ]
 
+        # already correct
+        if cols == target:
+            return
+
+        # If table exists but not matching, do a safe rebuild like you already did
         print(f"[BUYBACK] Migrating contracts table. Old columns: {cols}")
 
         self.db.execute("ALTER TABLE contracts RENAME TO contracts_old")
@@ -150,33 +171,36 @@ class BuybackAuto(commands.Cog):
             status TEXT,
             total REAL,
             payout REAL,
-            ts TEXT
+            ts TEXT,
+            janice_http INTEGER,
+            janice_snippet TEXT
         )
         """)
 
         old_cols = self._table_columns("contracts_old")
+        common = set(old_cols)
 
-        if old_cols == ["contract_id", "ign", "discord_id", "status", "total", "payout", "ts"]:
-            self.db.execute("""
-            INSERT INTO contracts (contract_id, issuer_char_id, issuer_name, discord_id, status, total, payout, ts)
-            SELECT contract_id, NULL, ign, discord_id, status, total, payout, ts
-            FROM contracts_old
-            """)
-        else:
-            common = set(old_cols)
-            issuer_name_expr = "issuer_name" if "issuer_name" in common else ("ign" if "ign" in common else "NULL")
-            issuer_char_expr = "issuer_char_id" if "issuer_char_id" in common else "NULL"
-            discord_expr = "discord_id" if "discord_id" in common else "NULL"
-            status_expr = "status" if "status" in common else "'UNKNOWN'"
-            total_expr = "total" if "total" in common else "0"
-            payout_expr = "payout" if "payout" in common else "0"
-            ts_expr = "ts" if "ts" in common else "NULL"
+        # map old -> new with best-effort
+        issuer_name_expr = "issuer_name" if "issuer_name" in common else ("ign" if "ign" in common else "NULL")
+        issuer_char_expr = "issuer_char_id" if "issuer_char_id" in common else "NULL"
+        discord_expr = "discord_id" if "discord_id" in common else "NULL"
+        status_expr = "status" if "status" in common else "'UNKNOWN'"
+        total_expr = "total" if "total" in common else "0"
+        payout_expr = "payout" if "payout" in common else "0"
+        ts_expr = "ts" if "ts" in common else "NULL"
+        janice_http_expr = "janice_http" if "janice_http" in common else "NULL"
+        janice_snippet_expr = "janice_snippet" if "janice_snippet" in common else "NULL"
 
-            self.db.execute(f"""
-            INSERT INTO contracts (contract_id, issuer_char_id, issuer_name, discord_id, status, total, payout, ts)
-            SELECT contract_id, {issuer_char_expr}, {issuer_name_expr}, {discord_expr}, {status_expr}, {total_expr}, {payout_expr}, {ts_expr}
-            FROM contracts_old
-            """)
+        self.db.execute(f"""
+        INSERT INTO contracts (
+            contract_id, issuer_char_id, issuer_name, discord_id,
+            status, total, payout, ts, janice_http, janice_snippet
+        )
+        SELECT
+            contract_id, {issuer_char_expr}, {issuer_name_expr}, {discord_expr},
+            {status_expr}, {total_expr}, {payout_expr}, {ts_expr}, {janice_http_expr}, {janice_snippet_expr}
+        FROM contracts_old
+        """)
 
         self.db.execute("DROP TABLE contracts_old")
         self.db.commit()
@@ -194,7 +218,9 @@ class BuybackAuto(commands.Cog):
             status TEXT,
             total REAL,
             payout REAL,
-            ts TEXT
+            ts TEXT,
+            janice_http INTEGER,
+            janice_snippet TEXT
         )
         """)
         self.db.execute("""
@@ -215,14 +241,16 @@ class BuybackAuto(commands.Cog):
         status: str,
         total: float,
         payout: float,
-        ts: Optional[str] = None
+        ts: Optional[str] = None,
+        janice_http: Optional[int] = None,
+        janice_snippet: Optional[str] = None
     ) -> None:
         self.db.execute(
             """
             INSERT OR REPLACE INTO contracts
-              (contract_id, issuer_char_id, issuer_name, discord_id, status, total, payout, ts)
+              (contract_id, issuer_char_id, issuer_name, discord_id, status, total, payout, ts, janice_http, janice_snippet)
             VALUES
-              (?, ?, ?, ?, ?, ?, ?, ?)
+              (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 contract_id,
@@ -233,9 +261,22 @@ class BuybackAuto(commands.Cog):
                 float(total),
                 float(payout),
                 ts or datetime.utcnow().isoformat(),
+                janice_http,
+                janice_snippet,
             ),
         )
         self.db.commit()
+
+    def get_contract_row(self, contract_id: int) -> Optional[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT * FROM contracts WHERE contract_id=?",
+            (contract_id,)
+        ).fetchone()
+
+    def should_retry_existing(self, row: sqlite3.Row) -> bool:
+        # Retry only if status is retryable (and not already priced/approved/etc.)
+        status = (row["status"] or "").strip().upper()
+        return status in self.RETRYABLE_STATUSES
 
     # ================= HELPERS =================
 
@@ -304,29 +345,48 @@ class BuybackAuto(commands.Cog):
                 return ch
         return None
 
-    # ================= SLASH COMMAND =================
-
-    @app_commands.command(name="buyback", description="Scan buyback contracts once (manual)")
-    @app_commands.checks.has_role(APPROVER_ROLE)
-    async def buyback_scan(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
+    async def fetch_corp_contracts(self) -> List[Dict[str, Any]]:
         headers = await self.esi_headers()
-
         async with self.session.get(
             f"{self.ESI}/corporations/{self.CORP_ID}/contracts/",
             headers=headers
         ) as r:
             body = await r.text()
             if r.status != 200:
-                await interaction.followup.send(
-                    f"❌ ESI error {r.status}\n```{body[:1800]}```",
-                    ephemeral=True
-                )
-                return
-            contracts = json.loads(body)
+                raise RuntimeError(f"ESI error {r.status}: {body[:1200]}")
+            return json.loads(body)
+
+    async def find_contract_in_esi(self, contract_id: int) -> Optional[Dict[str, Any]]:
+        # ESI corp contracts endpoint returns recent pages; simplest is scan result list
+        try:
+            contracts = await self.fetch_corp_contracts()
+        except Exception as e:
+            print(f"[BUYBACK] find_contract_in_esi failed: {e}")
+            return None
+
+        for c in contracts:
+            try:
+                if int(c.get("contract_id", 0)) == int(contract_id):
+                    return c
+            except Exception:
+                continue
+        return None
+
+    # ================= SLASH COMMANDS =================
+
+    @app_commands.command(name="buyback", description="Scan buyback contracts once (manual)")
+    @app_commands.checks.has_role(APPROVER_ROLE)
+    async def buyback_scan(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            contracts = await self.fetch_corp_contracts()
+        except Exception as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
 
         new = 0
+        retried = 0
         skipped = 0
 
         for c in contracts:
@@ -335,10 +395,7 @@ class BuybackAuto(commands.Cog):
             except Exception:
                 continue
 
-            if self.db.execute("SELECT 1 FROM contracts WHERE contract_id=?", (cid,)).fetchone():
-                skipped += 1
-                continue
-
+            # Filter down to relevant contracts first
             if c.get("type") != "item_exchange":
                 continue
             if int(c.get("assignee_id", 0)) != self.BUYBACK_CHARACTER_ID:
@@ -346,21 +403,106 @@ class BuybackAuto(commands.Cog):
             if int(c.get("start_location_id", 0)) != self.AT1_STRUCTURE_ID:
                 continue
 
+            row = self.get_contract_row(cid)
+            if row:
+                if self.should_retry_existing(row):
+                    ok = await self.process_contract(c, force=True)
+                    if ok:
+                        retried += 1
+                    else:
+                        # still counted as retried attempt
+                        retried += 1
+                else:
+                    skipped += 1
+                continue
+
             ok = await self.process_contract(c)
             if ok:
                 new += 1
 
         await interaction.followup.send(
-            f"✅ Buyback scan complete — {new} new contract(s) processed. ({skipped} already saved)",
+            f"✅ Buyback scan complete — {new} new, {retried} retried failed, {skipped} skipped (already handled).",
+            ephemeral=True
+        )
+
+    @app_commands.command(name="buyback_retry", description="Retry a specific contract ID (use when Janice failed)")
+    @app_commands.checks.has_role(APPROVER_ROLE)
+    @app_commands.describe(contract_id="The EVE contract ID to retry")
+    async def buyback_retry(self, interaction: discord.Interaction, contract_id: int):
+        await interaction.response.defer(ephemeral=True)
+
+        c = await self.find_contract_in_esi(contract_id)
+        if not c:
+            await interaction.followup.send(
+                "❌ I couldn't find that contract in the corporation contracts list (it may be too old or not visible via this endpoint).",
+                ephemeral=True
+            )
+            return
+
+        ok = await self.process_contract(c, force=True)
+        if ok:
+            await interaction.followup.send(f"✅ Retried contract {contract_id} successfully.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"⚠️ Retried contract {contract_id}, but it still failed. Check the payout channel for the error embed.", ephemeral=True)
+
+    @app_commands.command(name="buyback_retry_failed", description="Retry the most recent failed contracts saved in the DB")
+    @app_commands.checks.has_role(APPROVER_ROLE)
+    @app_commands.describe(limit="How many failed contracts to retry (default 10)")
+    async def buyback_retry_failed(self, interaction: discord.Interaction, limit: int = 10):
+        await interaction.response.defer(ephemeral=True)
+
+        if limit < 1:
+            limit = 1
+        if limit > 50:
+            limit = 50
+
+        rows = self.db.execute(
+            """
+            SELECT contract_id, status, ts
+            FROM contracts
+            WHERE UPPER(status) IN ({})
+            ORDER BY ts DESC
+            LIMIT ?
+            """.format(",".join("?" for _ in self.RETRYABLE_STATUSES)),
+            (*[s.upper() for s in self.RETRYABLE_STATUSES], limit)
+        ).fetchall()
+
+        if not rows:
+            await interaction.followup.send("✅ No failed contracts found to retry.", ephemeral=True)
+            return
+
+        attempted = 0
+        succeeded = 0
+        not_found = 0
+
+        for r in rows:
+            cid = int(r["contract_id"])
+            c = await self.find_contract_in_esi(cid)
+            if not c:
+                not_found += 1
+                continue
+
+            attempted += 1
+            ok = await self.process_contract(c, force=True)
+            if ok:
+                succeeded += 1
+
+        await interaction.followup.send(
+            f"✅ Retry complete — attempted {attempted}, succeeded {succeeded}, not found in ESI list {not_found}.",
             ephemeral=True
         )
 
     # ================= PROCESS =================
 
-    async def process_contract(self, c: Dict[str, Any]) -> bool:
+    async def process_contract(self, c: Dict[str, Any], force: bool = False) -> bool:
         cid = int(c["contract_id"])
-        issuer_char_id = int(c.get("issuer_id", 0))
 
+        # If exists and not forcing, do nothing
+        existing = self.get_contract_row(cid)
+        if existing and not force:
+            return False
+
+        issuer_char_id = int(c.get("issuer_id", 0))
         issuer_name = await self.get_character_name(issuer_char_id)
         discord_id = self.resolve_discord_from_ign(issuer_name)
 
@@ -381,6 +523,8 @@ class BuybackAuto(commands.Cog):
                     status="ITEMS_FAILED",
                     total=0,
                     payout=0,
+                    janice_http=None,
+                    janice_snippet=f"ESI items HTTP {r.status}: {text[:900]}",
                 )
                 return False
             items = json.loads(text)
@@ -396,14 +540,10 @@ class BuybackAuto(commands.Cog):
                 continue
 
             name = await self.type_name(type_id)
-
-            # Janice accepts: "quantity Item Name"
             janice_lines.append(f"{qty} {name}")
             display_lines.append(f"{qty:,} × {name}")
 
-        # -------------------------
-        # Janice payload hardening
-        # -------------------------
+        # Harden payload
         safe_lines: List[str] = []
         for line in janice_lines:
             line = (line or "").replace("\r", " ").replace("\n", " ").strip()
@@ -420,12 +560,12 @@ class BuybackAuto(commands.Cog):
                 status="EMPTY_ITEMS",
                 total=0,
                 payout=0,
+                janice_http=None,
+                janice_snippet="No valid items after filtering (qty/type_id).",
             )
             return False
 
-        # -------------------------------
         # JANICE APPRAISAL (FORM first, retry JSON on 400)
-        # -------------------------------
         form = {
             "market": self.JANICE_MARKET,
             "pricing": self.JANICE_PRICING,
@@ -437,9 +577,10 @@ class BuybackAuto(commands.Cog):
             "User-Agent": "ARC-Buyback-Bot",
         }
 
-        # Try FORM (x-www-form-urlencoded) first
         status = 0
         janice_text = ""
+
+        # Try FORM
         form_headers = dict(base_headers)
         form_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
@@ -447,14 +588,18 @@ class BuybackAuto(commands.Cog):
             janice_text = await r1.text()
             status = r1.status
 
-        # If 400, retry JSON (some configs expect JSON)
+        # If 400, retry JSON
         if status == 400:
             async with self.session.post(self.JANICE, json=form, headers=base_headers) as r2:
                 janice_text = await r2.text()
                 status = r2.status
 
         if status != 200:
-            print(f"[BUYBACK] Janice error for {cid}: {status}\n{(janice_text or '')[:1500]}")
+            snippet = (janice_text or "").strip() or "(empty response body)"
+            if len(snippet) > 900:
+                snippet = snippet[:900] + "…"
+
+            print(f"[BUYBACK] Janice error for {cid}: {status}\n{snippet}")
             self.upsert_contract(
                 contract_id=cid,
                 issuer_char_id=issuer_char_id,
@@ -463,34 +608,39 @@ class BuybackAuto(commands.Cog):
                 status="JANICE_FAILED",
                 total=0,
                 payout=0,
+                janice_http=status,
+                janice_snippet=snippet,
             )
 
             ch = self.get_channel()
             if ch:
                 emb = discord.Embed(
                     title="❌ Buyback Contract — Pricing Failed",
-                    description=f"Janice returned HTTP **{status}**.\nSaved as `JANICE_FAILED` so it won't re-loop.",
+                    description=(
+                        f"Janice returned HTTP **{status}**.\n"
+                        f"Saved as `JANICE_FAILED`.\n"
+                        f"Use `/buyback_retry {cid}` after Janice is healthy again."
+                    ),
                     color=discord.Color.red(),
                     timestamp=datetime.utcnow(),
                 )
                 emb.add_field(name="Contract ID", value=str(cid), inline=True)
                 emb.add_field(name="Issuer (IGN)", value=issuer_name, inline=True)
                 emb.add_field(name="Discord", value=f"<@{discord_id}>" if discord_id else "Not found", inline=False)
-
-                snippet = (janice_text or "").strip() or "(empty response body)"
-                if len(snippet) > 900:
-                    snippet = snippet[:900] + "…"
                 emb.add_field(name="Janice response (snippet)", value=f"```{snippet}```", inline=False)
-
                 await ch.send(embed=emb)
 
             return False
 
-        # Parse JSON (Janice sometimes returns 200 but body isn't valid JSON behind proxies)
+        # Parse JSON
         try:
             appraisal = json.loads(janice_text)
         except Exception:
-            print(f"[BUYBACK] Janice returned non-JSON for {cid}: {(janice_text or '')[:500]}")
+            snippet = (janice_text or "").strip() or "(empty body)"
+            if len(snippet) > 900:
+                snippet = snippet[:900] + "…"
+
+            print(f"[BUYBACK] Janice returned non-JSON for {cid}: {snippet[:500]}")
             self.upsert_contract(
                 contract_id=cid,
                 issuer_char_id=issuer_char_id,
@@ -499,6 +649,8 @@ class BuybackAuto(commands.Cog):
                 status="JANICE_BAD_JSON",
                 total=0,
                 payout=0,
+                janice_http=200,
+                janice_snippet=snippet,
             )
             return False
 
@@ -506,7 +658,8 @@ class BuybackAuto(commands.Cog):
         try:
             total = float(appraisal["effective_prices"]["total"])
         except Exception:
-            print(f"[BUYBACK] Unexpected Janice JSON keys for {cid}: {list(appraisal.keys())[:30]}")
+            keys = list(appraisal.keys())[:30]
+            print(f"[BUYBACK] Unexpected Janice JSON keys for {cid}: {keys}")
             self.upsert_contract(
                 contract_id=cid,
                 issuer_char_id=issuer_char_id,
@@ -515,6 +668,8 @@ class BuybackAuto(commands.Cog):
                 status="JANICE_SHAPE_UNKNOWN",
                 total=0,
                 payout=0,
+                janice_http=200,
+                janice_snippet=f"Missing effective_prices.total; keys={keys}",
             )
             return False
 
@@ -528,6 +683,8 @@ class BuybackAuto(commands.Cog):
             status="PRICED",
             total=total,
             payout=payout,
+            janice_http=200,
+            janice_snippet=None,
         )
 
         # Send embed
