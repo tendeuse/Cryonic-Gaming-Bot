@@ -164,58 +164,69 @@ class BuybackAuto(commands.Cog):
     # ================= PROCESS =================
 
     async def process_contract(self, c):
-        cid = c["contract_id"]
-        ign = str(c["issuer_id"])
-        discord_id = self.resolve_discord_from_ign(ign)
+    cid = c["contract_id"]
+    ign = str(c["issuer_id"])
+    discord_id = self.resolve_discord_from_ign(ign)
 
-        async with self.session.get(
-            f"{self.ESI}/corporations/{self.CORP_ID}/contracts/{cid}/items/",
-            headers=self.esi_headers()
-        ) as r:
-            items = await r.json()
+    async with self.session.get(
+        f"{self.ESI}/corporations/{self.CORP_ID}/contracts/{cid}/items/",
+        headers=self.esi_headers()
+    ) as r:
+        items = await r.json()
 
-        lines = []
-        for i in items:
-            name = await self.type_name(i["type_id"])
-            lines.append(f"{i['quantity']}x {name}")
+    # Janice expects "quantity ItemName" per line, not "1x ItemName"
+    lines = []
+    for i in items:
+        name = await self.type_name(i["type_id"])
+        lines.append(f"{i['quantity']} {name}")
 
-        async with self.session.post(
-            self.JANICE,
-            json={"market": "jita", "pricing": "buy", "items": "\n".join(lines)}
-        ) as r:
-            appraisal = await r.json()
+    # Prepare payload
+    payload = {
+        "market": "jita",
+        "pricing": "buy",
+        "items": "\n".join(lines)
+    }
 
-        total = appraisal["effective_prices"]["total"]
-        payout = total * self.BUYBACK_RATE
-
-        self.db.execute(
-            "INSERT INTO contracts VALUES (?, ?, ?, 'PRICED', ?, ?, ?)",
-            (cid, ign, discord_id, total, payout, datetime.utcnow().isoformat())
-        )
-        self.db.commit()
-
-        channel = discord.utils.get(
-            self.bot.get_all_channels(), name=self.PAYOUT_CHANNEL
-        )
-        if not channel:
+    async with self.session.post(self.JANICE, json=payload) as r:
+        if r.status != 200:
+            text = await r.text()
+            print(f"❌ Janice API error {r.status}:\n{text}")
             return
+        appraisal = await r.json()
 
-        emb = discord.Embed(
-            title="📦 Buyback Contract",
-            color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
-        )
+    total = appraisal["effective_prices"]["total"]
+    payout = total * self.BUYBACK_RATE
 
-        emb.add_field(name="IGN (pay this character)", value=ign, inline=False)
-        emb.add_field(
-            name="Discord",
-            value=f"<@{discord_id}>" if discord_id else "Not found",
-            inline=False
-        )
-        emb.add_field(name="Jita Buy Total", value=f"{total:,.0f} ISK")
-        emb.add_field(name="80% Payout", value=f"{payout:,.0f} ISK")
+    # Save contract
+    self.db.execute(
+        "INSERT INTO contracts VALUES (?, ?, ?, 'PRICED', ?, ?, ?)",
+        (cid, ign, discord_id, total, payout, datetime.utcnow().isoformat())
+    )
+    self.db.commit()
 
-        await channel.send(embed=emb, view=ApprovalView(self, cid))
+    # Send embed
+    channel = discord.utils.get(
+        self.bot.get_all_channels(), name=self.PAYOUT_CHANNEL
+    )
+    if not channel:
+        return
+
+    emb = discord.Embed(
+        title="📦 Buyback Contract",
+        color=discord.Color.blue(),
+        timestamp=datetime.utcnow()
+    )
+    emb.add_field(name="IGN (pay this character)", value=ign, inline=False)
+    emb.add_field(
+        name="Discord",
+        value=f"<@{discord_id}>" if discord_id else "Not found",
+        inline=False
+    )
+    emb.add_field(name="Jita Buy Total", value=f"{total:,.0f} ISK")
+    emb.add_field(name="80% Payout", value=f"{payout:,.0f} ISK")
+
+    await channel.send(embed=emb, view=ApprovalView(self, cid))
+
 
 # =========================
 # APPROVAL VIEW
