@@ -1,13 +1,16 @@
 import os
 import json
+import time
+import base64
 import sqlite3
 import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
-from discord.ui import View, Button
+from discord.ui import View
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Dict, Any, List
 
 # =========================
 # PATHS
@@ -20,22 +23,53 @@ DB_PATH = DATA / "buyback.db"
 IGN_FILE = DATA / "ign_registry.json"
 
 # =========================
+# OAUTH HELPER
+# =========================
+
+class EveOAuth:
+    def __init__(self):
+        self.client_id = os.getenv("EVE_CLIENT_ID")
+        self.client_secret = os.getenv("EVE_CLIENT_SECRET")
+        self.refresh_token = os.getenv("EVE_REFRESH_TOKEN")
+
+        if not self.client_id or not self.client_secret or not self.refresh_token:
+            raise RuntimeError("Missing EVE_CLIENT_ID / EVE_CLIENT_SECRET / EVE_REFRESH_TOKEN in environment variables.")
+
+        self._access_token: Optional[str] = None
+        self._expires_at: float = 0.0  # epoch seconds
+
+    async def get_access_token(self, session: aiohttp.ClientSession) -> str:
+        # Reuse token if still valid (60s buffer)
+        if self._access_token and time.time() < (self._expires_at - 60):
+            return self._access_token
+
+        basic = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode("utf-8")).decode("ascii")
+        headers = {
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token,
+        }
+
+        async with session.post("https://login.eveonline.com/v2/oauth/token", headers=headers, data=data) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"OAuth refresh failed ({resp.status}): {text}")
+
+            payload = await resp.json()
+
+        self._access_token = payload["access_token"]
+        self._expires_at = time.time() + int(payload.get("expires_in", 1200))
+        return self._access_token
+
+# =========================
 # COG
 # =========================
 
 class BuybackAuto(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-        self.bearer = os.getenv("ESI_BEARER_TOKEN")
-        if not self.bearer:
-            raise RuntimeError("ESI_BEARER_TOKEN missing")
-
-        self.session = aiohttp.ClientSession()
-        self.db = sqlite3.connect(DB_PATH)
-        self.db.row_factory = sqlite3.Row
-        self.init_db()
-
     # ================= CONFIG =================
     CORP_ID = 98743131
     BUYBACK_CHARACTER_ID = 2122848297
@@ -49,13 +83,36 @@ class BuybackAuto(commands.Cog):
     JANICE = "https://janice.e-351.com/api/v2/appraisal"
     # ==========================================
 
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.oauth = EveOAuth()
+        self.session = aiohttp.ClientSession()
+
+        self.db = sqlite3.connect(DB_PATH)
+        self.db.row_factory = sqlite3.Row
+        self.init_db()
+
+    def cog_unload(self):
+        # discord.py will call this on unload
+        try:
+            if self.session and not self.session.closed:
+                # can't await here; best-effort close
+                self.bot.loop.create_task(self.session.close())
+        except Exception:
+            pass
+        try:
+            self.db.close()
+        except Exception:
+            pass
+
     # ================= DB =================
 
     def init_db(self):
         self.db.execute("""
         CREATE TABLE IF NOT EXISTS contracts (
             contract_id INTEGER PRIMARY KEY,
-            ign TEXT,
+            issuer_char_id INTEGER,
+            issuer_name TEXT,
             discord_id INTEGER,
             status TEXT,
             total REAL,
@@ -73,12 +130,21 @@ class BuybackAuto(commands.Cog):
 
     # ================= HELPERS =================
 
-    def esi_headers(self):
+    async def esi_headers(self) -> Dict[str, str]:
+        token = await self.oauth.get_access_token(self.session)
         return {
-            "Authorization": f"Bearer {self.bearer}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "ARC-Buyback-Bot"
+            "User-Agent": "ARC-Buyback-Bot",
         }
+
+    async def get_character_name(self, character_id: int) -> str:
+        # This endpoint does not require auth, but we can still call it without headers
+        async with self.session.get(f"{self.ESI}/characters/{character_id}/") as r:
+            if r.status != 200:
+                return str(character_id)
+            data = await r.json()
+            return data.get("name", str(character_id))
 
     async def type_name(self, type_id: int) -> str:
         row = self.db.execute(
@@ -88,145 +154,215 @@ class BuybackAuto(commands.Cog):
         if row:
             return row["name"]
 
+        # universe/types does not require auth
         async with self.session.get(f"{self.ESI}/universe/types/{type_id}/") as r:
             if r.status != 200:
                 return f"typeID:{type_id}"
             data = await r.json()
-            name = data["name"]
+            name = data.get("name", f"typeID:{type_id}")
 
         self.db.execute(
-            "INSERT OR IGNORE INTO type_cache VALUES (?,?)",
+            "INSERT OR IGNORE INTO type_cache(type_id, name) VALUES (?, ?)",
             (type_id, name)
         )
         self.db.commit()
         return name
 
-    def resolve_discord_from_ign(self, ign: str):
+    def resolve_discord_from_ign(self, ign: str) -> Optional[int]:
+        """
+        Match EVE character name (IGN) to your IGN registry:
+        state["users"][discord_user_id]["igns"] = [list of character names]
+        """
         if not IGN_FILE.exists():
             return None
         try:
-            data = json.loads(IGN_FILE.read_text())
+            data = json.loads(IGN_FILE.read_text(encoding="utf-8"))
         except Exception:
             return None
 
-        for uid, rec in data.get("users", {}).items():
-            if ign.lower() in (x.lower() for x in rec.get("igns", [])):
-                return int(uid)
+        ign_l = (ign or "").strip().lower()
+        if not ign_l:
+            return None
+
+        users = data.get("users", {})
+        for uid, rec in users.items():
+            igns = rec.get("igns", [])
+            for x in igns:
+                if (x or "").strip().lower() == ign_l:
+                    try:
+                        return int(uid)
+                    except Exception:
+                        return None
+        return None
+
+    def get_channel(self) -> Optional[discord.TextChannel]:
+        for guild in self.bot.guilds:
+            ch = discord.utils.get(guild.text_channels, name=self.PAYOUT_CHANNEL)
+            if ch:
+                return ch
         return None
 
     # ================= SLASH COMMAND =================
 
-    @app_commands.command(name="buyback", description="Scan buyback contracts once")
+    @app_commands.command(name="buyback", description="Scan buyback contracts once (manual)")
     @app_commands.checks.has_role(APPROVER_ROLE)
     async def buyback_scan(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
+        headers = await self.esi_headers()
+
         async with self.session.get(
             f"{self.ESI}/corporations/{self.CORP_ID}/contracts/",
-            headers=self.esi_headers()
+            headers=headers
         ) as r:
+            body = await r.text()
             if r.status != 200:
-                body = await r.text()
                 await interaction.followup.send(
-                    f"❌ ESI error {r.status}\n```{body}```",
+                    f"❌ ESI error {r.status}\n```{body[:1800]}```",
                     ephemeral=True
                 )
                 return
-
-            contracts = await r.json()
+            contracts = json.loads(body)
 
         new = 0
+        skipped = 0
 
         for c in contracts:
-            cid = c["contract_id"]
-
-            if self.db.execute(
-                "SELECT 1 FROM contracts WHERE contract_id=?",
-                (cid,)
-            ).fetchone():
+            try:
+                cid = int(c["contract_id"])
+            except Exception:
                 continue
 
-            if c["type"] != "item_exchange":
-                continue
-            if c["assignee_id"] != self.BUYBACK_CHARACTER_ID:
-                continue
-            if c["start_location_id"] != self.AT1_STRUCTURE_ID:
+            # already processed?
+            if self.db.execute("SELECT 1 FROM contracts WHERE contract_id=?", (cid,)).fetchone():
+                skipped += 1
                 continue
 
-            await self.process_contract(c)
-            new += 1
+            # filters
+            if c.get("type") != "item_exchange":
+                continue
+            if int(c.get("assignee_id", 0)) != self.BUYBACK_CHARACTER_ID:
+                continue
+            if int(c.get("start_location_id", 0)) != self.AT1_STRUCTURE_ID:
+                continue
+
+            ok = await self.process_contract(c)
+            if ok:
+                new += 1
 
         await interaction.followup.send(
-            f"✅ Buyback scan complete — {new} new contract(s) processed.",
+            f"✅ Buyback scan complete — {new} new contract(s) processed. ({skipped} already saved)",
             ephemeral=True
         )
 
     # ================= PROCESS =================
 
-    async def process_contract(self, c):
-    cid = c["contract_id"]
-    ign = str(c["issuer_id"])
-    discord_id = self.resolve_discord_from_ign(ign)
+    async def process_contract(self, c: Dict[str, Any]) -> bool:
+        cid = int(c["contract_id"])
+        issuer_char_id = int(c.get("issuer_id", 0))
 
-    async with self.session.get(
-        f"{self.ESI}/corporations/{self.CORP_ID}/contracts/{cid}/items/",
-        headers=self.esi_headers()
-    ) as r:
-        items = await r.json()
+        issuer_name = await self.get_character_name(issuer_char_id)
+        discord_id = self.resolve_discord_from_ign(issuer_name)
 
-    # Janice expects "quantity ItemName" per line, not "1x ItemName"
-    lines = []
-    for i in items:
-        name = await self.type_name(i["type_id"])
-        lines.append(f"{i['quantity']} {name}")
+        headers = await self.esi_headers()
 
-    # Prepare payload
-    payload = {
-        "market": "jita",
-        "pricing": "buy",
-        "items": "\n".join(lines)
-    }
-
-    async with self.session.post(self.JANICE, json=payload) as r:
-        if r.status != 200:
+        # Pull items
+        async with self.session.get(
+            f"{self.ESI}/corporations/{self.CORP_ID}/contracts/{cid}/items/",
+            headers=headers
+        ) as r:
             text = await r.text()
-            print(f"❌ Janice API error {r.status}:\n{text}")
-            return
-        appraisal = await r.json()
+            if r.status != 200:
+                print(f"[BUYBACK] Failed items for {cid}: {r.status} {text[:500]}")
+                return False
+            items = json.loads(text)
 
-    total = appraisal["effective_prices"]["total"]
-    payout = total * self.BUYBACK_RATE
+        # Build Janice lines: "quantity ItemName" per line
+        janice_lines: List[str] = []
+        display_lines: List[str] = []
+        total_qty = 0
 
-    # Save contract
-    self.db.execute(
-        "INSERT INTO contracts VALUES (?, ?, ?, 'PRICED', ?, ?, ?)",
-        (cid, ign, discord_id, total, payout, datetime.utcnow().isoformat())
-    )
-    self.db.commit()
+        for it in items:
+            qty = int(it.get("quantity", 0))
+            type_id = int(it.get("type_id", 0))
+            name = await self.type_name(type_id)
 
-    # Send embed
-    channel = discord.utils.get(
-        self.bot.get_all_channels(), name=self.PAYOUT_CHANNEL
-    )
-    if not channel:
-        return
+            total_qty += qty
+            janice_lines.append(f"{qty} {name}")
+            # display (limit spam later)
+            display_lines.append(f"{qty:,} × {name}")
 
-    emb = discord.Embed(
-        title="📦 Buyback Contract",
-        color=discord.Color.blue(),
-        timestamp=datetime.utcnow()
-    )
-    emb.add_field(name="IGN (pay this character)", value=ign, inline=False)
-    emb.add_field(
-        name="Discord",
-        value=f"<@{discord_id}>" if discord_id else "Not found",
-        inline=False
-    )
-    emb.add_field(name="Jita Buy Total", value=f"{total:,.0f} ISK")
-    emb.add_field(name="80% Payout", value=f"{payout:,.0f} ISK")
+        payload = {
+            "market": "jita",
+            "pricing": "buy",
+            "items": "\n".join(janice_lines),
+        }
 
-    await channel.send(embed=emb, view=ApprovalView(self, cid))
+        # Janice appraisal
+        async with self.session.post(self.JANICE, json=payload) as r:
+            janice_text = await r.text()
+            if r.status != 200:
+                print(f"[BUYBACK] Janice error for {cid}: {r.status}\n{janice_text[:1000]}")
+                # still record as FAILED so it won't loop forever
+                self.db.execute(
+                    "INSERT OR REPLACE INTO contracts VALUES (?, ?, ?, ?, 'JANICE_FAILED', 0, 0, ?)",
+                    (cid, issuer_char_id, issuer_name, discord_id, datetime.utcnow().isoformat())
+                )
+                self.db.commit()
+                ch = self.get_channel()
+                if ch:
+                    emb = discord.Embed(
+                        title="❌ Buyback Contract — Pricing Failed",
+                        description=f"Janice returned HTTP {r.status}. Contract saved as `JANICE_FAILED`.",
+                        color=discord.Color.red(),
+                        timestamp=datetime.utcnow(),
+                    )
+                    emb.add_field(name="Contract ID", value=str(cid), inline=True)
+                    emb.add_field(name="Issuer (IGN)", value=issuer_name, inline=True)
+                    emb.add_field(name="Discord", value=f"<@{discord_id}>" if discord_id else "Not found", inline=False)
+                    await ch.send(embed=emb)
+                return False
 
+            appraisal = json.loads(janice_text)
+
+        total = float(appraisal["effective_prices"]["total"])
+        payout = total * self.BUYBACK_RATE
+
+        # Save contract (PRICED)
+        self.db.execute(
+            "INSERT OR REPLACE INTO contracts VALUES (?, ?, ?, ?, 'PRICED', ?, ?, ?)",
+            (cid, issuer_char_id, issuer_name, discord_id, total, payout, datetime.utcnow().isoformat())
+        )
+        self.db.commit()
+
+        # Send embed
+        channel = self.get_channel()
+        if not channel:
+            print("[BUYBACK] payout channel not found")
+            return False
+
+        ping = f"<@{discord_id}>" if discord_id else "Not found"
+
+        emb = discord.Embed(
+            title="📦 Buyback Contract — Pending",
+            color=discord.Color.orange(),
+            timestamp=datetime.utcnow(),
+            description="Items are priced at **Jita 4-4 Buy** via Janice. Payout is **80%**."
+        )
+        emb.add_field(name="Contract ID", value=str(cid), inline=True)
+        emb.add_field(name="Issuer (pay this IGN)", value=issuer_name, inline=True)
+        emb.add_field(name="Discord", value=ping, inline=False)
+        emb.add_field(name="Jita Buy Total", value=f"{total:,.0f} ISK", inline=True)
+        emb.add_field(name="80% Payout", value=f"{payout:,.0f} ISK", inline=True)
+
+        # show a preview of items (avoid huge embeds)
+        preview = "\n".join(display_lines[:15])
+        if len(display_lines) > 15:
+            preview += f"\n… and {len(display_lines) - 15} more line(s)"
+        emb.add_field(name="Items (preview)", value=f"```{preview}```", inline=False)
+
+        await channel.send(embed=emb, view=ApprovalView(self, cid))
+        return True
 
 # =========================
 # APPROVAL VIEW
@@ -238,26 +374,25 @@ class ApprovalView(View):
         self.cog = cog
         self.cid = cid
 
-    async def interaction_check(self, interaction):
-        return any(
-            r.name == self.cog.APPROVER_ROLE
-            for r in interaction.user.roles
-        )
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member):
+            return False
+        return any(r.name == self.cog.APPROVER_ROLE for r in interaction.user.roles)
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
-    async def approve(self, interaction, _):
+    async def approve(self, interaction: discord.Interaction, _):
         self.cog.db.execute(
             "UPDATE contracts SET status='APPROVED' WHERE contract_id=?",
             (self.cid,)
         )
         self.cog.db.commit()
         await interaction.response.send_message(
-            "✅ Approved. Pay ISK, then click **Paid**.",
+            "✅ Approved. Pay ISK in-game, then click **Paid**.",
             ephemeral=True
         )
 
     @discord.ui.button(label="Paid", style=discord.ButtonStyle.primary)
-    async def paid(self, interaction, _):
+    async def paid(self, interaction: discord.Interaction, _):
         self.cog.db.execute(
             "UPDATE contracts SET status='PAID' WHERE contract_id=?",
             (self.cid,)
@@ -266,7 +401,7 @@ class ApprovalView(View):
         await interaction.response.send_message("💰 Marked as PAID.", ephemeral=True)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger)
-    async def reject(self, interaction, _):
+    async def reject(self, interaction: discord.Interaction, _):
         self.cog.db.execute(
             "UPDATE contracts SET status='REJECTED' WHERE contract_id=?",
             (self.cid,)
