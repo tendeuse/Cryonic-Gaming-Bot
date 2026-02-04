@@ -4,6 +4,7 @@ import time
 import base64
 import sqlite3
 import aiohttp
+import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -83,25 +84,29 @@ class BuybackAuto(commands.Cog):
 
     ESI = "https://esi.evetech.net/latest"
 
-    # ---- JANICE v2 (text/plain) ----
-    JANICE = "https://janice.e-351.com/api/rest/v2/appraisal"
-    JANICE_MARKET_ID = 2                  # 2 = Jita (per Janice API)
-    JANICE_PRICING = "buy"                # buy/sell/split/purchase
-    JANICE_PRICING_VARIANT = "immediate"  # immediate/top5percent
-    JANICE_API_KEY = os.getenv("JANICE_API_KEY")  # REQUIRED (X-ApiKey)
-    if not JANICE_API_KEY:
-        raise RuntimeError(
-            "Missing JANICE_API_KEY env var. Janice v2 /api/rest/v2/appraisal requires an API key (X-ApiKey)."
-        )
-    # -------------------------------
+    # --- ESI MARKET PRICING (Janice-like) ---
+    # Jita 4-4 (Caldari Navy Assembly Plant) NPC station:
+    JITA_4_4_LOCATION_ID = 60003760
+    THE_FORGE_REGION_ID = 10000002
+
+    # Cache & rate-limit controls
+    MARKET_CACHE_TTL = 600  # seconds
+    MARKET_CONCURRENCY = 6
+
+    # “Similar rules to Janice” (best-effort heuristic filtering):
+    # - Ignore tiny-volume “bait” orders (relative to needed qty)
+    # - Ignore extreme outliers vs median of top-of-book snapshot
+    OUTLIER_LOW_FACTOR = 0.70     # drop prices < median * 0.70
+    OUTLIER_HIGH_FACTOR = 1.50    # drop prices > median * 1.50 (rare, but anti-spike)
+    TOP_BOOK_SAMPLE = 30          # how many top orders to sample for median/outliers
+    # ----------------------------------------
 
     # retryable statuses
     RETRYABLE_STATUSES = {
-        "JANICE_FAILED",
-        "JANICE_BAD_JSON",
-        "JANICE_SHAPE_UNKNOWN",
+        "ESI_PRICE_FAILED",
         "ITEMS_FAILED",
         "EMPTY_ITEMS",
+        "ESI_PRICE_NO_ORDERS",
     }
     # ==========================================
 
@@ -112,6 +117,9 @@ class BuybackAuto(commands.Cog):
 
         self.db = sqlite3.connect(DB_PATH)
         self.db.row_factory = sqlite3.Row
+
+        self._market_sem = asyncio.Semaphore(self.MARKET_CONCURRENCY)
+        self._market_cache: Dict[int, Dict[str, Any]] = {}  # type_id -> {ts, orders:[{price, vol, minv}]}
 
         self.init_db()
 
@@ -136,6 +144,8 @@ class BuybackAuto(commands.Cog):
         """
         Target columns:
           (contract_id, issuer_char_id, issuer_name, discord_id, status, total, payout, ts, janice_http, janice_snippet)
+        NOTE: We keep janice_http/janice_snippet fields for backwards compatibility.
+              We'll store ESI pricing failures in janice_snippet.
         """
         existing = self.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'"
@@ -445,33 +455,206 @@ class BuybackAuto(commands.Cog):
                 continue
         return None
 
-    # ================= JANICE HELPERS =================
+    # ================= MARKET PRICING (ESI) =================
 
-    async def _janice_call(self, params: Dict[str, str], headers: Dict[str, str], text_payload: str) -> Tuple[int, str]:
-        async with self.session.post(
-            self.JANICE,
-            params=params,
-            data=text_payload.encode("utf-8"),
-            headers=headers
-        ) as jr:
-            return jr.status, await jr.text()
+    @staticmethod
+    def _median(nums: List[float]) -> Optional[float]:
+        if not nums:
+            return None
+        s = sorted(nums)
+        n = len(s)
+        mid = n // 2
+        if n % 2 == 1:
+            return float(s[mid])
+        return (float(s[mid - 1]) + float(s[mid])) / 2.0
 
-    def _janice_snippet(self, body: str) -> str:
-        body = (body or "").strip()
-        if not body:
-            return "(empty response body)"
-        try:
-            pj = json.loads(body)
-            detail = pj.get("detail")
-            title = pj.get("title")
-            status = pj.get("status")
-            if detail:
-                s = f"{title or 'Error'} ({status}): {detail}"
-                return s[:900] + ("…" if len(s) > 900 else "")
-            j = json.dumps(pj)
-            return j[:900] + ("…" if len(j) > 900 else "")
-        except Exception:
-            return body[:900] + ("…" if len(body) > 900 else "")
+    async def _esi_get_json_with_backoff(self, url: str, params: Dict[str, Any]) -> Tuple[int, Any, Dict[str, str]]:
+        """
+        Returns (status, json_or_text, headers)
+        Handles 420/429 with backoff.
+        """
+        backoff = 1.0
+        for attempt in range(6):
+            async with self.session.get(url, params=params, headers={"Accept": "application/json", "User-Agent": "ARC-Buyback-Bot"}) as r:
+                status = r.status
+                hdrs = {k: v for k, v in r.headers.items()}
+                if status in (420, 429):
+                    # ESI rate limit
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2.0, 16.0)
+                    continue
+                if status != 200:
+                    text = await r.text()
+                    return status, text, hdrs
+                try:
+                    return status, await r.json(), hdrs
+                except Exception:
+                    text = await r.text()
+                    return 200, text, hdrs
+        return 429, "Rate limit/backoff exhausted", {}
+
+    async def _fetch_jita_buy_orders(self, type_id: int) -> List[Dict[str, Any]]:
+        """
+        Fetch all The Forge buy orders for a type and filter to Jita 4-4 location.
+        Cached for MARKET_CACHE_TTL seconds.
+        """
+        now = time.time()
+        cached = self._market_cache.get(type_id)
+        if cached and (now - float(cached.get("ts", 0))) < self.MARKET_CACHE_TTL:
+            return cached.get("orders", [])
+
+        async with self._market_sem:
+            # Re-check after acquiring semaphore to reduce duplicate work.
+            now = time.time()
+            cached = self._market_cache.get(type_id)
+            if cached and (now - float(cached.get("ts", 0))) < self.MARKET_CACHE_TTL:
+                return cached.get("orders", [])
+
+            url = f"{self.ESI}/markets/{self.THE_FORGE_REGION_ID}/orders/"
+            page = 1
+            all_orders: List[Dict[str, Any]] = []
+
+            while True:
+                params = {"order_type": "buy", "type_id": int(type_id), "page": page}
+                status, data, hdrs = await self._esi_get_json_with_backoff(url, params)
+
+                if status != 200:
+                    raise RuntimeError(f"ESI market orders HTTP {status}: {str(data)[:600]}")
+
+                if not isinstance(data, list) or len(data) == 0:
+                    break
+
+                # Filter to Jita 4-4
+                for o in data:
+                    try:
+                        if int(o.get("location_id", 0)) != int(self.JITA_4_4_LOCATION_ID):
+                            continue
+                        # Only active buy orders with remaining volume
+                        v_rem = int(o.get("volume_remain", 0))
+                        if v_rem <= 0:
+                            continue
+                        all_orders.append(o)
+                    except Exception:
+                        continue
+
+                # Pagination: ESI supplies X-Pages; otherwise break when empty page
+                try:
+                    xpages = int(hdrs.get("X-Pages", "1"))
+                except Exception:
+                    xpages = 1
+                if page >= xpages:
+                    break
+                page += 1
+
+            # Normalize and store only relevant fields
+            norm: List[Dict[str, Any]] = []
+            for o in all_orders:
+                try:
+                    norm.append({
+                        "price": float(o.get("price", 0.0)),
+                        "vol": int(o.get("volume_remain", 0)),
+                        "minv": int(o.get("min_volume", 1)),
+                    })
+                except Exception:
+                    continue
+
+            # Sort high->low price
+            norm.sort(key=lambda x: x["price"], reverse=True)
+
+            self._market_cache[type_id] = {"ts": time.time(), "orders": norm}
+            return norm
+
+    def _filter_orders_janice_like(self, orders: List[Dict[str, Any]], qty_needed: int) -> List[Dict[str, Any]]:
+        """
+        Best-effort “Janice-like” heuristics:
+          - ignore tiny volume orders (relative to needed qty)
+          - ignore outliers vs median of top-of-book sample
+        """
+        if not orders:
+            return []
+
+        qty_needed = max(1, int(qty_needed))
+
+        # Relative “tiny order” threshold
+        # 1% of qty, capped at 1000, min 1
+        tiny_threshold = max(1, min(1000, int(qty_needed * 0.01)))
+
+        candidates = []
+        for o in orders:
+            # Respect min_volume rule roughly (if remaining qty is smaller than min_volume, it won't fill anyway)
+            # Keep it, but it may be unusable for some fills.
+            if int(o["vol"]) < tiny_threshold:
+                continue
+            if float(o["price"]) <= 0:
+                continue
+            candidates.append(o)
+
+        if not candidates:
+            # If our filter removed everything, fall back to original book
+            candidates = orders[:]
+
+        # Compute median from top-of-book snapshot
+        sample = candidates[: self.TOP_BOOK_SAMPLE]
+        med = self._median([float(o["price"]) for o in sample if float(o["price"]) > 0])
+        if not med or med <= 0:
+            return candidates
+
+        low_cut = med * float(self.OUTLIER_LOW_FACTOR)
+        high_cut = med * float(self.OUTLIER_HIGH_FACTOR)
+
+        filtered = [o for o in candidates if (low_cut <= float(o["price"]) <= high_cut)]
+        return filtered if filtered else candidates
+
+    async def price_jita_buy_immediate(self, type_id: int, qty: int) -> Tuple[float, float, str]:
+        """
+        Returns (unit_effective_price, total_price, note)
+        “Immediate” means fill from highest buy orders downward, volume-weighted.
+        If insufficient liquidity: remainder priced at BEST price (top buy), per your request.
+        """
+        qty = max(0, int(qty))
+        if qty <= 0:
+            return 0.0, 0.0, "qty<=0"
+
+        orders = await self._fetch_jita_buy_orders(type_id)
+        if not orders:
+            return 0.0, 0.0, "no Jita 4-4 buy orders"
+
+        orders = self._filter_orders_janice_like(orders, qty)
+
+        remaining = qty
+        total = 0.0
+        filled = 0
+
+        best_price = float(orders[0]["price"]) if orders else 0.0
+
+        for o in orders:
+            if remaining <= 0:
+                break
+            price = float(o["price"])
+            vol = int(o["vol"])
+            minv = int(o.get("minv", 1))
+
+            if price <= 0 or vol <= 0:
+                continue
+
+            # If remaining is less than min_volume, this order can't be used (ESI min_volume is per order)
+            if remaining < minv:
+                continue
+
+            take = min(remaining, vol)
+            total += take * price
+            remaining -= take
+            filled += take
+
+        # Remainder fallback: best price for remaining
+        if remaining > 0 and best_price > 0:
+            total += remaining * best_price
+            filled += remaining
+            remaining = 0
+
+        unit_eff = (total / qty) if qty > 0 else 0.0
+        note = f"filled={filled}/{qty} (remainder@best if needed)"
+        return unit_eff, total, note
 
     # ================= SLASH COMMANDS =================
 
@@ -506,10 +689,8 @@ class BuybackAuto(commands.Cog):
             row = self.get_contract_row(cid)
             if row:
                 if self.should_retry_existing(row):
-                    ok = await self.process_contract(c, force=True)
+                    _ = await self.process_contract(c, force=True)
                     retried += 1
-                    if ok:
-                        pass
                 else:
                     skipped += 1
                 continue
@@ -523,7 +704,7 @@ class BuybackAuto(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(name="buyback_retry", description="Retry a specific contract ID (Janice/ESI failures)")
+    @app_commands.command(name="buyback_retry", description="Retry a specific contract ID (pricing/ESI failures)")
     @app_commands.checks.has_role(APPROVER_ROLE)
     @app_commands.describe(contract_id="The EVE contract ID to retry")
     async def buyback_retry(self, interaction: discord.Interaction, contract_id: int):
@@ -541,7 +722,10 @@ class BuybackAuto(commands.Cog):
         if ok:
             await interaction.followup.send(f"✅ Retried contract {contract_id} successfully.", ephemeral=True)
         else:
-            await interaction.followup.send(f"⚠️ Retried contract {contract_id}, but it still failed. Check the payout channel for the error embed.", ephemeral=True)
+            await interaction.followup.send(
+                f"⚠️ Retried contract {contract_id}, but it still failed. Check the payout channel for the error embed.",
+                ephemeral=True
+            )
 
     @app_commands.command(name="buyback_retry_failed", description="Retry the most recent failed contracts saved in the DB")
     @app_commands.checks.has_role(APPROVER_ROLE)
@@ -620,16 +804,19 @@ class BuybackAuto(commands.Cog):
                     status="ITEMS_FAILED",
                     total=0,
                     payout=0,
-                    janice_http=None,
+                    janice_http=r.status,
                     janice_snippet=f"ESI items HTTP {r.status}: {text[:900]}",
                 )
                 return False
             items = json.loads(text)
 
-        # Build Janice lines as: "ItemName qty" (simple text)
-        janice_lines: List[str] = []
+        # Build display + compute pricing using ESI market
         display_lines: List[str] = []
+        price_debug_lines: List[str] = []
 
+        total = 0.0
+
+        # We’ll price each type as (qty * effective unit) using the book-fill function
         for it in items:
             qty = int(it.get("quantity", 0))
             type_id = int(it.get("type_id", 0))
@@ -641,10 +828,51 @@ class BuybackAuto(commands.Cog):
             # Convert ores to compressed variant if available
             type_id, name = await self.maybe_convert_to_compressed(type_id, name)
 
-            janice_lines.append(f"{name} {qty}")
+            try:
+                unit_eff, line_total, note = await self.price_jita_buy_immediate(type_id, qty)
+            except Exception as e:
+                msg = f"Pricing failed for {name} (type_id={type_id}) qty={qty}: {e}"
+                print(f"[BUYBACK] {msg}")
+                self.upsert_contract(
+                    contract_id=cid,
+                    issuer_char_id=issuer_char_id,
+                    issuer_name=issuer_name,
+                    discord_id=discord_id,
+                    status="ESI_PRICE_FAILED",
+                    total=0,
+                    payout=0,
+                    janice_http=None,
+                    janice_snippet=msg[:900],
+                )
+
+                ch = self.get_channel()
+                if ch:
+                    emb = discord.Embed(
+                        title="❌ Buyback Contract — Pricing Failed",
+                        description=(
+                            "ESI market pricing failed while calculating Jita 4-4 buy.\n"
+                            f"Saved as `ESI_PRICE_FAILED`.\n"
+                            f"Use `/buyback_retry {cid}` after ESI recovers."
+                        ),
+                        color=discord.Color.red(),
+                        timestamp=datetime.utcnow(),
+                    )
+                    emb.add_field(name="Contract ID", value=str(cid), inline=True)
+                    emb.add_field(name="Issuer (IGN)", value=issuer_name, inline=True)
+                    emb.add_field(name="Discord", value=f"<@{discord_id}>" if discord_id else "Not found", inline=False)
+                    emb.add_field(name="Error", value=f"```{msg[:900]}```", inline=False)
+                    await ch.send(embed=emb)
+                return False
+
+            if line_total <= 0:
+                price_debug_lines.append(f"{name}: 0 ISK ({note})")
+            else:
+                price_debug_lines.append(f"{name}: {unit_eff:,.2f}/u ({note})")
+
+            total += float(line_total)
             display_lines.append(f"{qty:,} × {name}")
 
-        if not janice_lines:
+        if not display_lines:
             self.upsert_contract(
                 contract_id=cid,
                 issuer_char_id=issuer_char_id,
@@ -658,120 +886,17 @@ class BuybackAuto(commands.Cog):
             )
             return False
 
-        # -------------------------------
-        # JANICE v2 APPRAISAL (text/plain)
-        # -------------------------------
-        raw_text = "\n".join([ln.strip() for ln in janice_lines if (ln or "").strip()])
-
-        params = {
-            "market": str(self.JANICE_MARKET_ID),
-            "pricing": self.JANICE_PRICING,
-            "pricingVariant": self.JANICE_PRICING_VARIANT,
-            "persist": "false",
-            "compactize": "true",
-        }
-
-        j_headers = {
-            "Accept": "application/json",
-            "Content-Type": "text/plain",
-            "User-Agent": "ARC-Buyback-Bot",
-            "X-ApiKey": self.JANICE_API_KEY,  # REQUIRED
-        }
-
-        # Attempt #1: "ItemName qty"
-        status, janice_text = await self._janice_call(params, j_headers, raw_text)
-
-        # If 400, attempt #2: "qty ItemName"
-        if status == 400:
-            alt_lines: List[str] = []
-            for ln in janice_lines:
-                ln = (ln or "").strip()
-                if not ln:
-                    continue
-                parts = ln.rsplit(" ", 1)
-                if len(parts) == 2 and parts[1].isdigit():
-                    alt_lines.append(f"{parts[1]} {parts[0]}")
-                else:
-                    alt_lines.append(ln)
-            alt_text = "\n".join(alt_lines)
-            status, janice_text = await self._janice_call(params, j_headers, alt_text)
-
-        if status != 200:
-            snippet = self._janice_snippet(janice_text)
-            payload_preview = "\n".join(raw_text.splitlines()[:10])
-            if len(payload_preview) > 400:
-                payload_preview = payload_preview[:400] + "…"
-
-            print(f"[BUYBACK] Janice error for {cid}: {status}\n{snippet}")
-
+        if total <= 0:
             self.upsert_contract(
                 contract_id=cid,
                 issuer_char_id=issuer_char_id,
                 issuer_name=issuer_name,
                 discord_id=discord_id,
-                status="JANICE_FAILED",
+                status="ESI_PRICE_NO_ORDERS",
                 total=0,
                 payout=0,
-                janice_http=status,
-                janice_snippet=f"{snippet}\n\nSent (preview):\n{payload_preview}",
-            )
-
-            ch = self.get_channel()
-            if ch:
-                emb = discord.Embed(
-                    title="❌ Buyback Contract — Pricing Failed",
-                    description=(
-                        f"Janice returned HTTP **{status}**.\n"
-                        f"Saved as `JANICE_FAILED`.\n"
-                        f"Use `/buyback_retry {cid}` after correcting the cause."
-                    ),
-                    color=discord.Color.red(),
-                    timestamp=datetime.utcnow(),
-                )
-                emb.add_field(name="Contract ID", value=str(cid), inline=True)
-                emb.add_field(name="Issuer (IGN)", value=issuer_name, inline=True)
-                emb.add_field(name="Discord", value=f"<@{discord_id}>" if discord_id else "Not found", inline=False)
-                emb.add_field(name="Janice response (snippet)", value=f"```{snippet}```", inline=False)
-                emb.add_field(name="Sent (preview)", value=f"```{payload_preview}```", inline=False)
-                await ch.send(embed=emb)
-
-            return False
-
-        # Parse JSON
-        try:
-            appraisal = json.loads(janice_text)
-        except Exception:
-            snippet = (janice_text or "").strip() or "(empty body)"
-            if len(snippet) > 900:
-                snippet = snippet[:900] + "…"
-            self.upsert_contract(
-                contract_id=cid,
-                issuer_char_id=issuer_char_id,
-                issuer_name=issuer_name,
-                discord_id=discord_id,
-                status="JANICE_BAD_JSON",
-                total=0,
-                payout=0,
-                janice_http=200,
-                janice_snippet=snippet,
-            )
-            return False
-
-        # Janice v2 totals (pricing=buy => totalBuyPrice)
-        try:
-            effective = appraisal["effectivePrices"]
-            total = float(effective["totalBuyPrice"])
-        except Exception:
-            self.upsert_contract(
-                contract_id=cid,
-                issuer_char_id=issuer_char_id,
-                issuer_name=issuer_name,
-                discord_id=discord_id,
-                status="JANICE_SHAPE_UNKNOWN",
-                total=0,
-                payout=0,
-                janice_http=200,
-                janice_snippet=f"Unexpected JSON shape; keys={list(appraisal.keys())[:30]}",
+                janice_http=None,
+                janice_snippet="Total priced to 0 (no usable Jita 4-4 buy liquidity found for all items).",
             )
             return False
 
@@ -801,7 +926,11 @@ class BuybackAuto(commands.Cog):
             title="📦 Buyback Contract — Pending",
             color=discord.Color.orange(),
             timestamp=datetime.utcnow(),
-            description="Priced at **Jita 4-4 Buy** via Janice. Payout is **80%**.",
+            description=(
+                "Priced at **Jita 4-4 Buy (Immediate)** using ESI market orders (Janice-like).\n"
+                "If liquidity was insufficient, remainder was priced at the **best** buy price.\n"
+                "Payout is **80%**."
+            ),
         )
         emb.add_field(name="Contract ID", value=str(cid), inline=True)
         emb.add_field(name="IGN (pay this character)", value=issuer_name, inline=True)
@@ -813,6 +942,11 @@ class BuybackAuto(commands.Cog):
         if len(display_lines) > 15:
             preview += f"\n… and {len(display_lines) - 15} more line(s)"
         emb.add_field(name="Items (preview)", value=f"```{preview}```", inline=False)
+
+        # Optional debug lines (comment out if you don't want)
+        dbg = "\n".join(price_debug_lines[:10])
+        if dbg:
+            emb.add_field(name="Pricing notes (top 10)", value=f"```{dbg}```", inline=False)
 
         await channel.send(embed=emb, view=ApprovalView(self, cid))
         return True
