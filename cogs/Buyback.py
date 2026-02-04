@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ui import View
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # =========================
 # PATHS
@@ -85,10 +85,14 @@ class BuybackAuto(commands.Cog):
 
     # ---- JANICE v2 (text/plain) ----
     JANICE = "https://janice.e-351.com/api/rest/v2/appraisal"
-    JANICE_MARKET_ID = 2               # 2 = Jita (per Janice API)
-    JANICE_PRICING = "buy"             # buy/sell/split/purchase
+    JANICE_MARKET_ID = 2                  # 2 = Jita (per Janice API)
+    JANICE_PRICING = "buy"                # buy/sell/split/purchase
     JANICE_PRICING_VARIANT = "immediate"  # immediate/top5percent
     JANICE_API_KEY = os.getenv("JANICE_API_KEY")  # REQUIRED (X-ApiKey)
+    if not JANICE_API_KEY:
+        raise RuntimeError(
+            "Missing JANICE_API_KEY env var. Janice v2 /api/rest/v2/appraisal requires an API key (X-ApiKey)."
+        )
     # -------------------------------
 
     # retryable statuses
@@ -343,7 +347,7 @@ class BuybackAuto(commands.Cog):
                     return None
         return None
 
-    async def maybe_convert_to_compressed(self, type_id: int, name: str) -> tuple[int, str]:
+    async def maybe_convert_to_compressed(self, type_id: int, name: str) -> Tuple[int, str]:
         """
         If 'Compressed {name}' exists as a type, convert to it.
         Otherwise return original. Cached.
@@ -440,6 +444,34 @@ class BuybackAuto(commands.Cog):
             except Exception:
                 continue
         return None
+
+    # ================= JANICE HELPERS =================
+
+    async def _janice_call(self, params: Dict[str, str], headers: Dict[str, str], text_payload: str) -> Tuple[int, str]:
+        async with self.session.post(
+            self.JANICE,
+            params=params,
+            data=text_payload.encode("utf-8"),
+            headers=headers
+        ) as jr:
+            return jr.status, await jr.text()
+
+    def _janice_snippet(self, body: str) -> str:
+        body = (body or "").strip()
+        if not body:
+            return "(empty response body)"
+        try:
+            pj = json.loads(body)
+            detail = pj.get("detail")
+            title = pj.get("title")
+            status = pj.get("status")
+            if detail:
+                s = f"{title or 'Error'} ({status}): {detail}"
+                return s[:900] + ("…" if len(s) > 900 else "")
+            j = json.dumps(pj)
+            return j[:900] + ("…" if len(j) > 900 else "")
+        except Exception:
+            return body[:900] + ("…" if len(body) > 900 else "")
 
     # ================= SLASH COMMANDS =================
 
@@ -643,25 +675,35 @@ class BuybackAuto(commands.Cog):
             "Accept": "application/json",
             "Content-Type": "text/plain",
             "User-Agent": "ARC-Buyback-Bot",
+            "X-ApiKey": self.JANICE_API_KEY,  # REQUIRED
         }
-        if self.JANICE_API_KEY:
-            j_headers["X-ApiKey"] = self.JANICE_API_KEY
 
-        async with self.session.post(
-            self.JANICE,
-            params=params,
-            data=raw_text.encode("utf-8"),
-            headers=j_headers
-        ) as jr:
-            janice_text = await jr.text()
-            status = jr.status
+        # Attempt #1: "ItemName qty"
+        status, janice_text = await self._janice_call(params, j_headers, raw_text)
+
+        # If 400, attempt #2: "qty ItemName"
+        if status == 400:
+            alt_lines: List[str] = []
+            for ln in janice_lines:
+                ln = (ln or "").strip()
+                if not ln:
+                    continue
+                parts = ln.rsplit(" ", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    alt_lines.append(f"{parts[1]} {parts[0]}")
+                else:
+                    alt_lines.append(ln)
+            alt_text = "\n".join(alt_lines)
+            status, janice_text = await self._janice_call(params, j_headers, alt_text)
 
         if status != 200:
-            snippet = (janice_text or "").strip() or "(empty response body)"
-            if len(snippet) > 900:
-                snippet = snippet[:900] + "…"
+            snippet = self._janice_snippet(janice_text)
+            payload_preview = "\n".join(raw_text.splitlines()[:10])
+            if len(payload_preview) > 400:
+                payload_preview = payload_preview[:400] + "…"
 
             print(f"[BUYBACK] Janice error for {cid}: {status}\n{snippet}")
+
             self.upsert_contract(
                 contract_id=cid,
                 issuer_char_id=issuer_char_id,
@@ -671,7 +713,7 @@ class BuybackAuto(commands.Cog):
                 total=0,
                 payout=0,
                 janice_http=status,
-                janice_snippet=snippet,
+                janice_snippet=f"{snippet}\n\nSent (preview):\n{payload_preview}",
             )
 
             ch = self.get_channel()
@@ -681,7 +723,7 @@ class BuybackAuto(commands.Cog):
                     description=(
                         f"Janice returned HTTP **{status}**.\n"
                         f"Saved as `JANICE_FAILED`.\n"
-                        f"Use `/buyback_retry {cid}` after Janice is healthy again."
+                        f"Use `/buyback_retry {cid}` after correcting the cause."
                     ),
                     color=discord.Color.red(),
                     timestamp=datetime.utcnow(),
@@ -690,6 +732,7 @@ class BuybackAuto(commands.Cog):
                 emb.add_field(name="Issuer (IGN)", value=issuer_name, inline=True)
                 emb.add_field(name="Discord", value=f"<@{discord_id}>" if discord_id else "Not found", inline=False)
                 emb.add_field(name="Janice response (snippet)", value=f"```{snippet}```", inline=False)
+                emb.add_field(name="Sent (preview)", value=f"```{payload_preview}```", inline=False)
                 await ch.send(embed=emb)
 
             return False
