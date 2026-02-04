@@ -3,7 +3,7 @@ import json
 import datetime
 import asyncio
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import aiohttp
 import discord
@@ -55,6 +55,10 @@ ESI_BASE = "https://esi.evetech.net/latest"
 def utcnow_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
 
+def panel_signature() -> str:
+    # Anything that changes the panel output should be included here
+    return f"{PANEL_EMBED_TEXT}|{PANEL_BUTTON_LABEL}|v1"
+
 def load_state() -> Dict[str, Any]:
     if not DATA_FILE.exists():
         return {
@@ -64,16 +68,12 @@ def load_state() -> Dict[str, Any]:
             "panels": {},
             # ESI helpers:
             "esi": {
-                "refresh_token": None,      # stored refresh token (rotates sometimes)
+                "refresh_token": None,
                 "access_token": None,
-                "access_expires_utc": None, # ISO
+                "access_expires_utc": None,
             },
-            "char_index": {
-                # "lower ign": {"character_id": 123, "name": "Exact Name", "updated_utc": "..."}
-            },
-            "corp_watch": {
-                # "character_id": {"in_corp": True/False/None, "last_change_utc": "...", "last_alerted_left_utc": "..."}
-            },
+            "char_index": {},
+            "corp_watch": {},
         }
     try:
         s = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -472,18 +472,28 @@ class IGNRegistrationCog(commands.Cog):
         )
 
     # -------------------------
-    # Panel management
+    # Panel management (reduced edits on restart)
     # -------------------------
 
     def get_panel_record(self, guild_id: int) -> Dict[str, Any]:
         panels = self.state.setdefault("panels", {})
-        return panels.setdefault(str(guild_id), {"channel_id": None, "message_id": None, "updated_utc": utcnow_iso()})
+        return panels.setdefault(
+            str(guild_id),
+            {
+                "channel_id": None,
+                "message_id": None,
+                "updated_utc": utcnow_iso(),
+                "panel_sig": None,  # <-- NEW: signature of current panel content
+            },
+        )
 
     async def ensure_register_panel_message(self, guild: discord.Guild) -> None:
         ch = await self.ensure_request_panel_channel(guild)
 
         rec = self.get_panel_record(guild.id)
         rec["channel_id"] = ch.id
+
+        sig = panel_signature()
 
         embed = discord.Embed(
             description=PANEL_EMBED_TEXT,
@@ -492,11 +502,17 @@ class IGNRegistrationCog(commands.Cog):
         embed.set_footer(text="Wormhole Access Registration")
 
         msg_id = rec.get("message_id")
+
+        # If we have a message id AND the signature matches, skip editing on restarts.
+        if msg_id and rec.get("panel_sig") == sig:
+            return
+
         if msg_id:
             try:
                 msg = await ch.fetch_message(int(msg_id))
                 await msg.edit(embed=embed, view=RegisterPanelView(self))
                 rec["updated_utc"] = utcnow_iso()
+                rec["panel_sig"] = sig
                 save_state(self.state)
                 return
             except Exception:
@@ -506,6 +522,7 @@ class IGNRegistrationCog(commands.Cog):
             msg = await ch.send(embed=embed, view=RegisterPanelView(self))
             rec["message_id"] = msg.id
             rec["updated_utc"] = utcnow_iso()
+            rec["panel_sig"] = sig
             save_state(self.state)
         except Exception:
             pass
