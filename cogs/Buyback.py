@@ -479,7 +479,6 @@ class BuybackAuto(commands.Cog):
                 status = r.status
                 hdrs = {k: v for k, v in r.headers.items()}
                 if status in (420, 429):
-                    # ESI rate limit
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2.0, 16.0)
                     continue
@@ -494,17 +493,12 @@ class BuybackAuto(commands.Cog):
         return 429, "Rate limit/backoff exhausted", {}
 
     async def _fetch_jita_buy_orders(self, type_id: int) -> List[Dict[str, Any]]:
-        """
-        Fetch all The Forge buy orders for a type and filter to Jita 4-4 location.
-        Cached for MARKET_CACHE_TTL seconds.
-        """
         now = time.time()
         cached = self._market_cache.get(type_id)
         if cached and (now - float(cached.get("ts", 0))) < self.MARKET_CACHE_TTL:
             return cached.get("orders", [])
 
         async with self._market_sem:
-            # Re-check after acquiring semaphore to reduce duplicate work.
             now = time.time()
             cached = self._market_cache.get(type_id)
             if cached and (now - float(cached.get("ts", 0))) < self.MARKET_CACHE_TTL:
@@ -524,12 +518,10 @@ class BuybackAuto(commands.Cog):
                 if not isinstance(data, list) or len(data) == 0:
                     break
 
-                # Filter to Jita 4-4
                 for o in data:
                     try:
                         if int(o.get("location_id", 0)) != int(self.JITA_4_4_LOCATION_ID):
                             continue
-                        # Only active buy orders with remaining volume
                         v_rem = int(o.get("volume_remain", 0))
                         if v_rem <= 0:
                             continue
@@ -537,7 +529,6 @@ class BuybackAuto(commands.Cog):
                     except Exception:
                         continue
 
-                # Pagination: ESI supplies X-Pages; otherwise break when empty page
                 try:
                     xpages = int(hdrs.get("X-Pages", "1"))
                 except Exception:
@@ -546,7 +537,6 @@ class BuybackAuto(commands.Cog):
                     break
                 page += 1
 
-            # Normalize and store only relevant fields
             norm: List[Dict[str, Any]] = []
             for o in all_orders:
                 try:
@@ -558,31 +548,20 @@ class BuybackAuto(commands.Cog):
                 except Exception:
                     continue
 
-            # Sort high->low price
             norm.sort(key=lambda x: x["price"], reverse=True)
 
             self._market_cache[type_id] = {"ts": time.time(), "orders": norm}
             return norm
 
     def _filter_orders_janice_like(self, orders: List[Dict[str, Any]], qty_needed: int) -> List[Dict[str, Any]]:
-        """
-        Best-effort “Janice-like” heuristics:
-          - ignore tiny volume orders (relative to needed qty)
-          - ignore outliers vs median of top-of-book sample
-        """
         if not orders:
             return []
 
         qty_needed = max(1, int(qty_needed))
-
-        # Relative “tiny order” threshold
-        # 1% of qty, capped at 1000, min 1
         tiny_threshold = max(1, min(1000, int(qty_needed * 0.01)))
 
         candidates = []
         for o in orders:
-            # Respect min_volume rule roughly (if remaining qty is smaller than min_volume, it won't fill anyway)
-            # Keep it, but it may be unusable for some fills.
             if int(o["vol"]) < tiny_threshold:
                 continue
             if float(o["price"]) <= 0:
@@ -590,10 +569,8 @@ class BuybackAuto(commands.Cog):
             candidates.append(o)
 
         if not candidates:
-            # If our filter removed everything, fall back to original book
             candidates = orders[:]
 
-        # Compute median from top-of-book snapshot
         sample = candidates[: self.TOP_BOOK_SAMPLE]
         med = self._median([float(o["price"]) for o in sample if float(o["price"]) > 0])
         if not med or med <= 0:
@@ -606,11 +583,6 @@ class BuybackAuto(commands.Cog):
         return filtered if filtered else candidates
 
     async def price_jita_buy_immediate(self, type_id: int, qty: int) -> Tuple[float, float, str]:
-        """
-        Returns (unit_effective_price, total_price, note)
-        “Immediate” means fill from highest buy orders downward, volume-weighted.
-        If insufficient liquidity: remainder priced at BEST price (top buy), per your request.
-        """
         qty = max(0, int(qty))
         if qty <= 0:
             return 0.0, 0.0, "qty<=0"
@@ -636,8 +608,6 @@ class BuybackAuto(commands.Cog):
 
             if price <= 0 or vol <= 0:
                 continue
-
-            # If remaining is less than min_volume, this order can't be used (ESI min_volume is per order)
             if remaining < minv:
                 continue
 
@@ -646,7 +616,6 @@ class BuybackAuto(commands.Cog):
             remaining -= take
             filled += take
 
-        # Remainder fallback: best price for remaining
         if remaining > 0 and best_price > 0:
             total += remaining * best_price
             filled += remaining
@@ -658,7 +627,7 @@ class BuybackAuto(commands.Cog):
 
     # ================= SLASH COMMANDS =================
 
-    @app_commands.command(name="buyback", description="Scan buyback contracts once (manual)")
+    @app_commands.command(name="buyback", description="Scan OUTSTANDING buyback contracts once (manual)")
     @app_commands.checks.has_role(APPROVER_ROLE)
     async def buyback_scan(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -673,7 +642,14 @@ class BuybackAuto(commands.Cog):
         retried = 0
         skipped = 0
 
+        # Track what we found so we can "always display" outstanding contracts
+        found_outstanding: List[Tuple[int, str]] = []  # (contract_id, db_status_or_NOT_IN_DB)
+
         for c in contracts:
+            # ✅ Only OUTSTANDING contracts
+            if (c.get("status") or "").strip().lower() != "outstanding":
+                continue
+
             try:
                 cid = int(c["contract_id"])
             except Exception:
@@ -686,7 +662,15 @@ class BuybackAuto(commands.Cog):
             if int(c.get("start_location_id", 0)) != self.AT1_STRUCTURE_ID:
                 continue
 
+            # Record for display
             row = self.get_contract_row(cid)
+            if row:
+                db_status = (row["status"] or "UNKNOWN")
+                found_outstanding.append((cid, db_status))
+            else:
+                found_outstanding.append((cid, "NOT_IN_DB"))
+
+            # Existing logic (but now only for outstanding)
             if row:
                 if self.should_retry_existing(row):
                     _ = await self.process_contract(c, force=True)
@@ -699,8 +683,29 @@ class BuybackAuto(commands.Cog):
             if ok:
                 new += 1
 
+        # ✅ Always display what outstanding contracts exist (that match your buyback rules)
+        if not found_outstanding:
+            await interaction.followup.send(
+                "✅ No **OUTSTANDING** buyback contracts found (matching type/assignee/location).",
+                ephemeral=True
+            )
+            return
+
+        # Sort newest-ish by contract id (usually increases over time)
+        found_outstanding.sort(key=lambda x: x[0], reverse=True)
+
+        lines = []
+        for cid, st in found_outstanding[:25]:  # show up to 25 in the ephemeral response
+            lines.append(f"{cid}  —  {st}")
+
+        more = ""
+        if len(found_outstanding) > 25:
+            more = f"\n… and {len(found_outstanding) - 25} more."
+
         await interaction.followup.send(
-            f"✅ Buyback scan complete — {new} new, {retried} retried failed, {skipped} skipped (already handled).",
+            "📌 **Outstanding Buyback Contracts (matching filters)**\n"
+            f"```{chr(10).join(lines)}{more}```\n"
+            f"✅ Scan complete — {new} new, {retried} retried failed, {skipped} skipped (already handled).",
             ephemeral=True
         )
 
@@ -810,13 +815,10 @@ class BuybackAuto(commands.Cog):
                 return False
             items = json.loads(text)
 
-        # Build display + compute pricing using ESI market
         display_lines: List[str] = []
         price_debug_lines: List[str] = []
-
         total = 0.0
 
-        # We’ll price each type as (qty * effective unit) using the book-fill function
         for it in items:
             qty = int(it.get("quantity", 0))
             type_id = int(it.get("type_id", 0))
@@ -824,8 +826,6 @@ class BuybackAuto(commands.Cog):
                 continue
 
             name = await self.type_name(type_id)
-
-            # Convert ores to compressed variant if available
             type_id, name = await self.maybe_convert_to_compressed(type_id, name)
 
             try:
@@ -914,7 +914,6 @@ class BuybackAuto(commands.Cog):
             janice_snippet=None,
         )
 
-        # Send embed
         channel = self.get_channel()
         if not channel:
             print("[BUYBACK] payout channel not found")
@@ -943,7 +942,6 @@ class BuybackAuto(commands.Cog):
             preview += f"\n… and {len(display_lines) - 15} more line(s)"
         emb.add_field(name="Items (preview)", value=f"```{preview}```", inline=False)
 
-        # Optional debug lines (comment out if you don't want)
         dbg = "\n".join(price_debug_lines[:10])
         if dbg:
             emb.add_field(name="Pricing notes (top 10)", value=f"```{dbg}```", inline=False)
