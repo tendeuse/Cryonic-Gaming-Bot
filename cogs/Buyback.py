@@ -8,25 +8,23 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-from discord.ui import View
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
 # =========================
-# PATHS
+# PATHS (Railway persistent volume)
 # =========================
-
 DATA = Path(os.getenv("PERSIST_ROOT", "/data"))
 DATA.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA / "buyback.db"
 IGN_FILE = DATA / "ign_registry.json"
 
+
 # =========================
 # OAUTH HELPER (refresh token -> access token)
 # =========================
-
 class EveOAuth:
     def __init__(self):
         self.client_id = os.getenv("EVE_CLIENT_ID")
@@ -34,7 +32,9 @@ class EveOAuth:
         self.refresh_token = os.getenv("EVE_REFRESH_TOKEN")
 
         if not self.client_id or not self.client_secret or not self.refresh_token:
-            raise RuntimeError("Missing EVE_CLIENT_ID / EVE_CLIENT_SECRET / EVE_REFRESH_TOKEN in environment variables.")
+            raise RuntimeError(
+                "Missing EVE_CLIENT_ID / EVE_CLIENT_SECRET / EVE_REFRESH_TOKEN in environment variables."
+            )
 
         self._access_token: Optional[str] = None
         self._expires_at: float = 0.0  # epoch seconds
@@ -52,12 +52,11 @@ class EveOAuth:
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
         }
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token,
-        }
+        data = {"grant_type": "refresh_token", "refresh_token": self.refresh_token}
 
-        async with session.post("https://login.eveonline.com/v2/oauth/token", headers=headers, data=data) as resp:
+        async with session.post(
+            "https://login.eveonline.com/v2/oauth/token", headers=headers, data=data
+        ) as resp:
             text = await resp.text()
             if resp.status != 200:
                 raise RuntimeError(f"OAuth refresh failed ({resp.status}): {text}")
@@ -71,7 +70,6 @@ class EveOAuth:
 # =========================
 # COG
 # =========================
-
 class BuybackAuto(commands.Cog):
     # ================= CONFIG =================
     CORP_ID = 98743131
@@ -84,24 +82,21 @@ class BuybackAuto(commands.Cog):
 
     ESI = "https://esi.evetech.net/latest"
 
+    # --- Contract pagination cutoff ---
+    CONTRACT_LOOKBACK_DAYS = 15  # stop paging once contracts are older than this many days
+
     # --- ESI MARKET PRICING (Janice-like) ---
-    # Jita 4-4 (Caldari Navy Assembly Plant) NPC station:
     JITA_4_4_LOCATION_ID = 60003760
     THE_FORGE_REGION_ID = 10000002
 
-    # Cache & rate-limit controls
     MARKET_CACHE_TTL = 600  # seconds
     MARKET_CONCURRENCY = 6
 
-    # “Similar rules to Janice” (best-effort heuristic filtering):
-    # - Ignore tiny-volume “bait” orders (relative to needed qty)
-    # - Ignore extreme outliers vs median of top-of-book snapshot
-    OUTLIER_LOW_FACTOR = 0.70     # drop prices < median * 0.70
-    OUTLIER_HIGH_FACTOR = 1.50    # drop prices > median * 1.50 (rare, but anti-spike)
-    TOP_BOOK_SAMPLE = 30          # how many top orders to sample for median/outliers
+    OUTLIER_LOW_FACTOR = 0.70
+    OUTLIER_HIGH_FACTOR = 1.50
+    TOP_BOOK_SAMPLE = 30
     # ----------------------------------------
 
-    # retryable statuses
     RETRYABLE_STATUSES = {
         "ESI_PRICE_FAILED",
         "ITEMS_FAILED",
@@ -135,18 +130,11 @@ class BuybackAuto(commands.Cog):
             pass
 
     # ================= DB =================
-
     def _table_columns(self, table: str) -> List[str]:
         rows = self.db.execute(f"PRAGMA table_info({table})").fetchall()
         return [r["name"] for r in rows]
 
     def _migrate_contracts_if_needed(self) -> None:
-        """
-        Target columns:
-          (contract_id, issuer_char_id, issuer_name, discord_id, status, total, payout, ts, janice_http, janice_snippet)
-        NOTE: We keep janice_http/janice_snippet fields for backwards compatibility.
-              We'll store ESI pricing failures in janice_snippet.
-        """
         existing = self.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'"
         ).fetchone()
@@ -240,7 +228,6 @@ class BuybackAuto(commands.Cog):
         )
         """)
 
-        # cache mapping original ore type_id -> compressed type_id + name (best-effort)
         self.db.execute("""
         CREATE TABLE IF NOT EXISTS compress_cache (
             original_type_id INTEGER PRIMARY KEY,
@@ -248,7 +235,6 @@ class BuybackAuto(commands.Cog):
             compressed_name TEXT
         )
         """)
-
         self.db.commit()
 
     def upsert_contract(
@@ -298,7 +284,6 @@ class BuybackAuto(commands.Cog):
         return status in self.RETRYABLE_STATUSES
 
     # ================= HELPERS =================
-
     async def esi_headers(self) -> Dict[str, str]:
         token = await self.oauth.get_access_token(self.session)
         return {
@@ -336,9 +321,6 @@ class BuybackAuto(commands.Cog):
         return name
 
     async def _resolve_type_id_by_name(self, name: str) -> Optional[int]:
-        """
-        ESI /universe/ids/ resolves names to IDs; we use it to find 'Compressed {name}'
-        """
         if not name:
             return None
         url = f"{self.ESI}/universe/ids/"
@@ -358,10 +340,6 @@ class BuybackAuto(commands.Cog):
         return None
 
     async def maybe_convert_to_compressed(self, type_id: int, name: str) -> Tuple[int, str]:
-        """
-        If 'Compressed {name}' exists as a type, convert to it.
-        Otherwise return original. Cached.
-        """
         if not type_id or not name:
             return type_id, name
         if name.startswith("Compressed "):
@@ -429,16 +407,91 @@ class BuybackAuto(commands.Cog):
                 return ch
         return None
 
+    @staticmethod
+    def _parse_esi_dt(s: Optional[str]) -> Optional[datetime]:
+        """
+        ESI timestamps are ISO8601, typically ending with 'Z'.
+        Returns timezone-aware UTC datetime when possible.
+        """
+        if not s:
+            return None
+        try:
+            ss = s.strip()
+            if ss.endswith("Z"):
+                ss = ss[:-1] + "+00:00"
+            dt = datetime.fromisoformat(ss)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    # ================= ESI CONTRACTS (PAGINATED) =================
     async def fetch_corp_contracts(self) -> List[Dict[str, Any]]:
+        """
+        Corp contracts endpoint is PAGINATED.
+
+        Added behavior:
+        - Stop paging once we reach contracts older than CONTRACT_LOOKBACK_DAYS (based on `date_issued`).
+        - We still include any contracts on the current page that are within the lookback window.
+        """
         headers = await self.esi_headers()
-        async with self.session.get(
-            f"{self.ESI}/corporations/{self.CORP_ID}/contracts/",
-            headers=headers
-        ) as r:
-            body = await r.text()
-            if r.status != 200:
-                raise RuntimeError(f"ESI error {r.status}: {body[:1200]}")
-            return json.loads(body)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(self.CONTRACT_LOOKBACK_DAYS))
+
+        all_contracts: List[Dict[str, Any]] = []
+        page = 1
+
+        while True:
+            async with self.session.get(
+                f"{self.ESI}/corporations/{self.CORP_ID}/contracts/",
+                headers=headers,
+                params={"page": page},
+            ) as r:
+                body = await r.text()
+                if r.status != 200:
+                    raise RuntimeError(f"ESI error {r.status} (page {page}): {body[:1200]}")
+
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    raise RuntimeError(f"ESI returned non-JSON (page {page}): {body[:400]}")
+
+                if not isinstance(data, list) or len(data) == 0:
+                    break
+
+                # Keep only contracts within the lookback window, but use "older encountered" to stop paging.
+                older_encountered = False
+                for c in data:
+                    dt = self._parse_esi_dt(c.get("date_issued"))
+                    if dt is None:
+                        # If we can't parse date, keep it (safer) and don't use it to stop paging.
+                        all_contracts.append(c)
+                        continue
+
+                    if dt < cutoff:
+                        older_encountered = True
+                        # Do not include old contracts (beyond lookback)
+                        continue
+
+                    all_contracts.append(c)
+
+                # If this page contained any contracts older than cutoff, and ESI is sorted newest->oldest,
+                # then subsequent pages will be even older: stop paging now.
+                if older_encountered:
+                    break
+
+                try:
+                    x_pages = int(r.headers.get("X-Pages", "1"))
+                except Exception:
+                    x_pages = 1
+
+                if page >= x_pages:
+                    break
+
+                page += 1
+
+        return all_contracts
 
     async def find_contract_in_esi(self, contract_id: int) -> Optional[Dict[str, Any]]:
         try:
@@ -456,7 +509,6 @@ class BuybackAuto(commands.Cog):
         return None
 
     # ================= MARKET PRICING (ESI) =================
-
     @staticmethod
     def _median(nums: List[float]) -> Optional[float]:
         if not nums:
@@ -469,13 +521,13 @@ class BuybackAuto(commands.Cog):
         return (float(s[mid - 1]) + float(s[mid])) / 2.0
 
     async def _esi_get_json_with_backoff(self, url: str, params: Dict[str, Any]) -> Tuple[int, Any, Dict[str, str]]:
-        """
-        Returns (status, json_or_text, headers)
-        Handles 420/429 with backoff.
-        """
         backoff = 1.0
-        for attempt in range(6):
-            async with self.session.get(url, params=params, headers={"Accept": "application/json", "User-Agent": "ARC-Buyback-Bot"}) as r:
+        for _ in range(6):
+            async with self.session.get(
+                url,
+                params=params,
+                headers={"Accept": "application/json", "User-Agent": "ARC-Buyback-Bot"},
+            ) as r:
                 status = r.status
                 hdrs = {k: v for k, v in r.headers.items()}
                 if status in (420, 429):
@@ -549,7 +601,6 @@ class BuybackAuto(commands.Cog):
                     continue
 
             norm.sort(key=lambda x: x["price"], reverse=True)
-
             self._market_cache[type_id] = {"ts": time.time(), "orders": norm}
             return norm
 
@@ -562,9 +613,9 @@ class BuybackAuto(commands.Cog):
 
         candidates = []
         for o in orders:
-            if int(o["vol"]) < tiny_threshold:
+            if int(o.get("vol", 0)) < tiny_threshold:
                 continue
-            if float(o["price"]) <= 0:
+            if float(o.get("price", 0.0)) <= 0:
                 continue
             candidates.append(o)
 
@@ -572,13 +623,12 @@ class BuybackAuto(commands.Cog):
             candidates = orders[:]
 
         sample = candidates[: self.TOP_BOOK_SAMPLE]
-        med = self._median([float(o["price"]) for o in sample if float(o["price"]) > 0])
+        med = self._median([float(o["price"]) for o in sample if float(o.get("price", 0)) > 0])
         if not med or med <= 0:
             return candidates
 
         low_cut = med * float(self.OUTLIER_LOW_FACTOR)
         high_cut = med * float(self.OUTLIER_HIGH_FACTOR)
-
         filtered = [o for o in candidates if (low_cut <= float(o["price"]) <= high_cut)]
         return filtered if filtered else candidates
 
@@ -626,7 +676,6 @@ class BuybackAuto(commands.Cog):
         return unit_eff, total, note
 
     # ================= SLASH COMMANDS =================
-
     @app_commands.command(name="buyback", description="Scan OUTSTANDING buyback contracts once (manual)")
     @app_commands.checks.has_role(APPROVER_ROLE)
     async def buyback_scan(self, interaction: discord.Interaction):
@@ -642,35 +691,60 @@ class BuybackAuto(commands.Cog):
         retried = 0
         skipped = 0
 
-        # Track what we found so we can "always display" outstanding contracts
-        found_outstanding: List[Tuple[int, str]] = []  # (contract_id, db_status_or_NOT_IN_DB)
+        found_outstanding: List[Tuple[int, str]] = []
+
+        # Diagnostics (helpful if filters fail again)
+        diag = {
+            "total_returned": len(contracts),
+            "status_outstanding": 0,
+            "type_item_exchange": 0,
+            "assignee_match": 0,
+            "start_location_match": 0,
+        }
+
+        sample_activeish: List[str] = []
 
         for c in contracts:
-            # ✅ Only OUTSTANDING contracts
-            if (c.get("status") or "").strip().lower() != "outstanding":
+            status = (c.get("status") or "").strip().lower()
+            ctype = (c.get("type") or "").strip().lower()
+
+            if len(sample_activeish) < 12 and status in ("outstanding", "in_progress"):
+                try:
+                    sample_activeish.append(
+                        f"{int(c.get('contract_id', 0))} | status={status} | type={ctype} | "
+                        f"assignee={int(c.get('assignee_id', 0))} | start_loc={int(c.get('start_location_id', 0))}"
+                    )
+                except Exception:
+                    pass
+
+            if status != "outstanding":
                 continue
+            diag["status_outstanding"] += 1
 
             try:
                 cid = int(c["contract_id"])
             except Exception:
                 continue
 
-            if c.get("type") != "item_exchange":
+            if ctype != "item_exchange":
                 continue
-            if int(c.get("assignee_id", 0)) != self.BUYBACK_CHARACTER_ID:
-                continue
-            if int(c.get("start_location_id", 0)) != self.AT1_STRUCTURE_ID:
-                continue
+            diag["type_item_exchange"] += 1
 
-            # Record for display
+            if int(c.get("assignee_id", 0)) != int(self.BUYBACK_CHARACTER_ID):
+                continue
+            diag["assignee_match"] += 1
+
+            if int(c.get("start_location_id", 0)) != int(self.AT1_STRUCTURE_ID):
+                continue
+            diag["start_location_match"] += 1
+
             row = self.get_contract_row(cid)
             if row:
-                db_status = (row["status"] or "UNKNOWN")
-                found_outstanding.append((cid, db_status))
+                found_outstanding.append((cid, (row["status"] or "UNKNOWN")))
             else:
                 found_outstanding.append((cid, "NOT_IN_DB"))
 
-            # Existing logic (but now only for outstanding)
+            # process new or retryable
             if row:
                 if self.should_retry_existing(row):
                     _ = await self.process_contract(c, force=True)
@@ -683,24 +757,29 @@ class BuybackAuto(commands.Cog):
             if ok:
                 new += 1
 
-        # ✅ Always display what outstanding contracts exist (that match your buyback rules)
         if not found_outstanding:
-            await interaction.followup.send(
-                "✅ No **OUTSTANDING** buyback contracts found (matching type/assignee/location).",
-                ephemeral=True
+            msg = (
+                "✅ No **OUTSTANDING** buyback contracts found (matching type/assignee/location).\n\n"
+                "**Diagnostics:**\n"
+                f"- Total contracts returned (≤{self.CONTRACT_LOOKBACK_DAYS}d lookback): `{diag['total_returned']}`\n"
+                f"- Status outstanding: `{diag['status_outstanding']}`\n"
+                f"- Outstanding + item_exchange: `{diag['type_item_exchange']}`\n"
+                f"- + assignee match ({self.BUYBACK_CHARACTER_ID}): `{diag['assignee_match']}`\n"
+                f"- + start_location match ({self.AT1_STRUCTURE_ID}): `{diag['start_location_match']}`\n\n"
+                "**Sample (active-ish contracts ESI returned):**\n"
             )
+            if sample_activeish:
+                msg += "```" + "\n".join(sample_activeish) + "```"
+            else:
+                msg += "_No outstanding/in_progress sample contracts were returned by ESI._"
+
+            await interaction.followup.send(msg, ephemeral=True)
             return
 
-        # Sort newest-ish by contract id (usually increases over time)
         found_outstanding.sort(key=lambda x: x[0], reverse=True)
 
-        lines = []
-        for cid, st in found_outstanding[:25]:  # show up to 25 in the ephemeral response
-            lines.append(f"{cid}  —  {st}")
-
-        more = ""
-        if len(found_outstanding) > 25:
-            more = f"\n… and {len(found_outstanding) - 25} more."
+        lines = [f"{cid}  —  {st}" for cid, st in found_outstanding[:25]]
+        more = f"\n… and {len(found_outstanding) - 25} more." if len(found_outstanding) > 25 else ""
 
         await interaction.followup.send(
             "📌 **Outstanding Buyback Contracts (matching filters)**\n"
@@ -738,10 +817,7 @@ class BuybackAuto(commands.Cog):
     async def buyback_retry_failed(self, interaction: discord.Interaction, limit: int = 10):
         await interaction.response.defer(ephemeral=True)
 
-        if limit < 1:
-            limit = 1
-        if limit > 50:
-            limit = 50
+        limit = max(1, min(50, int(limit)))
 
         rows = self.db.execute(
             """
@@ -780,7 +856,6 @@ class BuybackAuto(commands.Cog):
         )
 
     # ================= PROCESS =================
-
     async def process_contract(self, c: Dict[str, Any], force: bool = False) -> bool:
         cid = int(c["contract_id"])
 
@@ -813,7 +888,11 @@ class BuybackAuto(commands.Cog):
                     janice_snippet=f"ESI items HTTP {r.status}: {text[:900]}",
                 )
                 return False
-            items = json.loads(text)
+
+            try:
+                items = json.loads(text)
+            except Exception:
+                items = []
 
         display_lines: List[str] = []
         price_debug_lines: List[str] = []
@@ -833,6 +912,7 @@ class BuybackAuto(commands.Cog):
             except Exception as e:
                 msg = f"Pricing failed for {name} (type_id={type_id}) qty={qty}: {e}"
                 print(f"[BUYBACK] {msg}")
+
                 self.upsert_contract(
                     contract_id=cid,
                     issuer_char_id=issuer_char_id,
@@ -851,7 +931,7 @@ class BuybackAuto(commands.Cog):
                         title="❌ Buyback Contract — Pricing Failed",
                         description=(
                             "ESI market pricing failed while calculating Jita 4-4 buy.\n"
-                            f"Saved as `ESI_PRICE_FAILED`.\n"
+                            "Saved as `ESI_PRICE_FAILED`.\n"
                             f"Use `/buyback_retry {cid}` after ESI recovers."
                         ),
                         color=discord.Color.red(),
@@ -882,26 +962,13 @@ class BuybackAuto(commands.Cog):
                 total=0,
                 payout=0,
                 janice_http=None,
-                janice_snippet="No valid items after filtering (qty/type_id).",
+                janice_snippet="No valid items returned by ESI items endpoint.",
             )
             return False
 
-        if total <= 0:
-            self.upsert_contract(
-                contract_id=cid,
-                issuer_char_id=issuer_char_id,
-                issuer_name=issuer_name,
-                discord_id=discord_id,
-                status="ESI_PRICE_NO_ORDERS",
-                total=0,
-                payout=0,
-                janice_http=None,
-                janice_snippet="Total priced to 0 (no usable Jita 4-4 buy liquidity found for all items).",
-            )
-            return False
+        payout = total * float(self.BUYBACK_RATE)
 
-        payout = total * self.BUYBACK_RATE
-
+        # Record success
         self.upsert_contract(
             contract_id=cid,
             issuer_char_id=issuer_char_id,
@@ -910,95 +977,30 @@ class BuybackAuto(commands.Cog):
             status="PRICED",
             total=total,
             payout=payout,
-            janice_http=200,
+            janice_http=None,
             janice_snippet=None,
         )
 
-        channel = self.get_channel()
-        if not channel:
-            print("[BUYBACK] payout channel not found")
-            return False
+        # Send payout embed
+        ch = self.get_channel()
+        if ch:
+            emb = discord.Embed(
+                title="✅ Buyback Contract — Priced",
+                description="Contract priced using ESI Jita 4-4 buy orders.",
+                color=discord.Color.green(),
+                timestamp=datetime.utcnow(),
+            )
+            emb.add_field(name="Contract ID", value=str(cid), inline=True)
+            emb.add_field(name="Issuer (IGN)", value=issuer_name, inline=True)
+            emb.add_field(name="Discord", value=f"<@{discord_id}>" if discord_id else "Not found", inline=False)
+            emb.add_field(name="Items", value="```" + "\n".join(display_lines)[:1000] + "```", inline=False)
+            emb.add_field(name="Total (Jita Buy)", value=f"{total:,.2f} ISK", inline=True)
+            emb.add_field(name=f"Payout ({int(self.BUYBACK_RATE*100)}%)", value=f"{payout:,.2f} ISK", inline=True)
+            emb.add_field(name="Price Notes", value="```" + "\n".join(price_debug_lines)[:1000] + "```", inline=False)
+            await ch.send(embed=emb)
 
-        ping = f"<@{discord_id}>" if discord_id else "Not found"
-
-        emb = discord.Embed(
-            title="📦 Buyback Contract — Pending",
-            color=discord.Color.orange(),
-            timestamp=datetime.utcnow(),
-            description=(
-                "Priced at **Jita 4-4 Buy (Immediate)** using ESI market orders (Janice-like).\n"
-                "If liquidity was insufficient, remainder was priced at the **best** buy price.\n"
-                "Payout is **80%**."
-            ),
-        )
-        emb.add_field(name="Contract ID", value=str(cid), inline=True)
-        emb.add_field(name="IGN (pay this character)", value=issuer_name, inline=True)
-        emb.add_field(name="Discord", value=ping, inline=False)
-        emb.add_field(name="Jita Buy Total", value=f"{total:,.0f} ISK", inline=True)
-        emb.add_field(name="80% Payout", value=f"{payout:,.0f} ISK", inline=True)
-
-        preview = "\n".join(display_lines[:15])
-        if len(display_lines) > 15:
-            preview += f"\n… and {len(display_lines) - 15} more line(s)"
-        emb.add_field(name="Items (preview)", value=f"```{preview}```", inline=False)
-
-        dbg = "\n".join(price_debug_lines[:10])
-        if dbg:
-            emb.add_field(name="Pricing notes (top 10)", value=f"```{dbg}```", inline=False)
-
-        await channel.send(embed=emb, view=ApprovalView(self, cid))
         return True
 
-
-# =========================
-# APPROVAL VIEW
-# =========================
-
-class ApprovalView(View):
-    def __init__(self, cog: BuybackAuto, cid: int):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.cid = cid
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not isinstance(interaction.user, discord.Member):
-            return False
-        return any(r.name == self.cog.APPROVER_ROLE for r in interaction.user.roles)
-
-    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
-    async def approve(self, interaction: discord.Interaction, _):
-        self.cog.db.execute(
-            "UPDATE contracts SET status='APPROVED' WHERE contract_id=?",
-            (self.cid,)
-        )
-        self.cog.db.commit()
-        await interaction.response.send_message(
-            "✅ Approved. Pay ISK in-game, then click **Paid**.",
-            ephemeral=True
-        )
-
-    @discord.ui.button(label="Paid", style=discord.ButtonStyle.primary)
-    async def paid(self, interaction: discord.Interaction, _):
-        self.cog.db.execute(
-            "UPDATE contracts SET status='PAID' WHERE contract_id=?",
-            (self.cid,)
-        )
-        self.cog.db.commit()
-        await interaction.response.send_message("💰 Marked as PAID.", ephemeral=True)
-
-    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger)
-    async def reject(self, interaction: discord.Interaction, _):
-        self.cog.db.execute(
-            "UPDATE contracts SET status='REJECTED' WHERE contract_id=?",
-            (self.cid,)
-        )
-        self.cog.db.commit()
-        await interaction.response.send_message("❌ Rejected.", ephemeral=True)
-
-
-# =========================
-# SETUP
-# =========================
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(BuybackAuto(bot))
