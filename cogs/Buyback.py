@@ -4,12 +4,13 @@ import asyncio
 import time
 import json
 import sqlite3
-from dataclasses import dataclass
+import datetime
+import re
 from typing import Dict, List, Optional, Tuple, Any
 
 import aiohttp
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 from pathlib import Path
 
@@ -25,35 +26,39 @@ IGN_REGISTRY_PATH = PERSIST_ROOT / "ign_registry.json"
 EVE_CLIENT_ID = os.getenv("EVE_CLIENT_ID", "")
 EVE_CLIENT_SECRET = os.getenv("EVE_CLIENT_SECRET", "")
 EVE_REFRESH_TOKEN = os.getenv("EVE_REFRESH_TOKEN", "")
-EVE_CHARACTER_ID = int(os.getenv("EVE_CHARACTER_ID", "0"))
+EVE_CHARACTER_ID = int(os.getenv("EVE_CHARACTER_ID", "0"))  # character used to read contracts
 
-# Filters (buyback rules)
+# Filters (your buyback rules)
 BUYBACK_ASSIGNEE_ID = int(os.getenv("BUYBACK_ASSIGNEE_ID", "2122848297"))
 BUYBACK_START_LOCATION_ID = int(os.getenv("BUYBACK_START_LOCATION_ID", "1048840990158"))
 BUYBACK_TYPE = os.getenv("BUYBACK_TYPE", "item_exchange")
 BUYBACK_STATUS = os.getenv("BUYBACK_STATUS", "outstanding")
 
 # Pricing
-JITA_REGION_ID = int(os.getenv("JITA_REGION_ID", "10000002"))
-JITA_LOCATION_ID = int(os.getenv("JITA_LOCATION_ID", "60003760"))
-PAYOUT_MULTIPLIER = float(os.getenv("PAYOUT_MULTIPLIER", "0.8"))
+JITA_REGION_ID = int(os.getenv("JITA_REGION_ID", "10000002"))     # The Forge
+JITA_LOCATION_ID = int(os.getenv("JITA_LOCATION_ID", "60003760")) # Jita 4-4
+PAYOUT_MULTIPLIER = float(os.getenv("PAYOUT_MULTIPLIER", "0.8"))  # 80%
 
 # Discord output
 BUYBACK_CHANNEL_NAME = os.getenv("BUYBACK_CHANNEL_NAME", "buyback-payout")
-SCAN_INTERVAL_SECONDS = int(os.getenv("BUYBACK_SCAN_INTERVAL", "300"))
-BUYBACK_AUTO_SCAN = os.getenv("BUYBACK_AUTO_SCAN", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Optional: safety limit (0 = unlimited).
+MAX_POST_PER_RUN = int(os.getenv("BUYBACK_MAX_POST_PER_RUN", "0"))
+
+# Role allowed to mark paid
+PAID_BUTTON_ROLE_NAME = "ARC Security Corporation Leader"
 
 # ESI
 ESI_BASE = "https://esi.evetech.net/latest"
 ESI_UA = os.getenv("ESI_USER_AGENT", "ARC Buyback Bot (discord)")
 
-# Caches
+# Local caches
 TYPE_CACHE_TTL = 24 * 3600
 PRICE_CACHE_TTL = 15 * 60
 CHAR_NAME_CACHE_TTL = 24 * 3600
 
 # =========================
-# ORE -> COMPRESSED
+# ORE -> COMPRESSED (name-based)
 # =========================
 ORE_TO_COMPRESSED_NAME: Dict[str, str] = {
     "Veldspar": "Compressed Veldspar",
@@ -107,20 +112,10 @@ ORE_TO_COMPRESSED_NAME: Dict[str, str] = {
 }
 
 # =========================
-# DB
+# DB (caching + paid status)
 # =========================
 def db_connect():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS processed_contracts (
-            contract_id INTEGER PRIMARY KEY,
-            processed_at INTEGER NOT NULL,
-            total_payout REAL NOT NULL,
-            payload_json TEXT NOT NULL
-        )
-        """
-    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS type_cache (
@@ -148,7 +143,51 @@ def db_connect():
         )
         """
     )
+    # Paid status persistence
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS buyback_paid (
+            contract_id INTEGER PRIMARY KEY,
+            paid_at INTEGER NOT NULL,
+            paid_by_discord_id INTEGER NOT NULL,
+            paid_by_tag TEXT NOT NULL
+        )
+        """
+    )
     return conn
+
+def _utc_iso(ts: int) -> str:
+    return datetime.datetime.utcfromtimestamp(ts).replace(tzinfo=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+def get_paid_status(contract_id: int) -> Optional[dict]:
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "SELECT paid_at, paid_by_discord_id, paid_by_tag FROM buyback_paid WHERE contract_id=?",
+            (int(contract_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        paid_at, paid_by_id, paid_by_tag = row
+        return {
+            "paid_at": int(paid_at),
+            "paid_by_discord_id": int(paid_by_id),
+            "paid_by_tag": str(paid_by_tag),
+        }
+    finally:
+        conn.close()
+
+def mark_paid(contract_id: int, paid_by_id: int, paid_by_tag: str) -> None:
+    conn = db_connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO buyback_paid(contract_id, paid_at, paid_by_discord_id, paid_by_tag) VALUES(?,?,?,?)",
+            (int(contract_id), int(time.time()), int(paid_by_id), str(paid_by_tag)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 # =========================
 # OAUTH
@@ -175,15 +214,8 @@ class EveOAuth:
 # ESI CLIENT
 # =========================
 class EsiClient:
-    def __init__(self, oauth: EveOAuth):
-        self.oauth = oauth
-
     async def _get(self, session: aiohttp.ClientSession, url: str, token: str, params: Optional[dict] = None):
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": ESI_UA,
-        }
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ESI_UA}
         async with session.get(url, headers=headers, params=params) as resp:
             text = await resp.text()
             if resp.status != 200:
@@ -200,6 +232,7 @@ class EsiClient:
                 raise RuntimeError("Unexpected contracts payload (not a list).")
             if not data:
                 break
+
             all_rows.extend(data)
 
             x_pages = headers.get("X-Pages")
@@ -209,13 +242,14 @@ class EsiClient:
                         break
                 except ValueError:
                     pass
+
             page += 1
             await asyncio.sleep(0.05)
         return all_rows
 
     async def get_character_contract_items(self, session: aiohttp.ClientSession, token: str, contract_id: int) -> List[dict]:
         url = f"{ESI_BASE}/characters/{EVE_CHARACTER_ID}/contracts/{contract_id}/items/"
-        data, _headers = await self._get(session, url, token)
+        data, _ = await self._get(session, url, token)
         if not isinstance(data, list):
             raise RuntimeError("Unexpected contract items payload (not a list).")
         return data
@@ -235,7 +269,7 @@ class EsiClient:
 
         conn.execute("INSERT OR REPLACE INTO type_cache(type_id, name, cached_at) VALUES(?,?,?)", (type_id, name, now))
         conn.commit()
-        return name
+        return str(name)
 
     async def get_character_name(self, session: aiohttp.ClientSession, token: str, conn: sqlite3.Connection, character_id: int) -> str:
         now = int(time.time())
@@ -294,25 +328,128 @@ class EsiClient:
         return float(best)
 
 # =========================
-# MAIN COG
+# UI: Paid button (persistent via DynamicItem)
+# =========================
+class PaidButton(discord.ui.DynamicItem[discord.ui.Button], template=r"buyback:paid:(?P<cid>\d+)"):
+    def __init__(self, contract_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Paid ✅",
+                style=discord.ButtonStyle.success,
+                custom_id=f"buyback:paid:{int(contract_id)}",
+            )
+        )
+        self.contract_id = int(contract_id)
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
+        cid = int(match.group("cid"))
+        return cls(cid)
+
+    async def callback(self, interaction: discord.Interaction):
+        # Gate by role
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ This must be used in a server.", ephemeral=True)
+            return
+
+        if not any(r.name == PAID_BUTTON_ROLE_NAME for r in interaction.user.roles):
+            await interaction.response.send_message(
+                f"❌ Only **{PAID_BUTTON_ROLE_NAME}** can mark contracts as paid.",
+                ephemeral=True,
+            )
+            return
+
+        # Already paid?
+        existing = get_paid_status(self.contract_id)
+        if existing:
+            await interaction.response.send_message(
+                f"⚠️ Contract `{self.contract_id}` is already marked PAID (by `{existing['paid_by_tag']}` at `{_utc_iso(existing['paid_at'])}`).",
+                ephemeral=True,
+            )
+            return
+
+        # Mark paid in DB
+        mark_paid(self.contract_id, interaction.user.id, str(interaction.user))
+
+        # Update embed status on that message + disable the button
+        msg = interaction.message
+        if not msg or not msg.embeds:
+            await interaction.response.send_message("✅ Marked as PAID. (Could not edit message embed.)", ephemeral=True)
+            return
+
+        emb = msg.embeds[0]
+
+        paid = get_paid_status(self.contract_id)
+        paid_line = f"**PAID** ✅\nBy: <@{paid['paid_by_discord_id']}> (`{paid['paid_by_tag']}`)\nAt: `{_utc_iso(paid['paid_at'])}`"
+
+        # Replace or add Status field
+        updated_fields = []
+        replaced = False
+        for f in emb.fields:
+            if f.name.strip().lower() == "status":
+                updated_fields.append(discord.EmbedField(name="Status", value=paid_line, inline=False))
+                replaced = True
+            else:
+                updated_fields.append(f)
+
+        new_emb = discord.Embed(
+            title=emb.title,
+            description=emb.description,
+            color=emb.color,
+            timestamp=emb.timestamp,
+        )
+        new_emb.set_footer(text=emb.footer.text if emb.footer else discord.Embed.Empty)
+
+        for f in updated_fields:
+            new_emb.add_field(name=f.name, value=f.value, inline=f.inline)
+
+        if not replaced:
+            new_emb.add_field(name="Status", value=paid_line, inline=False)
+
+        # Disable button in the view
+        view = BuybackPaidView(self.contract_id, disabled=True)
+
+        try:
+            await interaction.response.edit_message(embed=new_emb, view=view)
+        except Exception:
+            # If edit_message fails, at least ack
+            if not interaction.response.is_done():
+                await interaction.response.send_message("✅ Marked as PAID.", ephemeral=True)
+
+class BuybackPaidView(discord.ui.View):
+    def __init__(self, contract_id: int, *, disabled: bool = False):
+        super().__init__(timeout=None)
+        btn = PaidButton(int(contract_id))
+        if disabled:
+            btn.item.disabled = True
+        self.add_item(btn)
+
+# =========================
+# COG
 # =========================
 class BuybackContracts(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.oauth = EveOAuth()
-        self.esi = EsiClient(self.oauth)
+        self.esi = EsiClient()
         self._lock = asyncio.Lock()
 
-        if BUYBACK_AUTO_SCAN:
-            self.scan_loop.start()
+        # Register the dynamic item so old buttons keep working after restart
+        bot.add_dynamic_items(PaidButton)
 
-    def cog_unload(self):
-        if self.scan_loop.is_running():
-            self.scan_loop.cancel()
+    # -------------------------
+    # Discord channel
+    # -------------------------
+    async def _get_target_channel(self) -> Optional[discord.TextChannel]:
+        for g in self.bot.guilds:
+            ch = discord.utils.get(g.text_channels, name=BUYBACK_CHANNEL_NAME)
+            if ch:
+                return ch
+        return None
 
-    async def _get_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        return discord.utils.get(guild.text_channels, name=BUYBACK_CHANNEL_NAME)
-
+    # -------------------------
+    # Filters
+    # -------------------------
     def _contract_matches(self, row: dict) -> bool:
         try:
             return (
@@ -328,7 +465,7 @@ class BuybackContracts(commands.Cog):
         return ORE_TO_COMPRESSED_NAME.get(name, name)
 
     # -------------------------
-    # IGN registry lookup
+    # IGN Registry lookup (issuer_id -> discord user)
     # -------------------------
     def _load_ign_registry_state(self) -> Dict[str, Any]:
         try:
@@ -340,7 +477,7 @@ class BuybackContracts(commands.Cog):
 
     def _discord_user_id_for_character_id(self, character_id: int) -> Optional[int]:
         state = self._load_ign_registry_state()
-        users = (state.get("users") or {})
+        users = state.get("users") or {}
         for uid_str, rec in users.items():
             try:
                 uid = int(uid_str)
@@ -350,28 +487,6 @@ class BuybackContracts(commands.Cog):
             if any(isinstance(x, int) and x == character_id for x in cids):
                 return uid
         return None
-
-    # -------------------------
-    # Processed tracking
-    # -------------------------
-    async def _already_processed(self, contract_id: int) -> bool:
-        conn = db_connect()
-        try:
-            cur = conn.execute("SELECT 1 FROM processed_contracts WHERE contract_id=?", (contract_id,))
-            return cur.fetchone() is not None
-        finally:
-            conn.close()
-
-    async def _mark_processed(self, contract_id: int, payload: dict, total: float):
-        conn = db_connect()
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO processed_contracts(contract_id, processed_at, total_payout, payload_json) VALUES(?,?,?,?)",
-                (contract_id, int(time.time()), float(total), json.dumps(payload)),
-            )
-            conn.commit()
-        finally:
-            conn.close()
 
     # -------------------------
     # Appraisal
@@ -392,6 +507,7 @@ class BuybackContracts(commands.Cog):
                 name = await self.esi.get_type_name(session, token, conn, type_id)
                 priced_name = self._compress_if_ore_name(name)
 
+                # If we converted name->compressed, resolve compressed type_id for pricing
                 price_type_id = type_id
                 if priced_name != name:
                     ids_url = f"{ESI_BASE}/universe/ids/"
@@ -439,13 +555,25 @@ class BuybackContracts(commands.Cog):
         issuer_id: int,
         issuer_name: str,
         discord_user_id: Optional[int],
-    ):
+    ) -> None:
         cid = payload["contract_id"]
         total = payload["total"]
         mult = payload["multiplier"]
 
         mention = f"<@{discord_user_id}>" if discord_user_id else None
         issuer_line = f"**{issuer_name}** (`{issuer_id}`)" + (f" — {mention}" if mention else "")
+
+        paid = get_paid_status(cid)
+        if paid:
+            status_value = (
+                f"**PAID** ✅\n"
+                f"By: <@{paid['paid_by_discord_id']}> (`{paid['paid_by_tag']}`)\n"
+                f"At: `{_utc_iso(paid['paid_at'])}`"
+            )
+            paid_button_disabled = True
+        else:
+            status_value = "**UNPAID** ❌"
+            paid_button_disabled = False
 
         embed = discord.Embed(
             title=f"✅ Buyback Appraisal — Contract {cid}",
@@ -456,11 +584,13 @@ class BuybackContracts(commands.Cog):
             color=0x2ecc71,
         )
 
-        lines = payload["lines"]
+        # Status field first
+        embed.add_field(name="Status", value=status_value, inline=False)
+
+        # itemized lines (chunk for embed limits)
         chunks: List[str] = []
         buf = ""
-
-        for ln in lines:
+        for ln in payload["lines"]:
             row = (
                 f"• **{ln['name']}** × {ln['qty']}\n"
                 f"  Jita Buy: {ln['jita_buy']:.2f} ISK | Payout/unit: {ln['payout_unit']:.2f} ISK\n"
@@ -471,175 +601,91 @@ class BuybackContracts(commands.Cog):
                 buf = row
             else:
                 buf += row
-
         if buf:
             chunks.append(buf)
 
-        for idx, ch in enumerate(chunks[:10]):
+        for idx, ch in enumerate(chunks[:10]):  # embed field cap safety
             embed.add_field(name="Items" if idx == 0 else "Items (cont.)", value=ch, inline=False)
 
         embed.add_field(name="Total Payout", value=f"**{total:,.2f} ISK**", inline=False)
-        await channel.send(embed=embed)
+
+        view = BuybackPaidView(cid, disabled=paid_button_disabled)
+        await channel.send(embed=embed, view=view)
 
     # =========================
-    # SCAN CORE (returns diagnostics)
+    # SINGLE COMMAND: /buyback
     # =========================
-    async def _resolve_target_channel(self) -> Tuple[Optional[discord.TextChannel], Optional[str]]:
-        for g in self.bot.guilds:
-            ch = await self._get_channel(g)
-            if ch:
-                return ch, None
-        return None, f"Channel `#{BUYBACK_CHANNEL_NAME}` not found in any guild."
-
-    async def _scan(self, *, mode: str, force_latest: bool = False) -> Dict[str, int]:
-        """
-        mode:
-          - "all_new": post all unprocessed matches
-          - "latest": post newest matching outstanding (optionally even if processed when force_latest=True)
-        """
-        stats = {"contracts_total": 0, "matches": 0, "skipped_processed": 0, "posted": 0}
-        target_channel, err = await self._resolve_target_channel()
-        if not target_channel:
-            # represent as 0s; caller prints err
-            return stats | {"channel_missing": 1}
-
-        async with aiohttp.ClientSession() as session:
-            token = await self.oauth.get_access_token(session)
-            all_contracts = await self.esi.get_all_character_contracts(session, token)
-            stats["contracts_total"] = len(all_contracts)
-
-            matches = [c for c in all_contracts if self._contract_matches(c)]
-            matches.sort(key=lambda x: int(x.get("contract_id", 0)), reverse=True)
-            stats["matches"] = len(matches)
-
-            if not matches:
-                return stats
-
-            if mode == "latest":
-                c = matches[0]
-                cid = int(c["contract_id"])
-                if (not force_latest) and (await self._already_processed(cid)):
-                    stats["skipped_processed"] = 1
-                    return stats
-
-                issuer_id = int(c.get("issuer_id", 0) or 0)
-                conn = db_connect()
-                try:
-                    issuer_name = await self.esi.get_character_name(session, token, conn, issuer_id) if issuer_id else "Unknown"
-                finally:
-                    conn.close()
-
-                discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
-                payload, total = await self._appraise_contract(session, token, cid)
-                await self._post_appraisal(target_channel, payload, issuer_id=issuer_id, issuer_name=issuer_name, discord_user_id=discord_user_id)
-                await self._mark_processed(cid, payload, total)
-                stats["posted"] = 1
-                return stats
-
-            # mode == "all_new"
-            for c in matches:
-                cid = int(c["contract_id"])
-                if await self._already_processed(cid):
-                    stats["skipped_processed"] += 1
-                    continue
-
-                issuer_id = int(c.get("issuer_id", 0) or 0)
-                conn = db_connect()
-                try:
-                    issuer_name = await self.esi.get_character_name(session, token, conn, issuer_id) if issuer_id else "Unknown"
-                finally:
-                    conn.close()
-
-                discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
-                payload, total = await self._appraise_contract(session, token, cid)
-                await self._post_appraisal(target_channel, payload, issuer_id=issuer_id, issuer_name=issuer_name, discord_user_id=discord_user_id)
-                await self._mark_processed(cid, payload, total)
-                stats["posted"] += 1
-
-            return stats
-
-    # =========================
-    # LOOP (optional)
-    # =========================
-    @tasks.loop(seconds=SCAN_INTERVAL_SECONDS)
-    async def scan_loop(self):
-        if self._lock.locked():
-            return
-        async with self._lock:
-            # autoscan should behave like "all_new"
-            try:
-                await self._scan(mode="all_new")
-            except Exception:
-                pass
-
-    @scan_loop.before_loop
-    async def before_scan_loop(self):
-        await self.bot.wait_until_ready()
-
-    # =========================
-    # COMMANDS
-    # =========================
-    @app_commands.command(name="buyback_check", description="Scan and appraise ALL unprocessed outstanding buyback contracts.")
-    async def buyback_check(self, interaction: discord.Interaction):
+    @app_commands.command(name="buyback", description="Appraise and post ALL matching outstanding buyback contracts (every run).")
+    async def buyback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+
         async with self._lock:
-            try:
-                stats = await self._scan(mode="all_new")
-            except Exception as e:
-                await interaction.followup.send(f"❌ Scan failed: `{e}`", ephemeral=True)
+            channel = await self._get_target_channel()
+            if not channel:
+                await interaction.followup.send(
+                    f"❌ Channel `#{BUYBACK_CHANNEL_NAME}` not found in any guild.",
+                    ephemeral=True,
+                )
                 return
 
-        if stats.get("channel_missing"):
-            await interaction.followup.send(f"❌ Could not find channel `#{BUYBACK_CHANNEL_NAME}` in any guild.", ephemeral=True)
-            return
-
-        await interaction.followup.send(
-            f"✅ Scan done.\n"
-            f"- Contracts total: `{stats['contracts_total']}`\n"
-            f"- Matches (filters): `{stats['matches']}`\n"
-            f"- Skipped (already processed): `{stats['skipped_processed']}`\n"
-            f"- Posted: `{stats['posted']}`",
-            ephemeral=True,
-        )
-
-    @app_commands.command(name="buyback_latest", description="ALWAYS appraise the newest outstanding buyback contract (optionally force repost).")
-    @app_commands.describe(force="If true, repost even if already processed.")
-    async def buyback_latest(self, interaction: discord.Interaction, force: bool = False):
-        await interaction.response.defer(ephemeral=True)
-        async with self._lock:
             try:
-                stats = await self._scan(mode="latest", force_latest=force)
+                async with aiohttp.ClientSession() as session:
+                    token = await self.oauth.get_access_token(session)
+                    all_contracts = await self.esi.get_all_character_contracts(session, token)
+                    matches = [c for c in all_contracts if self._contract_matches(c)]
+
+                    matches.sort(key=lambda x: int(x.get("contract_id", 0)), reverse=True)
+
+                    if not matches:
+                        await interaction.followup.send(
+                            "⚠️ No matching outstanding contracts.\n"
+                            f"Checked `{len(all_contracts)}` total contracts.\n"
+                            f"Filters: status=`{BUYBACK_STATUS}`, type=`{BUYBACK_TYPE}`, assignee_id=`{BUYBACK_ASSIGNEE_ID}`, start_location_id=`{BUYBACK_START_LOCATION_ID}`",
+                            ephemeral=True,
+                        )
+                        return
+
+                    posted = 0
+                    for c in matches:
+                        if MAX_POST_PER_RUN > 0 and posted >= MAX_POST_PER_RUN:
+                            break
+
+                        cid = int(c["contract_id"])
+                        issuer_id = int(c.get("issuer_id", 0) or 0)
+
+                        # issuer name + discord mapping
+                        conn = db_connect()
+                        try:
+                            issuer_name = await self.esi.get_character_name(session, token, conn, issuer_id) if issuer_id else "Unknown"
+                        finally:
+                            conn.close()
+
+                        discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
+
+                        payload, _total = await self._appraise_contract(session, token, cid)
+                        await self._post_appraisal(
+                            channel,
+                            payload,
+                            issuer_id=issuer_id,
+                            issuer_name=issuer_name,
+                            discord_user_id=discord_user_id,
+                        )
+                        posted += 1
+
+                    note = ""
+                    if MAX_POST_PER_RUN > 0 and len(matches) > MAX_POST_PER_RUN:
+                        note = f"\n⚠️ Limited to `{MAX_POST_PER_RUN}` posts this run (set BUYBACK_MAX_POST_PER_RUN=0 for unlimited)."
+
+                    await interaction.followup.send(
+                        f"✅ Posted `{posted}` appraisal(s).\n"
+                        f"- Total contracts checked: `{len(all_contracts)}`\n"
+                        f"- Matching outstanding: `{len(matches)}`"
+                        f"{note}",
+                        ephemeral=True,
+                    )
+
             except Exception as e:
-                await interaction.followup.send(f"❌ Latest appraisal failed: `{e}`", ephemeral=True)
-                return
-
-        if stats.get("channel_missing"):
-            await interaction.followup.send(f"❌ Could not find channel `#{BUYBACK_CHANNEL_NAME}` in any guild.", ephemeral=True)
-            return
-
-        if stats["matches"] == 0:
-            await interaction.followup.send(
-                "⚠️ No matching outstanding contracts.\n"
-                f"- Contracts total: `{stats['contracts_total']}`\n"
-                f"- Filters: status=`{BUYBACK_STATUS}`, type=`{BUYBACK_TYPE}`, assignee_id=`{BUYBACK_ASSIGNEE_ID}`, start_location_id=`{BUYBACK_START_LOCATION_ID}`",
-                ephemeral=True,
-            )
-            return
-
-        if stats["posted"] == 0 and stats["skipped_processed"] > 0 and not force:
-            await interaction.followup.send(
-                "⚠️ Newest matching contract is already processed.\n"
-                "Run `/buyback_latest force:true` to repost it anyway.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.followup.send(
-            f"✅ Latest appraisal posted.\n"
-            f"- Contracts total: `{stats['contracts_total']}`\n"
-            f"- Matches (filters): `{stats['matches']}`",
-            ephemeral=True,
-        )
+                await interaction.followup.send(f"❌ /buyback failed: `{e}`", ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(BuybackContracts(bot))
