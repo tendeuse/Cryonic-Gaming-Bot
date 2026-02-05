@@ -5,7 +5,7 @@ import time
 import json
 import sqlite3
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import aiohttp
 import discord
@@ -20,6 +20,9 @@ PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = PERSIST_ROOT / "buyback_contracts.db"
+
+# IGN registry (from your other cog)
+IGN_REGISTRY_PATH = PERSIST_ROOT / "ign_registry.json"
 
 EVE_CLIENT_ID = os.getenv("EVE_CLIENT_ID", "")
 EVE_CLIENT_SECRET = os.getenv("EVE_CLIENT_SECRET", "")
@@ -41,6 +44,9 @@ PAYOUT_MULTIPLIER = float(os.getenv("PAYOUT_MULTIPLIER", "0.8"))  # 80%
 BUYBACK_CHANNEL_NAME = os.getenv("BUYBACK_CHANNEL_NAME", "buyback-payout")  # where to post results
 SCAN_INTERVAL_SECONDS = int(os.getenv("BUYBACK_SCAN_INTERVAL", "300"))      # 5 min default
 
+# IMPORTANT: autoscan toggle (default OFF to prevent unsolicited posting)
+BUYBACK_AUTO_SCAN = os.getenv("BUYBACK_AUTO_SCAN", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # ESI
 ESI_BASE = "https://esi.evetech.net/latest"
 ESI_UA = os.getenv("ESI_USER_AGENT", "ARC Buyback Bot (discord)")
@@ -48,75 +54,57 @@ ESI_UA = os.getenv("ESI_USER_AGENT", "ARC Buyback Bot (discord)")
 # Simple local caches (to reduce ESI calls)
 TYPE_CACHE_TTL = 24 * 3600
 PRICE_CACHE_TTL = 15 * 60
-
+CHAR_NAME_CACHE_TTL = 24 * 3600
 
 # =========================
 # ORE -> COMPRESSED MAPPING (name-based)
-# Includes common asteroid ores and variants.
-# If an item name is one of these keys, we replace it with the mapped value.
 # =========================
 ORE_TO_COMPRESSED_NAME: Dict[str, str] = {
-    # Veldspar
     "Veldspar": "Compressed Veldspar",
     "Concentrated Veldspar": "Compressed Concentrated Veldspar",
     "Dense Veldspar": "Compressed Dense Veldspar",
-    # Scordite
     "Scordite": "Compressed Scordite",
     "Condensed Scordite": "Compressed Condensed Scordite",
     "Massive Scordite": "Compressed Massive Scordite",
-    # Pyroxeres
     "Pyroxeres": "Compressed Pyroxeres",
     "Solid Pyroxeres": "Compressed Solid Pyroxeres",
     "Viscous Pyroxeres": "Compressed Viscous Pyroxeres",
-    # Plagioclase
     "Plagioclase": "Compressed Plagioclase",
     "Azure Plagioclase": "Compressed Azure Plagioclase",
     "Rich Plagioclase": "Compressed Rich Plagioclase",
-    # Omber
     "Omber": "Compressed Omber",
     "Silvery Omber": "Compressed Silvery Omber",
     "Golden Omber": "Compressed Golden Omber",
-    # Kernite
     "Kernite": "Compressed Kernite",
     "Luminous Kernite": "Compressed Luminous Kernite",
     "Fiery Kernite": "Compressed Fiery Kernite",
-    # Jaspet
     "Jaspet": "Compressed Jaspet",
     "Pure Jaspet": "Compressed Pure Jaspet",
     "Pristine Jaspet": "Compressed Pristine Jaspet",
-    # Hemorphite
     "Hemorphite": "Compressed Hemorphite",
     "Vivid Hemorphite": "Compressed Vivid Hemorphite",
     "Radiant Hemorphite": "Compressed Radiant Hemorphite",
-    # Hedbergite
     "Hedbergite": "Compressed Hedbergite",
     "Vitric Hedbergite": "Compressed Vitric Hedbergite",
     "Glazed Hedbergite": "Compressed Glazed Hedbergite",
-    # Gneiss
     "Gneiss": "Compressed Gneiss",
     "Iridescent Gneiss": "Compressed Iridescent Gneiss",
     "Prismatic Gneiss": "Compressed Prismatic Gneiss",
-    # Dark Ochre
     "Dark Ochre": "Compressed Dark Ochre",
     "Onyx Ochre": "Compressed Onyx Ochre",
     "Obsidian Ochre": "Compressed Obsidian Ochre",
-    # Spodumain
     "Spodumain": "Compressed Spodumain",
     "Bright Spodumain": "Compressed Bright Spodumain",
     "Gleaming Spodumain": "Compressed Gleaming Spodumain",
-    # Crokite
     "Crokite": "Compressed Crokite",
     "Sharp Crokite": "Compressed Sharp Crokite",
     "Crystalline Crokite": "Compressed Crystalline Crokite",
-    # Bistot
     "Bistot": "Compressed Bistot",
     "Triclinic Bistot": "Compressed Triclinic Bistot",
     "Monoclinic Bistot": "Compressed Monoclinic Bistot",
-    # Arkonor
     "Arkonor": "Compressed Arkonor",
     "Crimson Arkonor": "Compressed Crimson Arkonor",
     "Prime Arkonor": "Compressed Prime Arkonor",
-    # Mercoxit
     "Mercoxit": "Compressed Mercoxit",
     "Magma Mercoxit": "Compressed Magma Mercoxit",
     "Vitreous Mercoxit": "Compressed Vitreous Mercoxit",
@@ -134,13 +122,7 @@ class Contract:
     start_location_id: int
     title: str
     date_issued: str
-
-
-@dataclass
-class ContractItem:
-    type_id: int
-    quantity: int
-    is_included: bool
+    issuer_id: int
 
 
 # =========================
@@ -172,6 +154,15 @@ def db_connect():
         CREATE TABLE IF NOT EXISTS price_cache (
             type_id INTEGER PRIMARY KEY,
             jita_buy REAL NOT NULL,
+            cached_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS char_name_cache (
+            character_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
             cached_at INTEGER NOT NULL
         )
         """
@@ -221,9 +212,6 @@ class EsiClient:
             return await resp.json(), resp.headers
 
     async def get_all_character_contracts(self, session: aiohttp.ClientSession, token: str) -> List[dict]:
-        """
-        Fetch ALL pages of GET /characters/{character_id}/contracts/
-        """
         all_rows: List[dict] = []
         page = 1
 
@@ -239,7 +227,6 @@ class EsiClient:
 
             all_rows.extend(data)
 
-            # If X-Pages exists, stop when we've reached it
             x_pages = headers.get("X-Pages")
             if x_pages is not None:
                 try:
@@ -250,8 +237,6 @@ class EsiClient:
                     pass
 
             page += 1
-
-            # tiny throttle to be polite
             await asyncio.sleep(0.05)
 
         return all_rows
@@ -274,9 +259,7 @@ class EsiClient:
 
         url = f"{ESI_BASE}/universe/types/{type_id}/"
         data, _headers = await self._get(session, url, token)
-        name = data.get("name")
-        if not name:
-            name = f"type_id:{type_id}"
+        name = data.get("name") or f"type_id:{type_id}"
 
         conn.execute(
             "INSERT OR REPLACE INTO type_cache(type_id, name, cached_at) VALUES(?,?,?)",
@@ -285,12 +268,27 @@ class EsiClient:
         conn.commit()
         return name
 
+    async def get_character_name(self, session: aiohttp.ClientSession, token: str, conn: sqlite3.Connection, character_id: int) -> str:
+        now = int(time.time())
+        cur = conn.execute("SELECT name, cached_at FROM char_name_cache WHERE character_id=?", (character_id,))
+        row = cur.fetchone()
+        if row:
+            name, cached_at = row
+            if now - int(cached_at) <= CHAR_NAME_CACHE_TTL:
+                return str(name)
+
+        url = f"{ESI_BASE}/characters/{character_id}/"
+        data, _headers = await self._get(session, url, token)
+        name = data.get("name") or f"character_id:{character_id}"
+
+        conn.execute(
+            "INSERT OR REPLACE INTO char_name_cache(character_id, name, cached_at) VALUES(?,?,?)",
+            (character_id, name, now),
+        )
+        conn.commit()
+        return str(name)
+
     async def get_jita_buy_price(self, session: aiohttp.ClientSession, token: str, conn: sqlite3.Connection, type_id: int) -> float:
-        """
-        Highest BUY order price in Jita 4-4 (location_id).
-        Uses /markets/{region_id}/orders/?order_type=buy&type_id=...
-        then filters to location_id == JITA_LOCATION_ID.
-        """
         now = int(time.time())
         cur = conn.execute("SELECT jita_buy, cached_at FROM price_cache WHERE type_id=?", (type_id,))
         row = cur.fetchone()
@@ -300,7 +298,6 @@ class EsiClient:
                 return float(jita_buy)
 
         url = f"{ESI_BASE}/markets/{JITA_REGION_ID}/orders/"
-        # Note: ESI paginates orders too. We'll fetch pages until empty or X-Pages.
         best = 0.0
         page = 1
         while True:
@@ -314,7 +311,6 @@ class EsiClient:
                 break
 
             for o in data:
-                # Only Jita 4-4
                 if int(o.get("location_id", 0)) != JITA_LOCATION_ID:
                     continue
                 price = float(o.get("price", 0.0))
@@ -350,16 +346,17 @@ class BuybackContracts(commands.Cog):
         self.oauth = EveOAuth()
         self.esi = EsiClient(self.oauth)
         self._lock = asyncio.Lock()
-        self.scan_loop.start()
+
+        # Start autoscan ONLY if explicitly enabled
+        if BUYBACK_AUTO_SCAN:
+            self.scan_loop.start()
 
     def cog_unload(self):
-        self.scan_loop.cancel()
+        if self.scan_loop.is_running():
+            self.scan_loop.cancel()
 
     async def _get_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        for ch in guild.text_channels:
-            if ch.name == BUYBACK_CHANNEL_NAME:
-                return ch
-        return None
+        return discord.utils.get(guild.text_channels, name=BUYBACK_CHANNEL_NAME)
 
     def _contract_matches(self, row: dict) -> bool:
         try:
@@ -373,19 +370,44 @@ class BuybackContracts(commands.Cog):
             return False
 
     def _compress_if_ore_name(self, name: str) -> str:
-        # If it's a known ore name, swap it to compressed.
         return ORE_TO_COMPRESSED_NAME.get(name, name)
 
-    async def _appraise_contract(self, session: aiohttp.ClientSession, token: str, contract_id: int) -> Tuple[dict, float]:
-        """
-        Returns (payload, total_payout).
-        payload includes itemized lines.
-        """
+    # -------------------------
+    # IGN registry lookup
+    # -------------------------
+    def _load_ign_registry_state(self) -> Dict[str, Any]:
+        try:
+            if not IGN_REGISTRY_PATH.exists():
+                return {}
+            return json.loads(IGN_REGISTRY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _discord_user_id_for_character_id(self, character_id: int) -> Optional[int]:
+        state = self._load_ign_registry_state()
+        users = (state.get("users") or {})
+        for uid_str, rec in users.items():
+            try:
+                uid = int(uid_str)
+            except Exception:
+                continue
+            cids = rec.get("character_ids") or []
+            if any(isinstance(x, int) and x == character_id for x in cids):
+                return uid
+        return None
+
+    # -------------------------
+    # Appraisal
+    # -------------------------
+    async def _appraise_contract(
+        self,
+        session: aiohttp.ClientSession,
+        token: str,
+        contract_id: int,
+    ) -> Tuple[dict, float]:
         conn = db_connect()
         try:
             raw_items = await self.esi.get_character_contract_items(session, token, contract_id)
-
-            # Only included items count (item_exchange contracts have included/excluded)
             included = [i for i in raw_items if bool(i.get("is_included", True))]
 
             lines = []
@@ -398,12 +420,8 @@ class BuybackContracts(commands.Cog):
                 name = await self.esi.get_type_name(session, token, conn, type_id)
                 priced_name = self._compress_if_ore_name(name)
 
-                # If we converted name -> compressed, we must price the compressed type.
-                # We resolve the compressed name to a type_id by searching ESI /universe/ids/ (batch).
-                # We'll do a small helper: use /universe/ids/ with the name.
                 price_type_id = type_id
                 if priced_name != name:
-                    # Resolve the compressed type_id
                     ids_url = f"{ESI_BASE}/universe/ids/"
                     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ESI_UA}
                     async with session.post(ids_url, headers=headers, json=[priced_name]) as resp:
@@ -414,9 +432,6 @@ class BuybackContracts(commands.Cog):
                         inv_types = j.get("inventory_types") or []
                         if inv_types:
                             price_type_id = int(inv_types[0]["id"])
-                        else:
-                            # fallback: if it can't resolve, price original
-                            price_type_id = type_id
 
                 jita_buy = await self.esi.get_jita_buy_price(session, token, conn, price_type_id)
                 unit_payout = jita_buy * PAYOUT_MULTIPLIER
@@ -463,18 +478,31 @@ class BuybackContracts(commands.Cog):
         finally:
             conn.close()
 
-    async def _post_appraisal(self, channel: discord.TextChannel, payload: dict):
+    async def _post_appraisal(
+        self,
+        channel: discord.TextChannel,
+        payload: dict,
+        *,
+        issuer_id: int,
+        issuer_name: str,
+        discord_user_id: Optional[int],
+    ):
         cid = payload["contract_id"]
         total = payload["total"]
         mult = payload["multiplier"]
 
+        mention = f"<@{discord_user_id}>" if discord_user_id else None
+        issuer_line = f"**{issuer_name}** (`{issuer_id}`)" + (f" — {mention}" if mention else "")
+
         embed = discord.Embed(
             title=f"✅ Buyback Appraisal — Contract {cid}",
-            description=f"Pricing = **{int(mult*100)}%** of **Jita 4-4 BUY** orders (location {JITA_LOCATION_ID}).",
+            description=(
+                f"**Issuer:** {issuer_line}\n"
+                f"Pricing = **{int(mult*100)}%** of **Jita 4-4 BUY** orders (location `{JITA_LOCATION_ID}`)."
+            ),
             color=0x2ecc71,
         )
 
-        # Itemized lines (Discord embed field limits exist, so chunk if needed)
         lines = payload["lines"]
         chunks: List[str] = []
         buf = ""
@@ -494,7 +522,7 @@ class BuybackContracts(commands.Cog):
         if buf:
             chunks.append(buf)
 
-        for idx, ch in enumerate(chunks[:10]):  # safety cap
+        for idx, ch in enumerate(chunks[:10]):
             embed.add_field(
                 name="Items" if idx == 0 else "Items (cont.)",
                 value=ch,
@@ -506,21 +534,20 @@ class BuybackContracts(commands.Cog):
         await channel.send(embed=embed)
 
     # =========================
-    # LOOP
+    # LOOP (optional)
     # =========================
     @tasks.loop(seconds=SCAN_INTERVAL_SECONDS)
     async def scan_loop(self):
         if self._lock.locked():
             return
-
         async with self._lock:
-            await self._scan_once()
+            await self._scan_once(post_results=True)
 
     @scan_loop.before_loop
     async def before_scan_loop(self):
         await self.bot.wait_until_ready()
 
-    async def _scan_once(self):
+    async def _scan_once(self, *, post_results: bool):
         # pick a guild to post in: first guild where channel exists
         target_channel: Optional[discord.TextChannel] = None
         for g in self.bot.guilds:
@@ -528,7 +555,6 @@ class BuybackContracts(commands.Cog):
             if ch:
                 target_channel = ch
                 break
-
         if not target_channel:
             return
 
@@ -537,8 +563,6 @@ class BuybackContracts(commands.Cog):
 
             all_contracts = await self.esi.get_all_character_contracts(session, token)
             matches = [c for c in all_contracts if self._contract_matches(c)]
-
-            # Process newest-first (higher contract_id tends to be newer)
             matches.sort(key=lambda x: int(x.get("contract_id", 0)), reverse=True)
 
             for c in matches:
@@ -546,13 +570,32 @@ class BuybackContracts(commands.Cog):
                 if await self._already_processed(cid):
                     continue
 
+                issuer_id = int(c.get("issuer_id", 0) or 0)
                 try:
+                    conn = db_connect()
+                    try:
+                        issuer_name = await self.esi.get_character_name(session, token, conn, issuer_id) if issuer_id else "Unknown"
+                    finally:
+                        conn.close()
+
+                    discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
+
                     payload, total = await self._appraise_contract(session, token, cid)
-                    await self._post_appraisal(target_channel, payload)
+
+                    if post_results:
+                        await self._post_appraisal(
+                            target_channel,
+                            payload,
+                            issuer_id=issuer_id,
+                            issuer_name=issuer_name,
+                            discord_user_id=discord_user_id,
+                        )
+
                     await self._mark_processed(cid, payload, total)
+
                 except Exception as e:
-                    # Post an error but don't crash loop
-                    await target_channel.send(f"❌ Buyback appraisal failed for contract **{cid}**: `{e}`")
+                    if post_results:
+                        await target_channel.send(f"❌ Buyback appraisal failed for contract **{cid}**: `{e}`")
 
     # =========================
     # COMMANDS
@@ -561,7 +604,8 @@ class BuybackContracts(commands.Cog):
     async def buyback_check(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         async with self._lock:
-            await self._scan_once()
+            # Manual scan ALWAYS posts results
+            await self._scan_once(post_results=True)
         await interaction.followup.send("✅ Scan complete.", ephemeral=True)
 
 
