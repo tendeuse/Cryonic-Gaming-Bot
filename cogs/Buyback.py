@@ -1,3 +1,4 @@
+```python
 # cogs/buyback_contracts.py
 import os
 import asyncio
@@ -42,7 +43,7 @@ PAYOUT_MULTIPLIER = float(os.getenv("PAYOUT_MULTIPLIER", "0.8"))  # 80%
 # Discord output
 BUYBACK_CHANNEL_NAME = os.getenv("BUYBACK_CHANNEL_NAME", "buyback-payout")
 
-# Optional: safety limit (0 = unlimited).
+# Optional: safety limit (0 = unlimited). If you worry about spam, set e.g. 10.
 MAX_POST_PER_RUN = int(os.getenv("BUYBACK_MAX_POST_PER_RUN", "0"))
 
 # Role allowed to mark paid
@@ -380,41 +381,49 @@ class PaidButton(discord.ui.DynamicItem[discord.ui.Button], template=r"buyback:p
         emb = msg.embeds[0]
 
         paid = get_paid_status(self.contract_id)
-        paid_line = f"**PAID** ✅\nBy: <@{paid['paid_by_discord_id']}> (`{paid['paid_by_tag']}`)\nAt: `{_utc_iso(paid['paid_at'])}`"
+        paid_line = (
+            f"**PAID** ✅\n"
+            f"By: <@{paid['paid_by_discord_id']}> (`{paid['paid_by_tag']}`)\n"
+            f"At: `{_utc_iso(paid['paid_at'])}`"
+        )
 
-        # Replace or add Status field
-        updated_fields = []
-        replaced = False
-        for f in emb.fields:
-            if f.name.strip().lower() == "status":
-                updated_fields.append(discord.EmbedField(name="Status", value=paid_line, inline=False))
-                replaced = True
-            else:
-                updated_fields.append(f)
-
+        # ✅ FIX: discord.py has no discord.EmbedField. Rebuild embed and re-add fields.
+        updated = False
         new_emb = discord.Embed(
             title=emb.title,
             description=emb.description,
             color=emb.color,
             timestamp=emb.timestamp,
         )
-        new_emb.set_footer(text=emb.footer.text if emb.footer else discord.Embed.Empty)
 
-        for f in updated_fields:
-            new_emb.add_field(name=f.name, value=f.value, inline=f.inline)
+        # preserve footer / author / thumbnail / image if present
+        if emb.footer and emb.footer.text:
+            new_emb.set_footer(text=emb.footer.text, icon_url=getattr(emb.footer, "icon_url", None) or discord.Embed.Empty)
+        if emb.author and emb.author.name:
+            new_emb.set_author(
+                name=emb.author.name,
+                url=getattr(emb.author, "url", None) or discord.Embed.Empty,
+                icon_url=getattr(emb.author, "icon_url", None) or discord.Embed.Empty,
+            )
+        if emb.thumbnail and emb.thumbnail.url:
+            new_emb.set_thumbnail(url=emb.thumbnail.url)
+        if emb.image and emb.image.url:
+            new_emb.set_image(url=emb.image.url)
 
-        if not replaced:
+        # copy fields, replacing Status if present
+        for f in emb.fields:
+            if (f.name or "").strip().lower() == "status":
+                new_emb.add_field(name="Status", value=paid_line, inline=False)
+                updated = True
+            else:
+                new_emb.add_field(name=f.name, value=f.value, inline=f.inline)
+
+        if not updated:
             new_emb.add_field(name="Status", value=paid_line, inline=False)
 
         # Disable button in the view
         view = BuybackPaidView(self.contract_id, disabled=True)
-
-        try:
-            await interaction.response.edit_message(embed=new_emb, view=view)
-        except Exception:
-            # If edit_message fails, at least ack
-            if not interaction.response.is_done():
-                await interaction.response.send_message("✅ Marked as PAID.", ephemeral=True)
+        await interaction.response.edit_message(embed=new_emb, view=view)
 
 class BuybackPaidView(discord.ui.View):
     def __init__(self, contract_id: int, *, disabled: bool = False):
@@ -689,3 +698,4 @@ class BuybackContracts(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(BuybackContracts(bot))
+```
