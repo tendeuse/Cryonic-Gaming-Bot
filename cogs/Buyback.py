@@ -20,44 +20,40 @@ PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = PERSIST_ROOT / "buyback_contracts.db"
-
-# IGN registry (from your other cog)
 IGN_REGISTRY_PATH = PERSIST_ROOT / "ign_registry.json"
 
 EVE_CLIENT_ID = os.getenv("EVE_CLIENT_ID", "")
 EVE_CLIENT_SECRET = os.getenv("EVE_CLIENT_SECRET", "")
 EVE_REFRESH_TOKEN = os.getenv("EVE_REFRESH_TOKEN", "")
-EVE_CHARACTER_ID = int(os.getenv("EVE_CHARACTER_ID", "0"))  # the character that can read these contracts
+EVE_CHARACTER_ID = int(os.getenv("EVE_CHARACTER_ID", "0"))
 
-# Filters (set to your buyback rules)
-BUYBACK_ASSIGNEE_ID = int(os.getenv("BUYBACK_ASSIGNEE_ID", "2122848297"))  # who the contract is assigned to
-BUYBACK_START_LOCATION_ID = int(os.getenv("BUYBACK_START_LOCATION_ID", "1048840990158"))  # your structure/station id
+# Filters (buyback rules)
+BUYBACK_ASSIGNEE_ID = int(os.getenv("BUYBACK_ASSIGNEE_ID", "2122848297"))
+BUYBACK_START_LOCATION_ID = int(os.getenv("BUYBACK_START_LOCATION_ID", "1048840990158"))
 BUYBACK_TYPE = os.getenv("BUYBACK_TYPE", "item_exchange")
 BUYBACK_STATUS = os.getenv("BUYBACK_STATUS", "outstanding")
 
 # Pricing
-JITA_REGION_ID = int(os.getenv("JITA_REGION_ID", "10000002"))     # The Forge
-JITA_LOCATION_ID = int(os.getenv("JITA_LOCATION_ID", "60003760")) # Jita 4-4 station
-PAYOUT_MULTIPLIER = float(os.getenv("PAYOUT_MULTIPLIER", "0.8"))  # 80%
+JITA_REGION_ID = int(os.getenv("JITA_REGION_ID", "10000002"))
+JITA_LOCATION_ID = int(os.getenv("JITA_LOCATION_ID", "60003760"))
+PAYOUT_MULTIPLIER = float(os.getenv("PAYOUT_MULTIPLIER", "0.8"))
 
 # Discord output
-BUYBACK_CHANNEL_NAME = os.getenv("BUYBACK_CHANNEL_NAME", "buyback-payout")  # where to post results
-SCAN_INTERVAL_SECONDS = int(os.getenv("BUYBACK_SCAN_INTERVAL", "300"))      # 5 min default
-
-# IMPORTANT: autoscan toggle (default OFF to prevent unsolicited posting)
+BUYBACK_CHANNEL_NAME = os.getenv("BUYBACK_CHANNEL_NAME", "buyback-payout")
+SCAN_INTERVAL_SECONDS = int(os.getenv("BUYBACK_SCAN_INTERVAL", "300"))
 BUYBACK_AUTO_SCAN = os.getenv("BUYBACK_AUTO_SCAN", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # ESI
 ESI_BASE = "https://esi.evetech.net/latest"
 ESI_UA = os.getenv("ESI_USER_AGENT", "ARC Buyback Bot (discord)")
 
-# Simple local caches (to reduce ESI calls)
+# Caches
 TYPE_CACHE_TTL = 24 * 3600
 PRICE_CACHE_TTL = 15 * 60
 CHAR_NAME_CACHE_TTL = 24 * 3600
 
 # =========================
-# ORE -> COMPRESSED MAPPING (name-based)
+# ORE -> COMPRESSED
 # =========================
 ORE_TO_COMPRESSED_NAME: Dict[str, str] = {
     "Veldspar": "Compressed Veldspar",
@@ -111,21 +107,6 @@ ORE_TO_COMPRESSED_NAME: Dict[str, str] = {
 }
 
 # =========================
-# DATA MODELS
-# =========================
-@dataclass
-class Contract:
-    contract_id: int
-    status: str
-    type: str
-    assignee_id: int
-    start_location_id: int
-    title: str
-    date_issued: str
-    issuer_id: int
-
-
-# =========================
 # DB
 # =========================
 def db_connect():
@@ -169,7 +150,6 @@ def db_connect():
     )
     return conn
 
-
 # =========================
 # OAUTH
 # =========================
@@ -190,7 +170,6 @@ class EveOAuth:
                 raise RuntimeError(f"OAuth failed: {resp.status} {txt}")
             j = await resp.json()
             return j["access_token"]
-
 
 # =========================
 # ESI CLIENT
@@ -214,31 +193,24 @@ class EsiClient:
     async def get_all_character_contracts(self, session: aiohttp.ClientSession, token: str) -> List[dict]:
         all_rows: List[dict] = []
         page = 1
-
         while True:
             url = f"{ESI_BASE}/characters/{EVE_CHARACTER_ID}/contracts/"
             data, headers = await self._get(session, url, token, params={"page": page})
-
             if not isinstance(data, list):
                 raise RuntimeError("Unexpected contracts payload (not a list).")
-
             if not data:
                 break
-
             all_rows.extend(data)
 
             x_pages = headers.get("X-Pages")
             if x_pages is not None:
                 try:
-                    max_pages = int(x_pages)
-                    if page >= max_pages:
+                    if page >= int(x_pages):
                         break
                 except ValueError:
                     pass
-
             page += 1
             await asyncio.sleep(0.05)
-
         return all_rows
 
     async def get_character_contract_items(self, session: aiohttp.ClientSession, token: str, contract_id: int) -> List[dict]:
@@ -258,13 +230,10 @@ class EsiClient:
                 return str(name)
 
         url = f"{ESI_BASE}/universe/types/{type_id}/"
-        data, _headers = await self._get(session, url, token)
+        data, _ = await self._get(session, url, token)
         name = data.get("name") or f"type_id:{type_id}"
 
-        conn.execute(
-            "INSERT OR REPLACE INTO type_cache(type_id, name, cached_at) VALUES(?,?,?)",
-            (type_id, name, now),
-        )
+        conn.execute("INSERT OR REPLACE INTO type_cache(type_id, name, cached_at) VALUES(?,?,?)", (type_id, name, now))
         conn.commit()
         return name
 
@@ -278,13 +247,10 @@ class EsiClient:
                 return str(name)
 
         url = f"{ESI_BASE}/characters/{character_id}/"
-        data, _headers = await self._get(session, url, token)
+        data, _ = await self._get(session, url, token)
         name = data.get("name") or f"character_id:{character_id}"
 
-        conn.execute(
-            "INSERT OR REPLACE INTO char_name_cache(character_id, name, cached_at) VALUES(?,?,?)",
-            (character_id, name, now),
-        )
+        conn.execute("INSERT OR REPLACE INTO char_name_cache(character_id, name, cached_at) VALUES(?,?,?)", (character_id, name, now))
         conn.commit()
         return str(name)
 
@@ -301,12 +267,7 @@ class EsiClient:
         best = 0.0
         page = 1
         while True:
-            data, headers = await self._get(
-                session,
-                url,
-                token,
-                params={"order_type": "buy", "type_id": type_id, "page": page},
-            )
+            data, headers = await self._get(session, url, token, params={"order_type": "buy", "type_id": type_id, "page": page})
             if not data:
                 break
 
@@ -320,8 +281,7 @@ class EsiClient:
             x_pages = headers.get("X-Pages")
             if x_pages is not None:
                 try:
-                    max_pages = int(x_pages)
-                    if page >= max_pages:
+                    if page >= int(x_pages):
                         break
                 except ValueError:
                     pass
@@ -329,13 +289,9 @@ class EsiClient:
             page += 1
             await asyncio.sleep(0.05)
 
-        conn.execute(
-            "INSERT OR REPLACE INTO price_cache(type_id, jita_buy, cached_at) VALUES(?,?,?)",
-            (type_id, best, now),
-        )
+        conn.execute("INSERT OR REPLACE INTO price_cache(type_id, jita_buy, cached_at) VALUES(?,?,?)", (type_id, best, now))
         conn.commit()
         return float(best)
-
 
 # =========================
 # MAIN COG
@@ -347,7 +303,6 @@ class BuybackContracts(commands.Cog):
         self.esi = EsiClient(self.oauth)
         self._lock = asyncio.Lock()
 
-        # Start autoscan ONLY if explicitly enabled
         if BUYBACK_AUTO_SCAN:
             self.scan_loop.start()
 
@@ -397,14 +352,31 @@ class BuybackContracts(commands.Cog):
         return None
 
     # -------------------------
+    # Processed tracking
+    # -------------------------
+    async def _already_processed(self, contract_id: int) -> bool:
+        conn = db_connect()
+        try:
+            cur = conn.execute("SELECT 1 FROM processed_contracts WHERE contract_id=?", (contract_id,))
+            return cur.fetchone() is not None
+        finally:
+            conn.close()
+
+    async def _mark_processed(self, contract_id: int, payload: dict, total: float):
+        conn = db_connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO processed_contracts(contract_id, processed_at, total_payout, payload_json) VALUES(?,?,?,?)",
+                (contract_id, int(time.time()), float(total), json.dumps(payload)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # -------------------------
     # Appraisal
     # -------------------------
-    async def _appraise_contract(
-        self,
-        session: aiohttp.ClientSession,
-        token: str,
-        contract_id: int,
-    ) -> Tuple[dict, float]:
+    async def _appraise_contract(self, session: aiohttp.ClientSession, token: str, contract_id: int) -> Tuple[dict, float]:
         conn = db_connect()
         try:
             raw_items = await self.esi.get_character_contract_items(session, token, contract_id)
@@ -459,25 +431,6 @@ class BuybackContracts(commands.Cog):
         finally:
             conn.close()
 
-    async def _already_processed(self, contract_id: int) -> bool:
-        conn = db_connect()
-        try:
-            cur = conn.execute("SELECT 1 FROM processed_contracts WHERE contract_id=?", (contract_id,))
-            return cur.fetchone() is not None
-        finally:
-            conn.close()
-
-    async def _mark_processed(self, contract_id: int, payload: dict, total: float):
-        conn = db_connect()
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO processed_contracts(contract_id, processed_at, total_payout, payload_json) VALUES(?,?,?,?)",
-                (contract_id, int(time.time()), float(total), json.dumps(payload)),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
     async def _post_appraisal(
         self,
         channel: discord.TextChannel,
@@ -523,15 +476,87 @@ class BuybackContracts(commands.Cog):
             chunks.append(buf)
 
         for idx, ch in enumerate(chunks[:10]):
-            embed.add_field(
-                name="Items" if idx == 0 else "Items (cont.)",
-                value=ch,
-                inline=False,
-            )
+            embed.add_field(name="Items" if idx == 0 else "Items (cont.)", value=ch, inline=False)
 
         embed.add_field(name="Total Payout", value=f"**{total:,.2f} ISK**", inline=False)
-
         await channel.send(embed=embed)
+
+    # =========================
+    # SCAN CORE (returns diagnostics)
+    # =========================
+    async def _resolve_target_channel(self) -> Tuple[Optional[discord.TextChannel], Optional[str]]:
+        for g in self.bot.guilds:
+            ch = await self._get_channel(g)
+            if ch:
+                return ch, None
+        return None, f"Channel `#{BUYBACK_CHANNEL_NAME}` not found in any guild."
+
+    async def _scan(self, *, mode: str, force_latest: bool = False) -> Dict[str, int]:
+        """
+        mode:
+          - "all_new": post all unprocessed matches
+          - "latest": post newest matching outstanding (optionally even if processed when force_latest=True)
+        """
+        stats = {"contracts_total": 0, "matches": 0, "skipped_processed": 0, "posted": 0}
+        target_channel, err = await self._resolve_target_channel()
+        if not target_channel:
+            # represent as 0s; caller prints err
+            return stats | {"channel_missing": 1}
+
+        async with aiohttp.ClientSession() as session:
+            token = await self.oauth.get_access_token(session)
+            all_contracts = await self.esi.get_all_character_contracts(session, token)
+            stats["contracts_total"] = len(all_contracts)
+
+            matches = [c for c in all_contracts if self._contract_matches(c)]
+            matches.sort(key=lambda x: int(x.get("contract_id", 0)), reverse=True)
+            stats["matches"] = len(matches)
+
+            if not matches:
+                return stats
+
+            if mode == "latest":
+                c = matches[0]
+                cid = int(c["contract_id"])
+                if (not force_latest) and (await self._already_processed(cid)):
+                    stats["skipped_processed"] = 1
+                    return stats
+
+                issuer_id = int(c.get("issuer_id", 0) or 0)
+                conn = db_connect()
+                try:
+                    issuer_name = await self.esi.get_character_name(session, token, conn, issuer_id) if issuer_id else "Unknown"
+                finally:
+                    conn.close()
+
+                discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
+                payload, total = await self._appraise_contract(session, token, cid)
+                await self._post_appraisal(target_channel, payload, issuer_id=issuer_id, issuer_name=issuer_name, discord_user_id=discord_user_id)
+                await self._mark_processed(cid, payload, total)
+                stats["posted"] = 1
+                return stats
+
+            # mode == "all_new"
+            for c in matches:
+                cid = int(c["contract_id"])
+                if await self._already_processed(cid):
+                    stats["skipped_processed"] += 1
+                    continue
+
+                issuer_id = int(c.get("issuer_id", 0) or 0)
+                conn = db_connect()
+                try:
+                    issuer_name = await self.esi.get_character_name(session, token, conn, issuer_id) if issuer_id else "Unknown"
+                finally:
+                    conn.close()
+
+                discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
+                payload, total = await self._appraise_contract(session, token, cid)
+                await self._post_appraisal(target_channel, payload, issuer_id=issuer_id, issuer_name=issuer_name, discord_user_id=discord_user_id)
+                await self._mark_processed(cid, payload, total)
+                stats["posted"] += 1
+
+            return stats
 
     # =========================
     # LOOP (optional)
@@ -541,73 +566,80 @@ class BuybackContracts(commands.Cog):
         if self._lock.locked():
             return
         async with self._lock:
-            await self._scan_once(post_results=True)
+            # autoscan should behave like "all_new"
+            try:
+                await self._scan(mode="all_new")
+            except Exception:
+                pass
 
     @scan_loop.before_loop
     async def before_scan_loop(self):
         await self.bot.wait_until_ready()
 
-    async def _scan_once(self, *, post_results: bool):
-        # pick a guild to post in: first guild where channel exists
-        target_channel: Optional[discord.TextChannel] = None
-        for g in self.bot.guilds:
-            ch = await self._get_channel(g)
-            if ch:
-                target_channel = ch
-                break
-        if not target_channel:
-            return
-
-        async with aiohttp.ClientSession() as session:
-            token = await self.oauth.get_access_token(session)
-
-            all_contracts = await self.esi.get_all_character_contracts(session, token)
-            matches = [c for c in all_contracts if self._contract_matches(c)]
-            matches.sort(key=lambda x: int(x.get("contract_id", 0)), reverse=True)
-
-            for c in matches:
-                cid = int(c["contract_id"])
-                if await self._already_processed(cid):
-                    continue
-
-                issuer_id = int(c.get("issuer_id", 0) or 0)
-                try:
-                    conn = db_connect()
-                    try:
-                        issuer_name = await self.esi.get_character_name(session, token, conn, issuer_id) if issuer_id else "Unknown"
-                    finally:
-                        conn.close()
-
-                    discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
-
-                    payload, total = await self._appraise_contract(session, token, cid)
-
-                    if post_results:
-                        await self._post_appraisal(
-                            target_channel,
-                            payload,
-                            issuer_id=issuer_id,
-                            issuer_name=issuer_name,
-                            discord_user_id=discord_user_id,
-                        )
-
-                    await self._mark_processed(cid, payload, total)
-
-                except Exception as e:
-                    if post_results:
-                        await target_channel.send(f"❌ Buyback appraisal failed for contract **{cid}**: `{e}`")
-
     # =========================
     # COMMANDS
     # =========================
-    @app_commands.command(name="buyback_check", description="Manually scan and appraise outstanding buyback contracts.")
+    @app_commands.command(name="buyback_check", description="Scan and appraise ALL unprocessed outstanding buyback contracts.")
     async def buyback_check(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         async with self._lock:
-            # Manual scan ALWAYS posts results
-            await self._scan_once(post_results=True)
-        await interaction.followup.send("✅ Scan complete.", ephemeral=True)
+            try:
+                stats = await self._scan(mode="all_new")
+            except Exception as e:
+                await interaction.followup.send(f"❌ Scan failed: `{e}`", ephemeral=True)
+                return
 
+        if stats.get("channel_missing"):
+            await interaction.followup.send(f"❌ Could not find channel `#{BUYBACK_CHANNEL_NAME}` in any guild.", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"✅ Scan done.\n"
+            f"- Contracts total: `{stats['contracts_total']}`\n"
+            f"- Matches (filters): `{stats['matches']}`\n"
+            f"- Skipped (already processed): `{stats['skipped_processed']}`\n"
+            f"- Posted: `{stats['posted']}`",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="buyback_latest", description="ALWAYS appraise the newest outstanding buyback contract (optionally force repost).")
+    @app_commands.describe(force="If true, repost even if already processed.")
+    async def buyback_latest(self, interaction: discord.Interaction, force: bool = False):
+        await interaction.response.defer(ephemeral=True)
+        async with self._lock:
+            try:
+                stats = await self._scan(mode="latest", force_latest=force)
+            except Exception as e:
+                await interaction.followup.send(f"❌ Latest appraisal failed: `{e}`", ephemeral=True)
+                return
+
+        if stats.get("channel_missing"):
+            await interaction.followup.send(f"❌ Could not find channel `#{BUYBACK_CHANNEL_NAME}` in any guild.", ephemeral=True)
+            return
+
+        if stats["matches"] == 0:
+            await interaction.followup.send(
+                "⚠️ No matching outstanding contracts.\n"
+                f"- Contracts total: `{stats['contracts_total']}`\n"
+                f"- Filters: status=`{BUYBACK_STATUS}`, type=`{BUYBACK_TYPE}`, assignee_id=`{BUYBACK_ASSIGNEE_ID}`, start_location_id=`{BUYBACK_START_LOCATION_ID}`",
+                ephemeral=True,
+            )
+            return
+
+        if stats["posted"] == 0 and stats["skipped_processed"] > 0 and not force:
+            await interaction.followup.send(
+                "⚠️ Newest matching contract is already processed.\n"
+                "Run `/buyback_latest force:true` to repost it anyway.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"✅ Latest appraisal posted.\n"
+            f"- Contracts total: `{stats['contracts_total']}`\n"
+            f"- Matches (filters): `{stats['matches']}`",
+            ephemeral=True,
+        )
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(BuybackContracts(bot))
