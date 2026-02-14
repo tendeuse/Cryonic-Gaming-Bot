@@ -1,11 +1,4 @@
-# shift_monitor.py
-# discord.py 2.x Cog (Railway-safe, restart-safe, rate-limit-safe)
-# - Auto-creates missing channels + escalation role
-# - Persists ONLY IDs + primitives (no discord.Message objects in JSON)
-# - Uses unique custom_ids per shift/escalation so Views survive restarts
-# - Avoids spam message edits (edits only on state changes)
-# - Invite tracking: init cache on startup + persistent invite_registry
-# - "Owner-only" admin functions: Server Owner OR role "ARC Security Corporation Leader"
+# cogs/shift_monitor.py
 
 import asyncio
 import json
@@ -21,12 +14,10 @@ from discord import app_commands
 # ================= CONFIG =================
 GUILD_ID = 1444318058419322983
 
-# Role that is allowed to use owner-only functions (in addition to server owner)
 OWNER_ROLE_NAME = "ARC Security Corporation Leader"
 
-# Server objects to ensure exist
 SHIFT_CATEGORY_NAME = "Recruiter Scheduling"
-ESCALATION_ROLE_NAME = "Recruiter Escalation"  # created if missing
+ESCALATION_ROLE_NAME = "Recruiter Escalation"
 LOG_CHANNEL_NAME = "shift-log"
 
 CHANNEL_NAMES = {
@@ -37,7 +28,6 @@ CHANNEL_NAMES = {
     "escalation": "recruiter-claims",
 }
 
-# Checkpoints interpreted in UTC (tell me if you want AST/ADT instead)
 CHECKPOINTS_DEFAULT = {
     1: "00:00",
     2: "06:00",
@@ -45,14 +35,12 @@ CHECKPOINTS_DEFAULT = {
     4: "18:00",
 }
 
-ESCALATION_TIMEOUT = timedelta(seconds=15)  # testing; set to minutes for real usage
+ESCALATION_TIMEOUT = timedelta(seconds=15)  # testing
 
-# Railway persistence
 DATA_DIR = Path("/data")
 STATE_FILE = DATA_DIR / "shift_state.json"
 
 
-# ================= UTIL =================
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -79,7 +67,6 @@ def safe_int(x, default=None):
 def get_current_checkpoint(checkpoints: Dict[int, str]) -> int:
     ordered = sorted((k, parse_hhmm(v)) for k, v in checkpoints.items())
     now = now_utc().time()
-
     for i in range(len(ordered)):
         cp, start = ordered[i]
         next_start = ordered[(i + 1) % len(ordered)][1]
@@ -105,28 +92,16 @@ def fmt_td(td: timedelta) -> str:
 
 
 def has_owner_privs(interaction: discord.Interaction) -> bool:
-    """
-    Owner-only access: server owner OR member has OWNER_ROLE_NAME.
-    """
     if not interaction.guild:
         return False
-
     if interaction.user.id == interaction.guild.owner_id:
         return True
-
     if isinstance(interaction.user, discord.Member):
         return any(r.name == OWNER_ROLE_NAME for r in interaction.user.roles)
-
     return False
 
 
-# ================= VIEWS =================
 class ShiftView(discord.ui.View):
-    """
-    Persistent view. custom_ids unique per shift:
-      shift:{timer_id}:start
-      shift:{timer_id}:stop
-    """
     def __init__(self, cog: "ShiftMonitor", timer_id: str, shift_num: int):
         super().__init__(timeout=None)
         self.cog = cog
@@ -135,15 +110,13 @@ class ShiftView(discord.ui.View):
 
         self.start_btn.custom_id = f"shift:{timer_id}:start"
         self.stop_btn.custom_id = f"shift:{timer_id}:stop"
-
         self.sync_enabled_states()
 
     def sync_enabled_states(self):
-        state = self.cog.shift_state.get(self.timer_id, {})
-        active = bool(state.get("active"))
-        locked = bool(state.get("locked"))
-        running = bool(state.get("running"))
-
+        st = self.cog.shift_state.get(self.timer_id, {})
+        active = bool(st.get("active"))
+        locked = bool(st.get("locked"))
+        running = bool(st.get("running"))
         self.start_btn.disabled = not (active and (not locked) and (not running))
         self.stop_btn.disabled = not running
 
@@ -157,11 +130,6 @@ class ShiftView(discord.ui.View):
 
 
 class EscalationView(discord.ui.View):
-    """
-    Persistent view. custom_ids unique per shift:
-      esc:{shift_num}:claim
-      esc:{shift_num}:stop
-    """
     def __init__(self, cog: "ShiftMonitor", shift_num: int):
         super().__init__(timeout=None)
         self.cog = cog
@@ -169,7 +137,6 @@ class EscalationView(discord.ui.View):
 
         self.claim_btn.custom_id = f"esc:{shift_num}:claim"
         self.stop_btn.custom_id = f"esc:{shift_num}:stop"
-
         self.sync_enabled_states()
 
     def sync_enabled_states(self):
@@ -187,7 +154,6 @@ class EscalationView(discord.ui.View):
         await self.cog.handle_escalation_stop(interaction, self.shift_num)
 
 
-# ================= COG =================
 class ShiftMonitor(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -196,14 +162,12 @@ class ShiftMonitor(commands.Cog):
         self.escalation_state: Dict[str, Dict[str, Any]] = {}
         self.invite_cache: Dict[str, int] = {}
         self.invite_registry: Dict[str, Dict[str, Any]] = {}
-
         self.checkpoints: Dict[int, str] = dict(CHECKPOINTS_DEFAULT)
 
         self.escalation_role_id: Optional[int] = None
         self._log_channel_id: Optional[int] = None
 
         self._lock = asyncio.Lock()
-
         self.load_state()
 
     # ----------------- Persistence -----------------
@@ -211,9 +175,7 @@ class ShiftMonitor(commands.Cog):
         if not STATE_FILE.exists():
             return
         try:
-            with STATE_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             self.shift_state = data.get("shift_state", {}) or {}
             self.escalation_state = data.get("escalation_state", {}) or {}
             self.invite_cache = data.get("invite_cache", {}) or {}
@@ -225,7 +187,6 @@ class ShiftMonitor(commands.Cog):
 
             self.escalation_role_id = data.get("escalation_role_id")
             self._log_channel_id = data.get("log_channel_id")
-
         except Exception:
             self.shift_state = {}
             self.escalation_state = {}
@@ -254,27 +215,25 @@ class ShiftMonitor(commands.Cog):
         if not guild:
             return
 
-        channel = None
+        ch = None
         if self._log_channel_id:
-            channel = guild.get_channel(self._log_channel_id)
+            ch = guild.get_channel(self._log_channel_id)
 
-        if channel is None:
-            channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
-            if channel:
-                self._log_channel_id = channel.id
+        if ch is None:
+            ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+            if ch:
+                self._log_channel_id = ch.id
                 self.save_state()
 
-        if channel:
+        if ch:
             try:
-                await channel.send(message)
+                await ch.send(message)
             except discord.HTTPException:
                 pass
 
     # ----------------- Server Setup -----------------
     async def ensure_role(self, guild: discord.Guild) -> discord.Role:
-        role = None
-        if self.escalation_role_id:
-            role = guild.get_role(self.escalation_role_id)
+        role = guild.get_role(self.escalation_role_id) if self.escalation_role_id else None
         if role is None:
             role = discord.utils.get(guild.roles, name=ESCALATION_ROLE_NAME)
         if role is None:
@@ -330,9 +289,9 @@ class ShiftMonitor(commands.Cog):
         if channel is None:
             return
 
-        state = self.shift_state.get(timer_id)
-        if not state:
-            state = {
+        st = self.shift_state.get(timer_id)
+        if not st:
+            st = {
                 "shift_num": shift_num,
                 "channel_id": channel.id,
                 "message_id": None,
@@ -346,51 +305,23 @@ class ShiftMonitor(commands.Cog):
                 "start_ts": None,
                 "last_render_key": None,
             }
-            self.shift_state[timer_id] = state
+            self.shift_state[timer_id] = st
 
-        state["channel_id"] = channel.id
+        st["channel_id"] = channel.id
 
         msg = None
-        if state.get("message_id"):
-            msg = await self.fetch_message(guild, state["channel_id"], state["message_id"])
+        if st.get("message_id"):
+            msg = await self.fetch_message(guild, st["channel_id"], st["message_id"])
 
         if msg is None:
             view = ShiftView(self, timer_id, shift_num)
             msg = await channel.send(f"⏱️ **Shift {shift_num}**", view=view)
-            state["message_id"] = msg.id
-            state["last_render_key"] = None
+            st["message_id"] = msg.id
+            st["last_render_key"] = None
 
         self.bot.add_view(ShiftView(self, timer_id, shift_num))
         await self.render_shift_if_needed(guild, timer_id)
 
-    async def ensure_escalation_message(self, guild: discord.Guild, shift_num: int) -> None:
-        esc = self.escalation_state.get(str(shift_num))
-        if not esc:
-            return
-
-        ch = discord.utils.get(guild.text_channels, name=CHANNEL_NAMES["escalation"])
-        if ch is None:
-            return
-        esc["channel_id"] = ch.id
-
-        msg = None
-        if esc.get("message_id"):
-            msg = await self.fetch_message(guild, esc["channel_id"], esc["message_id"])
-
-        if msg is None:
-            role = await self.ensure_role(guild)
-            remaining = time_until_next_checkpoint(self.checkpoints)
-            content = f"{role.mention} **Shift {shift_num} has unclaimed time ({fmt_td(remaining)} remaining). Claim it?**"
-            view = EscalationView(self, shift_num)
-            msg = await ch.send(content, view=view)
-            esc["message_id"] = msg.id
-            esc["start_ts"] = esc.get("start_ts") or int(now_utc().timestamp())
-            esc["last_render_key"] = None
-
-        self.bot.add_view(EscalationView(self, shift_num))
-        await self.render_escalation_if_needed(guild, shift_num)
-
-    # ----------------- Rendering -----------------
     async def render_shift_if_needed(self, guild: discord.Guild, timer_id: str) -> None:
         st = self.shift_state.get(timer_id)
         if not st:
@@ -411,27 +342,7 @@ class ShiftMonitor(commands.Cog):
         except discord.HTTPException:
             pass
 
-    async def render_escalation_if_needed(self, guild: discord.Guild, shift_num: int) -> None:
-        esc = self.escalation_state.get(str(shift_num))
-        if not esc:
-            return
-        render_key = f"owner={esc.get('owner_id')}"
-        if esc.get("last_render_key") == render_key:
-            return
-
-        msg = await self.fetch_message(guild, esc["channel_id"], esc["message_id"])
-        if msg is None:
-            return
-
-        view = EscalationView(self, shift_num)
-        try:
-            await msg.edit(view=view)
-            esc["last_render_key"] = render_key
-            self.save_state()
-        except discord.HTTPException:
-            pass
-
-    # ----------------- Core shift actions -----------------
+    # ----------------- Escalation -----------------
     async def escalate_shift(self, shift_num: int, reason: str):
         guild = self.bot.get_guild(GUILD_ID)
         if not guild:
@@ -469,7 +380,6 @@ class ShiftMonitor(commands.Cog):
 
         self.bot.add_view(EscalationView(self, shift_num))
         self.save_state()
-
         await self.log(f"⚠️ Escalation started for Shift {shift_num} ({reason}) (<t:{int(datetime.now().timestamp())}:f>)")
 
     async def end_escalation(self, shift_num: int, reason: str):
@@ -478,46 +388,19 @@ class ShiftMonitor(commands.Cog):
             return
 
         esc_key = str(shift_num)
-        esc = self.escalation_state.get(esc_key)
-        if not esc:
+        if esc_key not in self.escalation_state:
             return
 
         timer_id = f"id_{shift_num}"
         st = self.shift_state.get(timer_id)
         if st:
             st["locked"] = False
+            st["last_render_key"] = None
             await self.render_shift_if_needed(guild, timer_id)
 
         self.escalation_state.pop(esc_key, None)
         self.save_state()
-
         await self.log(f"🟥 Escalation ended for Shift {shift_num} ({reason}) (<t:{int(datetime.now().timestamp())}:f>)")
-
-    async def force_stop(self, timer_id: str, reason: str, manual: bool = False):
-        guild = self.bot.get_guild(GUILD_ID)
-        if not guild:
-            return
-
-        st = self.shift_state.get(timer_id)
-        if not st or not st.get("running"):
-            return
-
-        st["running"] = False
-        st["started_by"] = None
-        st["start_ts"] = None
-
-        # Escalate if manually stopped while still active and >60 minutes remain.
-        if manual and st.get("active") and (time_until_next_checkpoint(self.checkpoints) > timedelta(minutes=60)) and not st.get("escalated"):
-            st["escalated"] = True
-            self.save_state()
-            await self.render_shift_if_needed(guild, timer_id)
-            await self.log(f"⚠️ Shift {st['shift_num']} ended early — escalating (<t:{int(datetime.now().timestamp())}:f>)")
-            await self.escalate_shift(st["shift_num"], "Ended early")
-            return
-
-        self.save_state()
-        await self.render_shift_if_needed(guild, timer_id)
-        await self.log(f"🔴 Shift {st['shift_num']} ended ({reason}) (<t:{int(datetime.now().timestamp())}:f>)")
 
     # ----------------- Interaction handlers -----------------
     async def handle_shift_start(self, interaction: discord.Interaction, timer_id: str):
@@ -540,15 +423,15 @@ class ShiftMonitor(commands.Cog):
                 await interaction.response.send_message("❌ Shift already running.", ephemeral=True)
                 return
 
-            guild_owner_id = interaction.guild.owner_id
             owner_id = st.get("owner_id")
-            if owner_id and interaction.user.id not in (owner_id, guild_owner_id):
+            if owner_id and interaction.user.id not in (owner_id, interaction.guild.owner_id):
                 await interaction.response.send_message("❌ You are not assigned to this shift.", ephemeral=True)
                 return
 
             st["running"] = True
             st["started_by"] = interaction.user.id
             st["start_ts"] = int(now_utc().timestamp())
+            st["last_render_key"] = None
             self.save_state()
 
         await self.render_shift_if_needed(interaction.guild, timer_id)
@@ -565,12 +448,17 @@ class ShiftMonitor(commands.Cog):
                 await interaction.response.send_message("❌ Shift state missing.", ephemeral=True)
                 return
 
-            starter = st.get("started_by")
-            if interaction.user.id not in (starter, interaction.guild.owner_id):
+            if interaction.user.id not in (st.get("started_by"), interaction.guild.owner_id):
                 await interaction.response.send_message("❌ You did not start this shift.", ephemeral=True)
                 return
 
-        await self.force_stop(timer_id, "Manual stop", manual=True)
+            st["running"] = False
+            st["started_by"] = None
+            st["start_ts"] = None
+            st["last_render_key"] = None
+            self.save_state()
+
+        await self.render_shift_if_needed(interaction.guild, timer_id)
         await interaction.response.send_message("🔴 Shift ended.", ephemeral=True)
 
     async def handle_escalation_claim(self, interaction: discord.Interaction, shift_num: int):
@@ -585,11 +473,10 @@ class ShiftMonitor(commands.Cog):
             if esc.get("owner_id") is not None:
                 await interaction.response.send_message("Shift already claimed.", ephemeral=True)
                 return
-
             esc["owner_id"] = interaction.user.id
+            esc["last_render_key"] = None
             self.save_state()
 
-        await self.render_escalation_if_needed(interaction.guild, shift_num)
         await interaction.response.send_message("✅ You claimed this escalation shift.", ephemeral=True)
         await self.log(f"✅ Escalation shift {shift_num} claimed by {interaction.user.display_name} (<t:{int(datetime.now().timestamp())}:f>)")
 
@@ -634,16 +521,17 @@ class ShiftMonitor(commands.Cog):
                     st["active"] = True
                     st["activated_ts"] = now_ts
                     st["escalated"] = False
+                    st["last_render_key"] = None
                     to_render.add(timer_id)
 
                 elif (not should_be_active) and st.get("active"):
-                    if st.get("running"):
-                        st["running"] = False
-                        st["started_by"] = None
-                        st["start_ts"] = None
                     st["active"] = False
                     st["activated_ts"] = None
                     st["escalated"] = False
+                    st["running"] = False
+                    st["started_by"] = None
+                    st["start_ts"] = None
+                    st["last_render_key"] = None
                     to_render.add(timer_id)
 
                 if (
@@ -654,6 +542,7 @@ class ShiftMonitor(commands.Cog):
                     and (now_ts - int(st["activated_ts"])) >= int(ESCALATION_TIMEOUT.total_seconds())
                 ):
                     st["escalated"] = True
+                    st["last_render_key"] = None
                     to_render.add(timer_id)
                     to_escalate.append(sn)
 
@@ -670,77 +559,6 @@ class ShiftMonitor(commands.Cog):
     async def before_checkpoint_loop(self):
         await self.bot.wait_until_ready()
 
-    # ----------------- Invite tracking -----------------
-    async def init_invites(self, guild: discord.Guild):
-        try:
-            invites = await guild.invites()
-        except discord.Forbidden:
-            return
-        except discord.HTTPException:
-            return
-
-        cache = {i.code: (i.uses or 0) for i in invites}
-        try:
-            vanity = await guild.vanity_invite()
-            if vanity and vanity.uses is not None:
-                cache["vanity"] = vanity.uses
-        except Exception:
-            pass
-
-        self.invite_cache = cache
-        self.save_state()
-
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member):
-        if member.guild.id != GUILD_ID:
-            return
-        guild = member.guild
-
-        try:
-            new_invites = await guild.invites()
-        except discord.Forbidden:
-            return
-        except discord.HTTPException:
-            return
-
-        used_code = None
-        for inv in new_invites:
-            old_uses = self.invite_cache.get(inv.code, 0)
-            new_uses = inv.uses or 0
-            if new_uses > old_uses:
-                used_code = inv.code
-                break
-
-        if used_code is None:
-            try:
-                vanity = await guild.vanity_invite()
-                if vanity and vanity.uses is not None and vanity.uses > self.invite_cache.get("vanity", 0):
-                    used_code = "vanity"
-            except Exception:
-                pass
-
-        self.invite_cache = {inv.code: (inv.uses or 0) for inv in new_invites}
-        try:
-            vanity = await guild.vanity_invite()
-            if vanity and vanity.uses is not None:
-                self.invite_cache["vanity"] = vanity.uses
-        except Exception:
-            pass
-        self.save_state()
-
-        if used_code is None:
-            await self.log(f"⚠️ Could not detect which invite {member.mention} used. (<t:{int(datetime.now().timestamp())}:f>)")
-            return
-
-        assigned = self.invite_registry.get(used_code)
-        if not assigned:
-            await self.log(f"🚨 ALERT: {member.mention} joined using `{used_code}`, which is not an assigned invite. (<t:{int(datetime.now().timestamp())}:f>)")
-            return
-
-        shift_id = assigned.get("shift_id")
-        owner_id = assigned.get("owner_id")
-        await self.log(f"✅ <@{owner_id}>'s assigned invite `{used_code}` used by {member.mention} (Shift {shift_id}) (<t:{int(datetime.now().timestamp())}:f>).")
-
     # ----------------- Slash Commands -----------------
     @app_commands.command(name="setup_shifts", description="Create missing channels/role and initialize shift messages.")
     async def setup_shifts_cmd(self, interaction: discord.Interaction):
@@ -756,44 +574,14 @@ class ShiftMonitor(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         await self.ensure_server_objects()
-
         guild = interaction.guild
         for i in range(1, 5):
             await self.ensure_shift_message(guild, i)
 
-        for key in list(self.escalation_state.keys()):
-            sn = safe_int(key, None)
-            if sn in (1, 2, 3, 4):
-                await self.ensure_escalation_message(guild, sn)
-
-        await self.init_invites(guild)
+        if not self.checkpoint_loop.is_running():
+            self.checkpoint_loop.start()
 
         await interaction.followup.send("✅ Setup complete.", ephemeral=True)
-
-    @app_commands.command(name="setcheckpoint", description="Set a checkpoint time (HH:MM in UTC).")
-    async def setcheckpoint_cmd(self, interaction: discord.Interaction, shift_number: int, time_str: str):
-        if not interaction.guild or interaction.guild.id != GUILD_ID:
-            return
-        if not has_owner_privs(interaction):
-            await interaction.response.send_message(
-                f"Only the **server owner** or **{OWNER_ROLE_NAME}** can use this.",
-                ephemeral=True
-            )
-            return
-        if shift_number not in (1, 2, 3, 4):
-            await interaction.response.send_message("Shift number must be 1-4.", ephemeral=True)
-            return
-        try:
-            parse_hhmm(time_str)
-        except Exception:
-            await interaction.response.send_message("Invalid time. Use HH:MM (e.g., 06:00).", ephemeral=True)
-            return
-
-        async with self._lock:
-            self.checkpoints[shift_number] = time_str
-            self.save_state()
-
-        await interaction.response.send_message("✅ Checkpoint updated.", ephemeral=True)
 
     @app_commands.command(name="setowner", description="Assign a user to a shift.")
     async def setowner_cmd(self, interaction: discord.Interaction, shift_number: int, user: discord.Member):
@@ -821,78 +609,16 @@ class ShiftMonitor(commands.Cog):
         await self.render_shift_if_needed(interaction.guild, timer_id)
         await interaction.response.send_message(f"✅ Owner for Shift {shift_number} set to {user.mention}.", ephemeral=True)
 
-    @app_commands.command(name="linkassign", description="Assign an invite URL/code to a shift for auditing.")
-    async def linkassign_cmd(self, interaction: discord.Interaction, shift_id: int, invite_url: str):
-        if not interaction.guild or interaction.guild.id != GUILD_ID:
-            return
-        if not has_owner_privs(interaction):
-            await interaction.response.send_message(
-                f"Only the **server owner** or **{OWNER_ROLE_NAME}** can use this.",
-                ephemeral=True
-            )
-            return
-        if shift_id not in (1, 2, 3, 4):
-            await interaction.response.send_message("Shift id must be 1-4.", ephemeral=True)
-            return
-
-        code = invite_url.split("/")[-1].strip().replace(" ", "")
-
-        try:
-            invites = await interaction.guild.invites()
-        except discord.Forbidden:
-            await interaction.response.send_message("Bot needs **Manage Server** permission to read invites.", ephemeral=True)
-            return
-        except discord.HTTPException:
-            await interaction.response.send_message("Could not fetch invites right now. Try again.", ephemeral=True)
-            return
-
-        valid_codes = {i.code for i in invites}
-        if code != "vanity" and code not in valid_codes:
-            await interaction.response.send_message("Invalid or unknown invite code (or use `vanity`).", ephemeral=True)
-            return
-
-        async with self._lock:
-            self.invite_registry[code] = {"shift_id": shift_id, "owner_id": interaction.user.id}
-            self.save_state()
-
-        await interaction.response.send_message(f"✅ Invite `{code}` assigned to Shift {shift_id}.", ephemeral=True)
-
-    @app_commands.command(name="checkpoints", description="Show checkpoints (UTC).")
-    async def checkpoints_cmd(self, interaction: discord.Interaction):
-        if not interaction.guild or interaction.guild.id != GUILD_ID:
-            return
-        lines = [f"{k}: {v} UTC" for k, v in sorted(self.checkpoints.items())]
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
     # ----------------- Lifecycle -----------------
     async def cog_load(self):
-        guild_obj = discord.Object(id=GUILD_ID)
-        self.bot.tree.add_command(self.setup_shifts_cmd, guild=guild_obj)
-        self.bot.tree.add_command(self.setcheckpoint_cmd, guild=guild_obj)
-        self.bot.tree.add_command(self.setowner_cmd, guild=guild_obj)
-        self.bot.tree.add_command(self.linkassign_cmd, guild=guild_obj)
-        self.bot.tree.add_command(self.checkpoints_cmd, guild=guild_obj)
-        try:
-            await self.bot.tree.sync(guild=guild_obj)
-        except Exception:
-            pass
-
         await self.bot.wait_until_ready()
         guild = self.bot.get_guild(GUILD_ID)
         if not guild:
             return
 
         await self.ensure_server_objects()
-
         for i in range(1, 5):
             await self.ensure_shift_message(guild, i)
-
-        for key in list(self.escalation_state.keys()):
-            sn = safe_int(key, None)
-            if sn in (1, 2, 3, 4):
-                await self.ensure_escalation_message(guild, sn)
-
-        await self.init_invites(guild)
 
         if not self.checkpoint_loop.is_running():
             self.checkpoint_loop.start()
@@ -905,6 +631,5 @@ class ShiftMonitor(commands.Cog):
         self.save_state()
 
 
-# ================= SETUP =================
 async def setup(bot: commands.Bot):
     await bot.add_cog(ShiftMonitor(bot))
