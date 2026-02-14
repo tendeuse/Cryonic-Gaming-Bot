@@ -17,8 +17,8 @@ ONBOARDING_ROLE = "Onboarding"
 
 # Permission roles
 GENESIS_ROLE = "ARC Genesis"
-DIRECTOR_ROLE = "Director"
-CEO_ROLE = "Ceo"
+DIRECTOR_ROLE = "ARC Security Administration Council"
+CEO_ROLE = "ARC Security Corporation Leader"
 
 LOG_CHANNEL_NAME = "roles-log"
 
