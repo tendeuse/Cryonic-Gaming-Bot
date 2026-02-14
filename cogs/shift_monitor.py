@@ -41,7 +41,8 @@ CHECKPOINTS_DEFAULT = {
     4: "18:00",
 }
 
-ESCALATION_TIMEOUT = timedelta(seconds=15)  # testing
+# ✅ CHANGED: 15 seconds -> 20 minutes
+ESCALATION_TIMEOUT = timedelta(minutes=20)
 
 DATA_DIR = Path(os.getenv("PERSIST_ROOT", "/data"))
 STATE_FILE = DATA_DIR / "shift_state.json"
