@@ -1,5 +1,4 @@
 import os
-import asyncio
 import traceback
 import inspect
 from pathlib import Path
@@ -9,30 +8,17 @@ from discord.ext import commands
 from discord import app_commands
 
 
-# =====================
-# CONFIG
-# =====================
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not set in environment variables.")
 
-# Your main guild where you want instant command availability
 GUILD_ID = 1444318058419322983
 
-# Roles allowed to use /sync (optional)
 ADMIN_SYNC_ROLE_NAMES = {
     # "ARC Security Corporation Leader",
     # "ARC Security Administration Council",
 }
 
-# Optional: guild IDs to clear old command duplicates from
-CLEANUP_GUILD_IDS = [
-    # 781978392894505020,
-]
-
-# =====================
-# INTENTS
-# =====================
 intents = discord.Intents.all()
 
 
@@ -44,27 +30,17 @@ def is_admin_or_allowed_role(member: discord.Member) -> bool:
     return False
 
 
-async def maybe_await(result):
-    if inspect.isawaitable(result):
-        return await result
-    return result
-
-
-# =====================
-# /sync ADMIN COMMAND
-# =====================
 class SyncCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     @app_commands.command(
         name="sync",
-        description="Admin-only: sync slash commands globally or to a specific guild.",
+        description="Admin-only: sync slash commands to the main guild (fast) and optionally global (slow).",
     )
     async def sync(
         self,
         interaction: discord.Interaction,
-        guild_id: str | None = None,
         clean_guild: bool = False,
         also_global: bool = False,
     ):
@@ -78,16 +54,7 @@ class SyncCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        if not guild_id:
-            gid = GUILD_ID
-        else:
-            try:
-                gid = int(str(guild_id).strip())
-            except ValueError:
-                await interaction.followup.send("Invalid guild_id.", ephemeral=True)
-                return
-
-        guild_obj = discord.Object(id=gid)
+        guild_obj = discord.Object(id=GUILD_ID)
 
         try:
             if clean_guild:
@@ -95,74 +62,106 @@ class SyncCog(commands.Cog):
 
             self.bot.tree.copy_global_to(guild=guild_obj)
             synced = await self.bot.tree.sync(guild=guild_obj)
-
-            msg = f"Guild sync complete for `{gid}`. Synced `{len(synced)}` command(s)."
+            msg = f"✅ Guild sync complete. Synced `{len(synced)}` command(s) to `{GUILD_ID}`."
 
             if also_global:
                 gsynced = await self.bot.tree.sync()
-                msg += f"\nAlso global synced `{len(gsynced)}` command(s)."
+                msg += f"\n✅ Global sync complete. Synced `{len(gsynced)}` command(s). (May take time to appear.)"
 
             await interaction.followup.send(msg, ephemeral=True)
 
         except Exception as e:
             traceback.print_exception(type(e), e, e.__traceback__)
-            await interaction.followup.send("Sync failed. Check bot logs.", ephemeral=True)
+            await interaction.followup.send("❌ Sync failed. Check bot logs.", ephemeral=True)
 
 
-# =====================
-# BOT
-# =====================
 class MyBot(commands.Bot):
     async def setup_hook(self):
+        print("[BOOT] setup_hook() start")
 
-        # ---- Ensure cogs package exists ----
-        cogs_dir = Path("cogs")
-        if not cogs_dir.exists():
-            print("No 'cogs' folder found.")
-            return
+        try:
+            # ---- Ensure cogs package exists ----
+            cogs_dir = Path("cogs")
+            print("[BOOT] CWD:", os.getcwd())
+            print("[BOOT] cogs_dir exists:", cogs_dir.exists(), "is_dir:", cogs_dir.is_dir())
 
-        init_py = cogs_dir / "__init__.py"
-        if not init_py.exists():
-            init_py.write_text("# auto\n", encoding="utf-8")
+            if not cogs_dir.exists() or not cogs_dir.is_dir():
+                print("[BOOT] No /cogs folder found; skipping cog loading.")
+                return
 
-        # ---- Load cogs ----
-        loaded = []
-        failed = []
+            init_py = cogs_dir / "__init__.py"
+            if not init_py.exists():
+                init_py.write_text("# auto\n", encoding="utf-8")
+                print("[BOOT] Created cogs/__init__.py")
 
-        for filename in sorted(os.listdir(cogs_dir)):
-            if not filename.endswith(".py") or filename.startswith("__"):
-                continue
+            # ---- Directory listing (THIS is what proves what Railway deployed) ----
+            listing = sorted([p.name for p in cogs_dir.iterdir()])
+            print("[COGS] Directory listing:", listing)
 
-            ext = f"cogs.{filename[:-3]}"
+            # ---- Load cogs ----
+            loaded = []
+            failed = []
+
+            for filename in sorted(os.listdir(cogs_dir)):
+                if not filename.endswith(".py") or filename.startswith("__"):
+                    continue
+
+                ext = f"cogs.{filename[:-3]}"
+                print(f"[COGS] Attempting load: {ext}")
+                try:
+                    await self.load_extension(ext)
+                    print(f"[COGS] Loaded: {ext}")
+                    loaded.append(ext)
+                except Exception as e:
+                    print(f"[COGS] FAILED: {ext} -> {type(e).__name__}: {e}")
+                    traceback.print_exception(type(e), e, e.__traceback__)
+                    failed.append(ext)
+
+            print(f"[COGS] Loaded ({len(loaded)}): {loaded}")
+            if failed:
+                print(f"[COGS] FAILED ({len(failed)}): {failed}")
+
+            # ---- Add /sync ----
             try:
-                await self.load_extension(ext)
-                print(f"Loaded cog: {ext}")
-                loaded.append(ext)
+                await self.add_cog(SyncCog(self))
+                print("[BOOT] Loaded internal cog: SyncCog (/sync)")
             except Exception as e:
-                print(f"Failed to load {ext}: {e}")
+                print("[BOOT] Failed to add SyncCog:", e)
                 traceback.print_exception(type(e), e, e.__traceback__)
-                failed.append(ext)
 
-        print(f"[COGS] Loaded ({len(loaded)}): {loaded}")
-        if failed:
-            print(f"[COGS] FAILED ({len(failed)}): {failed}")
+            # ---- Resolve application ID ----
+            try:
+                app_info = await self.application_info()
+                self._connection.application_id = app_info.id
+                print(f"[BOOT] Application ID resolved: {app_info.id}")
+            except Exception as e:
+                print("[BOOT] application_info() failed:", e)
+                traceback.print_exception(type(e), e, e.__traceback__)
+                return
 
-        # ---- Add /sync ----
-        await self.add_cog(SyncCog(self))
+            # ---- Guild sync (fast, immediate in your server) ----
+            try:
+                guild_obj = discord.Object(id=GUILD_ID)
+                self.tree.copy_global_to(guild=guild_obj)
+                synced_guild = await self.tree.sync(guild=guild_obj)
+                print(f"[SYNC] Guild synced {len(synced_guild)} commands to {GUILD_ID}.")
+            except Exception as e:
+                print("[SYNC] Guild sync failed:", e)
+                traceback.print_exception(type(e), e, e.__traceback__)
 
-        # ---- Resolve application ID ----
-        app_info = await self.application_info()
-        self._connection.application_id = app_info.id
+            # ---- Global sync (optional; keep if you want) ----
+            try:
+                synced_global = await self.tree.sync()
+                print(f"[SYNC] Global synced {len(synced_global)} commands.")
+            except Exception as e:
+                print("[SYNC] Global sync failed:", e)
+                traceback.print_exception(type(e), e, e.__traceback__)
 
-        # ---- Guild sync for instant availability ----
-        guild_obj = discord.Object(id=GUILD_ID)
-        self.tree.copy_global_to(guild=guild_obj)
-        gsynced = await self.tree.sync(guild=guild_obj)
-        print(f"Synced {len(gsynced)} guild commands to {GUILD_ID}")
+            print("[BOOT] setup_hook() complete")
 
-        # ---- Optional global sync ----
-        synced = await self.tree.sync()
-        print(f"Synced {len(synced)} global commands.")
+        except Exception as e:
+            print("[BOOT] FATAL in setup_hook():", e)
+            traceback.print_exception(type(e), e, e.__traceback__)
 
 
 bot = MyBot(command_prefix="!", intents=intents)
@@ -170,17 +169,18 @@ bot = MyBot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} ({bot.user.id})")
+    print(f"[READY] Logged in as {bot.user} (ID: {bot.user.id})")
 
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    print("[APP] Command error:", error)
     traceback.print_exception(type(error), error, error.__traceback__)
     try:
         if interaction.response.is_done():
-            await interaction.followup.send("Command failed. Check logs.", ephemeral=True)
+            await interaction.followup.send("Command failed. Check bot logs.", ephemeral=True)
         else:
-            await interaction.response.send_message("Command failed. Check logs.", ephemeral=True)
+            await interaction.response.send_message("Command failed. Check bot logs.", ephemeral=True)
     except Exception:
         pass
 
