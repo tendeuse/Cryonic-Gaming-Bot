@@ -11,9 +11,14 @@ DATA_FILE = os.path.join(DATA_DIR, "member_roles.json")
 
 NEW_MEMBER_ROLE = "New Member"
 SECURITY_ROLE = "ARC Security"
+SUBSIDIZED_ROLE = "ARC Subsidized"
 SCHEDULING_ROLE = "Scheduling"
 ONBOARDING_ROLE = "Onboarding"
+
+# Permission roles
 GENESIS_ROLE = "ARC Genesis"
+DIRECTOR_ROLE = "Director"
+CEO_ROLE = "Ceo"
 
 LOG_CHANNEL_NAME = "roles-log"
 
@@ -72,25 +77,72 @@ class NewMemberRoles(commands.Cog):
         if channel:
             await channel.send(message)
 
+    def user_has_any_role(self, member: discord.Member, role_names: set[str]) -> bool:
+        return any(r.name in role_names for r in member.roles)
+
+    async def enforce_subsidy_swap(self, member: discord.Member, reason: str = "Auto subsidy swap"):
+        """
+        If member has Onboarding + ARC Security, replace ARC Security with ARC Subsidized.
+        Safe to call repeatedly; it only acts when needed.
+        """
+        guild = member.guild
+        onboarding = self.get_role(guild, ONBOARDING_ROLE)
+        security = self.get_role(guild, SECURITY_ROLE)
+        subsidized = self.get_role(guild, SUBSIDIZED_ROLE)
+
+        if not onboarding or not security or not subsidized:
+            return
+
+        has_onboarding = onboarding in member.roles
+        has_security = security in member.roles
+        has_subsidized = subsidized in member.roles
+
+        if not (has_onboarding and has_security):
+            return
+
+        try:
+            if not has_subsidized:
+                await member.add_roles(subsidized, reason=reason)
+
+            if security in member.roles:
+                await member.remove_roles(security, reason=reason)
+
+            await self.log(
+                guild,
+                f"🟣 **Subsidy swap**: {member.mention} had **{ONBOARDING_ROLE}** + **{SECURITY_ROLE}** → "
+                f"removed **{SECURITY_ROLE}**, added **{SUBSIDIZED_ROLE}**."
+            )
+        except discord.Forbidden:
+            await self.log(
+                guild,
+                f"⚠️ **Subsidy swap failed** for {member.mention}: missing permissions or role hierarchy issue."
+            )
+        except discord.HTTPException as e:
+            await self.log(
+                guild,
+                f"⚠️ **Subsidy swap failed** for {member.mention}: HTTP error: {e}"
+            )
+
     # ---------- Bootstrap Existing Members ----------
 
     async def bootstrap_existing_members(self):
-        """Ensure existing members are safely marked to avoid retroactive triggers."""
+        """Ensure existing members are safely marked to avoid retroactive triggers AND enforce subsidy swap."""
         await self.bot.wait_until_ready()
         data = load_data()
         changed = False
 
         for guild in self.bot.guilds:
             nm_role = self.get_role(guild, NEW_MEMBER_ROLE)
-            if not nm_role:
-                continue
+            if nm_role:
+                for member in guild.members:
+                    if nm_role in member.roles:
+                        uid = str(member.id)
+                        if uid not in data["rewarded"]:
+                            data["rewarded"].append(uid)
+                            changed = True
 
             for member in guild.members:
-                if nm_role in member.roles:
-                    uid = str(member.id)
-                    if uid not in data["rewarded"]:
-                        data["rewarded"].append(uid)
-                        changed = True
+                await self.enforce_subsidy_swap(member, reason="Bootstrap subsidy swap")
 
         if changed:
             save_data(data)
@@ -129,21 +181,24 @@ class NewMemberRoles(commands.Cog):
                         except discord.Forbidden:
                             pass
 
+                    await self.enforce_subsidy_swap(member, reason="Timer task subsidy swap")
+
                 del data["pending"][user_id]
                 changed = True
 
         if changed:
             save_data(data)
 
-    # ---------- Role Removal Detection ----------
+    # ---------- Role Removal Detection + Subsidy Swap Hook ----------
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         before_roles = {r.name for r in before.roles}
         after_roles = {r.name for r in after.roles}
 
+        await self.enforce_subsidy_swap(after, reason="Role update subsidy swap")
+
         if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
-            # Find who removed the role
             actor = "Unknown"
             try:
                 async for entry in after.guild.audit_logs(
@@ -184,10 +239,20 @@ class NewMemberRoles(commands.Cog):
                 except discord.Forbidden:
                     return
 
+            await self.enforce_subsidy_swap(after, reason="Post-reward subsidy swap")
+
             data["rewarded"].append(uid)
             save_data(data)
 
     # ---------- Permission Check ----------
+
+    def leadership_only():
+        allowed = {GENESIS_ROLE, DIRECTOR_ROLE, CEO_ROLE}
+        async def predicate(interaction: discord.Interaction):
+            if not interaction.user or not isinstance(interaction.user, discord.Member):
+                return False
+            return any(r.name in allowed for r in interaction.user.roles)
+        return app_commands.check(predicate)
 
     def genesis_only():
         async def predicate(interaction: discord.Interaction):
@@ -195,6 +260,74 @@ class NewMemberRoles(commands.Cog):
         return app_commands.check(predicate)
 
     # ---------- Slash Commands ----------
+
+    @app_commands.command(
+        name="transfer_to_security",
+        description="Transfer a member from ARC Subsidized to ARC Security"
+    )
+    @leadership_only()
+    async def transfer_to_security(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member
+    ):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+
+        security = self.get_role(guild, SECURITY_ROLE)
+        subsidized = self.get_role(guild, SUBSIDIZED_ROLE)
+
+        if not security or not subsidized:
+            await interaction.response.send_message(
+                f"Missing roles: ensure **{SECURITY_ROLE}** and **{SUBSIDIZED_ROLE}** exist.",
+                ephemeral=True
+            )
+            return
+
+        if subsidized not in member.roles:
+            await interaction.response.send_message(
+                f"{member.mention} does not have **{SUBSIDIZED_ROLE}**.",
+                ephemeral=True
+            )
+            return
+
+        # Optional: prevent immediate auto-swap back if they still have Onboarding
+        onboarding = self.get_role(guild, ONBOARDING_ROLE)
+        if onboarding and onboarding in member.roles:
+            await interaction.response.send_message(
+                f"⚠️ {member.mention} still has **{ONBOARDING_ROLE}**. "
+                f"Your auto-rule will re-swap them back to **{SUBSIDIZED_ROLE}** unless you remove **{ONBOARDING_ROLE}** first.",
+                ephemeral=True
+            )
+            # We continue anyway, since the user asked to transfer.
+
+        try:
+            # Add security first, then remove subsidized
+            await member.add_roles(security, reason=f"Transfer to security by {interaction.user}")
+            await member.remove_roles(subsidized, reason=f"Transfer to security by {interaction.user}")
+
+            await self.log(
+                guild,
+                f"🟦 **Transfer**: {interaction.user.mention} transferred {member.mention} "
+                f"from **{SUBSIDIZED_ROLE}** → **{SECURITY_ROLE}**."
+            )
+
+            await interaction.response.send_message(
+                f"✅ Transferred {member.mention} to **{SECURITY_ROLE}** (removed **{SUBSIDIZED_ROLE}**).",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I don't have permission (check role hierarchy / Manage Roles).",
+                ephemeral=True
+            )
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"❌ Discord API error: {e}",
+                ephemeral=True
+            )
 
     @app_commands.command(
         name="remove_scheduling",
