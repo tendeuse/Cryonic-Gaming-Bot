@@ -44,6 +44,9 @@ ESCALATION_TIMEOUT = timedelta(seconds=15)  # testing
 DATA_DIR = Path(os.getenv("PERSIST_ROOT", "/data"))
 STATE_FILE = DATA_DIR / "shift_state.json"
 
+# global edit spacing (helps avoid 429 spam on message edits)
+GLOBAL_EDIT_MIN_INTERVAL_SECONDS = float(os.getenv("SHIFT_EDIT_MIN_INTERVAL", "1.2"))
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -162,99 +165,84 @@ class EscalationView(discord.ui.View):
         await self.cog.handle_escalation_stop(interaction, self.guild_id, self.shift_num)
 
 
-# ----------------- Cog -----------------
 class ShiftMonitor(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # GLOBAL persisted state keyed by guild_id (as string)
-        self.state: Dict[str, Any] = {
-            "guilds": {},  # str(guild_id) -> guild_state
-        }
+        # state["guilds"][str(guild_id)] = {"shift_state": {...}, "escalation_state": {...}, "checkpoints": {...}, ...}
+        self.state: Dict[str, Any] = {"guilds": {}}
 
         self._lock = asyncio.Lock()
         self._init_task: Optional[asyncio.Task] = None
 
+        # global edit throttle
+        self._edit_lock = asyncio.Lock()
+        self._global_last_edit_at = 0.0
+
         self.load_state()
-
-    # ----------------- Per-guild state helpers -----------------
-    def _ensure_guild_state(self, guild_id: int) -> Dict[str, Any]:
-        gkey = str(guild_id)
-        guilds = self.state.setdefault("guilds", {})
-        gs = guilds.get(gkey)
-        if not isinstance(gs, dict):
-            gs = {}
-            guilds[gkey] = gs
-
-        gs.setdefault("shift_state", {})
-        gs.setdefault("escalation_state", {})
-        gs.setdefault("invite_cache", {})
-        gs.setdefault("invite_registry", {})
-        gs.setdefault("checkpoints", dict(CHECKPOINTS_DEFAULT))
-        gs.setdefault("escalation_role_id", None)
-        gs.setdefault("log_channel_id", None)
-        return gs
-
-    def get_shift_state(self, guild_id: int) -> Dict[str, Dict[str, Any]]:
-        gs = self._ensure_guild_state(guild_id)
-        ss = gs.get("shift_state")
-        if not isinstance(ss, dict):
-            ss = {}
-            gs["shift_state"] = ss
-        return ss  # type: ignore
-
-    def get_escalation_state(self, guild_id: int) -> Dict[str, Dict[str, Any]]:
-        gs = self._ensure_guild_state(guild_id)
-        es = gs.get("escalation_state")
-        if not isinstance(es, dict):
-            es = {}
-            gs["escalation_state"] = es
-        return es  # type: ignore
-
-    def get_checkpoints(self, guild_id: int) -> Dict[int, str]:
-        gs = self._ensure_guild_state(guild_id)
-        cp = gs.get("checkpoints")
-        if not isinstance(cp, dict):
-            cp = dict(CHECKPOINTS_DEFAULT)
-            gs["checkpoints"] = cp
-        # normalize keys to int
-        out: Dict[int, str] = {}
-        for k, v in cp.items():
-            ik = safe_int(k, None)
-            if ik is None:
-                continue
-            out[ik] = str(v)
-        if not out:
-            out = dict(CHECKPOINTS_DEFAULT)
-        gs["checkpoints"] = {str(k): v for k, v in out.items()}
-        return out
-
-    def set_checkpoints(self, guild_id: int, checkpoints: Dict[int, str]) -> None:
-        gs = self._ensure_guild_state(guild_id)
-        gs["checkpoints"] = {str(k): v for k, v in checkpoints.items()}
 
     # ----------------- Persistence -----------------
     def load_state(self):
         if not STATE_FILE.exists():
             return
         try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("guilds"), dict):
-                self.state = data
+            self.state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(self.state, dict):
+                self.state = {"guilds": {}}
+            self.state.setdefault("guilds", {})
         except Exception:
             self.state = {"guilds": {}}
 
     def save_state(self):
         atomic_json_write(STATE_FILE, self.state)
 
+    def _gkey(self, guild_id: int) -> str:
+        return str(guild_id)
+
+    def _ensure_guild_state(self, guild_id: int) -> Dict[str, Any]:
+        gs = self.state.setdefault("guilds", {}).setdefault(self._gkey(guild_id), {})
+        if not isinstance(gs, dict):
+            gs = {}
+            self.state["guilds"][self._gkey(guild_id)] = gs
+        gs.setdefault("shift_state", {})
+        gs.setdefault("escalation_state", {})
+        gs.setdefault("invite_cache", {})
+        gs.setdefault("invite_registry", {})
+        gs.setdefault("checkpoints", dict(CHECKPOINTS_DEFAULT))
+        gs.setdefault("log_channel_id", None)
+        gs.setdefault("escalation_role_id", None)
+        return gs
+
+    def get_shift_state(self, guild_id: int) -> Dict[str, Dict[str, Any]]:
+        gs = self._ensure_guild_state(guild_id)
+        return gs["shift_state"]
+
+    def get_escalation_state(self, guild_id: int) -> Dict[str, Dict[str, Any]]:
+        gs = self._ensure_guild_state(guild_id)
+        return gs["escalation_state"]
+
+    def get_checkpoints(self, guild_id: int) -> Dict[int, str]:
+        gs = self._ensure_guild_state(guild_id)
+        cp = gs.get("checkpoints") or {}
+        out: Dict[int, str] = {}
+        if isinstance(cp, dict):
+            for k, v in cp.items():
+                ik = safe_int(k, None)
+                if ik is None:
+                    continue
+                out[ik] = str(v)
+        if not out:
+            out = dict(CHECKPOINTS_DEFAULT)
+        gs["checkpoints"] = {str(k): v for k, v in out.items()}
+        return out
+
     # ----------------- Logging -----------------
     async def log(self, guild: discord.Guild, message: str):
         print(message, flush=True)
-
         gs = self._ensure_guild_state(guild.id)
-        log_channel_id = gs.get("log_channel_id")
-
         ch = None
+
+        log_channel_id = gs.get("log_channel_id")
         if log_channel_id:
             ch = guild.get_channel(int(log_channel_id))
 
@@ -273,8 +261,8 @@ class ShiftMonitor(commands.Cog):
     # ----------------- Server Setup -----------------
     async def ensure_role(self, guild: discord.Guild) -> discord.Role:
         gs = self._ensure_guild_state(guild.id)
-        role_id = gs.get("escalation_role_id")
-        role = guild.get_role(int(role_id)) if role_id else None
+        rid = gs.get("escalation_role_id")
+        role = guild.get_role(int(rid)) if rid else None
         if role is None:
             role = discord.utils.get(guild.roles, name=ESCALATION_ROLE_NAME)
         if role is None:
@@ -306,11 +294,7 @@ class ShiftMonitor(commands.Cog):
 
         log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
         if log_ch is None:
-            log_ch = await guild.create_text_channel(
-                name=LOG_CHANNEL_NAME,
-                category=cat,
-                reason="ShiftMonitor auto-setup",
-            )
+            log_ch = await guild.create_text_channel(name=LOG_CHANNEL_NAME, category=cat, reason="ShiftMonitor auto-setup")
 
         gs = self._ensure_guild_state(guild.id)
         gs["log_channel_id"] = log_ch.id
@@ -331,6 +315,15 @@ class ShiftMonitor(commands.Cog):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
 
+    async def _throttled_edit(self, msg: discord.Message, *, view: discord.ui.View):
+        async with self._edit_lock:
+            now = asyncio.get_running_loop().time()
+            wait_for = (self._global_last_edit_at + GLOBAL_EDIT_MIN_INTERVAL_SECONDS) - now
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            await msg.edit(view=view)
+            self._global_last_edit_at = asyncio.get_running_loop().time()
+
     async def ensure_shift_message(self, guild: discord.Guild, shift_num: int) -> None:
         timer_id = f"id_{shift_num}"
         channel = discord.utils.get(guild.text_channels, name=CHANNEL_NAMES[shift_num])
@@ -338,7 +331,6 @@ class ShiftMonitor(commands.Cog):
             return
 
         shift_state = self.get_shift_state(guild.id)
-
         st = shift_state.get(timer_id)
         if not st:
             st = {
@@ -368,10 +360,10 @@ class ShiftMonitor(commands.Cog):
             msg = await channel.send(f"⏱️ **Shift {shift_num}**", view=view)
             st["message_id"] = msg.id
             st["last_render_key"] = None
+            self.save_state()
 
-        # register persistent view (safe to call multiple times)
+        # register persistent view
         self.bot.add_view(ShiftView(self, guild.id, timer_id, shift_num))
-        self.save_state()
         await self.render_shift_if_needed(guild, timer_id)
 
     async def render_shift_if_needed(self, guild: discord.Guild, timer_id: str) -> None:
@@ -380,7 +372,10 @@ class ShiftMonitor(commands.Cog):
         if not st:
             return
 
-        render_key = f"a={int(bool(st.get('active')))}|r={int(bool(st.get('running')))}|l={int(bool(st.get('locked')))}|o={st.get('owner_id')}"
+        render_key = (
+            f"a={int(bool(st.get('active')))}|r={int(bool(st.get('running')))}"
+            f"|l={int(bool(st.get('locked')))}|o={st.get('owner_id')}"
+        )
         if st.get("last_render_key") == render_key:
             return
 
@@ -390,7 +385,7 @@ class ShiftMonitor(commands.Cog):
 
         view = ShiftView(self, guild.id, timer_id, int(st["shift_num"]))
         try:
-            await msg.edit(view=view)
+            await self._throttled_edit(msg, view=view)
             st["last_render_key"] = render_key
             self.save_state()
         except discord.HTTPException:
@@ -557,24 +552,21 @@ class ShiftMonitor(commands.Cog):
         await self.end_escalation(interaction.guild, shift_num, "Manual stop by claimer")
         await interaction.response.send_message("🟥 Escalation shift ended.", ephemeral=True)
 
-    # ----------------- Checkpoint loop (GLOBAL) -----------------
+    # ----------------- Checkpoint loop -----------------
     @tasks.loop(seconds=10)
     async def checkpoint_loop(self):
-        # iterate all guilds the bot is in
+        # run over all guilds the bot is in
         for guild in list(self.bot.guilds):
             checkpoints = self.get_checkpoints(guild.id)
             current_cp = get_current_checkpoint(checkpoints)
             now_ts = int(now_utc().timestamp())
-
-            shift_state = self.get_shift_state(guild.id)
-            escalation_state = self.get_escalation_state(guild.id)
-
             to_escalate: list[int] = []
             to_render: set[str] = set()
 
             async with self._lock:
+                shift_state = self.get_shift_state(guild.id)
                 for timer_id, st in shift_state.items():
-                    sn = st.get("shift_num")
+                    sn = safe_int(st.get("shift_num"), None)
                     if sn not in (1, 2, 3, 4):
                         continue
 
@@ -608,22 +600,23 @@ class ShiftMonitor(commands.Cog):
                         st["escalated"] = True
                         st["last_render_key"] = None
                         to_render.add(timer_id)
-                        to_escalate.append(int(sn))
+                        to_escalate.append(sn)
 
                 self.save_state()
 
+            # render updates for this guild (spaced by global throttle)
             for timer_id in to_render:
                 await self.render_shift_if_needed(guild, timer_id)
 
             for sn in to_escalate:
-                if str(sn) not in escalation_state:
+                if str(sn) not in self.get_escalation_state(guild.id):
                     await self.escalate_shift(guild, sn, f"No one started within {fmt_td(ESCALATION_TIMEOUT)}")
 
     @checkpoint_loop.before_loop
     async def before_checkpoint_loop(self):
         await self.bot.wait_until_ready()
 
-    # ----------------- Slash Commands (GLOBAL) -----------------
+    # ----------------- Slash Commands -----------------
     @app_commands.command(name="setup_shifts", description="Create missing channels/role and initialize shift messages.")
     async def setup_shifts_cmd(self, interaction: discord.Interaction):
         if not interaction.guild:
@@ -631,7 +624,7 @@ class ShiftMonitor(commands.Cog):
         if not has_owner_privs(interaction):
             await interaction.response.send_message(
                 f"Only the **server owner** or **{OWNER_ROLE_NAME}** can use this.",
-                ephemeral=True
+                ephemeral=True,
             )
             return
 
@@ -640,6 +633,7 @@ class ShiftMonitor(commands.Cog):
         await self.ensure_server_objects(interaction.guild)
         for i in range(1, 5):
             await self.ensure_shift_message(interaction.guild, i)
+            await asyncio.sleep(0.25)  # small spacing for API friendliness
 
         if not self.checkpoint_loop.is_running():
             self.checkpoint_loop.start()
@@ -653,7 +647,7 @@ class ShiftMonitor(commands.Cog):
         if not has_owner_privs(interaction):
             await interaction.response.send_message(
                 f"Only the **server owner** or **{OWNER_ROLE_NAME}** can use this.",
-                ephemeral=True
+                ephemeral=True,
             )
             return
         if shift_number not in (1, 2, 3, 4):
@@ -675,31 +669,34 @@ class ShiftMonitor(commands.Cog):
 
     # ----------------- Lifecycle -----------------
     async def cog_load(self):
-        # DO NOT await wait_until_ready here
         if self._init_task is None or self._init_task.done():
-            self._init_task = self.bot.loop.create_task(self._post_ready_init())
+            self._init_task = asyncio.create_task(self._post_ready_init())
         print("[shift_monitor] cog_load: scheduled post-ready init", flush=True)
 
     async def _post_ready_init(self):
         await self.bot.wait_until_ready()
         try:
-            # Register persistent views for any saved state we already know about
-            # (also ensures custom_ids are registered across restarts)
-            guild_ids = list((self.state.get("guilds") or {}).keys())
-            for gkey in guild_ids:
-                gid = safe_int(gkey, None)
-                if gid is None:
-                    continue
+            # hydrate for all guilds we have state for (and also current guilds)
+            guild_ids = set(self._ensure_guild_state(g.id) and g.id for g in self.bot.guilds)
+
+            # also include guild IDs from saved state
+            saved = (self.state.get("guilds") or {})
+            if isinstance(saved, dict):
+                for gkey in saved.keys():
+                    gid = safe_int(gkey, None)
+                    if gid is not None:
+                        guild_ids.add(gid)
+
+            for gid in sorted(guild_ids):
                 guild = self.bot.get_guild(gid)
                 if not guild:
                     continue
-
-                # Ensure server objects exist, hydrate messages, start loop
                 await self.ensure_server_objects(guild)
                 for i in range(1, 5):
                     await self.ensure_shift_message(guild, i)
+                    await asyncio.sleep(0.25)
 
-                # register escalation views if any exist
+                # register escalation views
                 esc = self.get_escalation_state(guild.id)
                 for sn_str in list(esc.keys()):
                     sn = safe_int(sn_str, None)
