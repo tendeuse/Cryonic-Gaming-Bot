@@ -1,4 +1,8 @@
 # cogs/shift_monitor.py
+# FIXED: no deadlock on startup (DO NOT await wait_until_ready in cog_load)
+# FIXED: post-ready init runs in a background task
+# FIXED: buttons use persistent custom_ids
+# FIXED: persists only IDs + primitives (Railway restart-safe)
 
 import asyncio
 import json
@@ -108,6 +112,7 @@ class ShiftView(discord.ui.View):
         self.timer_id = timer_id
         self.shift_num = shift_num
 
+        # Persistent unique ids
         self.start_btn.custom_id = f"shift:{timer_id}:start"
         self.stop_btn.custom_id = f"shift:{timer_id}:stop"
         self.sync_enabled_states()
@@ -135,6 +140,7 @@ class EscalationView(discord.ui.View):
         self.cog = cog
         self.shift_num = shift_num
 
+        # Persistent unique ids
         self.claim_btn.custom_id = f"esc:{shift_num}:claim"
         self.stop_btn.custom_id = f"esc:{shift_num}:stop"
         self.sync_enabled_states()
@@ -168,6 +174,8 @@ class ShiftMonitor(commands.Cog):
         self._log_channel_id: Optional[int] = None
 
         self._lock = asyncio.Lock()
+        self._init_task: Optional[asyncio.Task] = None
+
         self.load_state()
 
     # ----------------- Persistence -----------------
@@ -210,7 +218,7 @@ class ShiftMonitor(commands.Cog):
 
     # ----------------- Logging -----------------
     async def log(self, message: str):
-        print(message)
+        print(message, flush=True)
         guild = self.bot.get_guild(GUILD_ID)
         if not guild:
             return
@@ -248,7 +256,12 @@ class ShiftMonitor(commands.Cog):
             cat = await guild.create_category(name=SHIFT_CATEGORY_NAME, reason="ShiftMonitor auto-setup")
         return cat
 
-    async def ensure_text_channel(self, guild: discord.Guild, name: str, category: Optional[discord.CategoryChannel]) -> discord.TextChannel:
+    async def ensure_text_channel(
+        self,
+        guild: discord.Guild,
+        name: str,
+        category: Optional[discord.CategoryChannel],
+    ) -> discord.TextChannel:
         ch = discord.utils.get(guild.text_channels, name=name)
         if ch is None:
             ch = await guild.create_text_channel(name=name, category=category, reason="ShiftMonitor auto-setup")
@@ -264,7 +277,11 @@ class ShiftMonitor(commands.Cog):
 
         log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
         if log_ch is None:
-            log_ch = await guild.create_text_channel(name=LOG_CHANNEL_NAME, category=cat, reason="ShiftMonitor auto-setup")
+            log_ch = await guild.create_text_channel(
+                name=LOG_CHANNEL_NAME,
+                category=cat,
+                reason="ShiftMonitor auto-setup",
+            )
         self._log_channel_id = log_ch.id
 
         for i in range(1, 5):
@@ -319,6 +336,7 @@ class ShiftMonitor(commands.Cog):
             st["message_id"] = msg.id
             st["last_render_key"] = None
 
+        # register persistent view
         self.bot.add_view(ShiftView(self, timer_id, shift_num))
         await self.render_shift_if_needed(guild, timer_id)
 
@@ -358,6 +376,7 @@ class ShiftMonitor(commands.Cog):
             return
 
         st["locked"] = True
+        st["last_render_key"] = None
         await self.render_shift_if_needed(guild, timer_id)
 
         role = await self.ensure_role(guild)
@@ -366,7 +385,10 @@ class ShiftMonitor(commands.Cog):
             return
 
         remaining = time_until_next_checkpoint(self.checkpoints)
-        content = f"{role.mention} **Shift {shift_num} has unclaimed time ({fmt_td(remaining)} remaining). Claim it?**\nReason: {reason}"
+        content = (
+            f"{role.mention} **Shift {shift_num} has unclaimed time ({fmt_td(remaining)} remaining). Claim it?**\n"
+            f"Reason: {reason}"
+        )
         msg = await ch.send(content, view=EscalationView(self, shift_num))
 
         self.escalation_state[esc_key] = {
@@ -611,23 +633,38 @@ class ShiftMonitor(commands.Cog):
 
     # ----------------- Lifecycle -----------------
     async def cog_load(self):
+        # CRITICAL FIX: do NOT await wait_until_ready() here (can stall bot setup_hook)
+        if self._init_task is None or self._init_task.done():
+            self._init_task = self.bot.loop.create_task(self._post_ready_init())
+        print("[shift_monitor] cog_load: scheduled post-ready init", flush=True)
+
+    async def _post_ready_init(self):
         await self.bot.wait_until_ready()
-        guild = self.bot.get_guild(GUILD_ID)
-        if not guild:
-            return
+        try:
+            guild = self.bot.get_guild(GUILD_ID)
+            if not guild:
+                print("[shift_monitor] post-ready init: guild not found", flush=True)
+                return
 
-        await self.ensure_server_objects()
-        for i in range(1, 5):
-            await self.ensure_shift_message(guild, i)
+            await self.ensure_server_objects()
+            for i in range(1, 5):
+                await self.ensure_shift_message(guild, i)
 
-        if not self.checkpoint_loop.is_running():
-            self.checkpoint_loop.start()
+            if not self.checkpoint_loop.is_running():
+                self.checkpoint_loop.start()
 
-        await self.log("✅ ShiftMonitor loaded and running.")
+            await self.log("✅ ShiftMonitor loaded and running.")
+            print("[shift_monitor] post-ready init complete", flush=True)
+        except Exception as e:
+            print(f"[shift_monitor] post-ready init failed: {type(e).__name__}: {e}", flush=True)
+            import traceback as _tb
+            _tb.print_exception(type(e), e, e.__traceback__)
 
     async def cog_unload(self):
         if self.checkpoint_loop.is_running():
             self.checkpoint_loop.cancel()
+        if self._init_task and not self._init_task.done():
+            self._init_task.cancel()
         self.save_state()
 
 
