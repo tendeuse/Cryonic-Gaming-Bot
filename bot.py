@@ -1,6 +1,5 @@
 import os
 import traceback
-import inspect
 from pathlib import Path
 
 import discord
@@ -12,7 +11,10 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not set in environment variables.")
 
-GUILD_ID = 1444318058419322983
+# IMPORTANT:
+# - DEV_GUILD_ID is optional. Set it in Railway only if you want fast guild sync.
+# - If not set (or 0), guild sync is skipped entirely (no more 50001 tracebacks).
+DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0"))
 
 ADMIN_SYNC_ROLE_NAMES = {
     # "ARC Security Corporation Leader",
@@ -36,7 +38,7 @@ class SyncCog(commands.Cog):
 
     @app_commands.command(
         name="sync",
-        description="Admin-only: sync slash commands to the main guild (fast) and optionally global (slow).",
+        description="Admin-only: sync slash commands to the current server (fast) and optionally global (slow).",
     )
     async def sync(
         self,
@@ -54,7 +56,8 @@ class SyncCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        guild_obj = discord.Object(id=GUILD_ID)
+        # Sync to the guild you ran /sync in (prevents Missing Access issues)
+        guild_obj = discord.Object(id=interaction.guild.id)
 
         try:
             if clean_guild:
@@ -62,7 +65,7 @@ class SyncCog(commands.Cog):
 
             self.bot.tree.copy_global_to(guild=guild_obj)
             synced = await self.bot.tree.sync(guild=guild_obj)
-            msg = f"✅ Guild sync complete. Synced `{len(synced)}` command(s) to `{GUILD_ID}`."
+            msg = f"✅ Guild sync complete. Synced `{len(synced)}` command(s) to `{interaction.guild.id}`."
 
             if also_global:
                 gsynced = await self.bot.tree.sync()
@@ -98,7 +101,7 @@ class MyBot(commands.Bot):
             listing = sorted([p.name for p in cogs_dir.iterdir()])
             print("[COGS] Directory listing:", listing)
 
-            # ---- Load cogs ----
+            # ---- Load cogs (idempotent: skip if already loaded) ----
             loaded = []
             failed = []
 
@@ -108,10 +111,16 @@ class MyBot(commands.Bot):
 
                 ext = f"cogs.{filename[:-3]}"
                 print(f"[COGS] Attempting load: {ext}")
+
                 try:
+                    if ext in self.extensions:
+                        print(f"[COGS] SKIP (already loaded): {ext}")
+                        continue
+
                     await self.load_extension(ext)
                     print(f"[COGS] Loaded: {ext}")
                     loaded.append(ext)
+
                 except Exception as e:
                     print(f"[COGS] FAILED: {ext} -> {type(e).__name__}: {e}")
                     traceback.print_exception(type(e), e, e.__traceback__)
@@ -121,10 +130,13 @@ class MyBot(commands.Bot):
             if failed:
                 print(f"[COGS] FAILED ({len(failed)}): {failed}")
 
-            # ---- Add /sync ----
+            # ---- Add /sync (idempotent) ----
             try:
-                await self.add_cog(SyncCog(self))
-                print("[BOOT] Loaded internal cog: SyncCog (/sync)")
+                if self.get_cog("SyncCog") is None:
+                    await self.add_cog(SyncCog(self))
+                    print("[BOOT] Loaded internal cog: SyncCog (/sync)")
+                else:
+                    print("[BOOT] SyncCog already loaded; skipping.")
             except Exception as e:
                 print("[BOOT] Failed to add SyncCog:", e)
                 traceback.print_exception(type(e), e, e.__traceback__)
@@ -139,17 +151,25 @@ class MyBot(commands.Bot):
                 traceback.print_exception(type(e), e, e.__traceback__)
                 return
 
-            # ---- Guild sync (fast, immediate in your server) ----
-            try:
-                guild_obj = discord.Object(id=GUILD_ID)
-                self.tree.copy_global_to(guild=guild_obj)
-                synced_guild = await self.tree.sync(guild=guild_obj)
-                print(f"[SYNC] Guild synced {len(synced_guild)} commands to {GUILD_ID}.")
-            except Exception as e:
-                print("[SYNC] Guild sync failed:", e)
-                traceback.print_exception(type(e), e, e.__traceback__)
+            # ---- Guild sync (OPTIONAL; only if DEV_GUILD_ID is set & accessible) ----
+            if DEV_GUILD_ID:
+                guild_obj = self.get_guild(DEV_GUILD_ID)
+                if guild_obj is None:
+                    print(f"[SYNC] Skipping guild sync: bot cannot access guild {DEV_GUILD_ID} (wrong ID or bot not in server).")
+                else:
+                    try:
+                        self.tree.copy_global_to(guild=guild_obj)
+                        synced_guild = await self.tree.sync(guild=guild_obj)
+                        print(f"[SYNC] Guild synced {len(synced_guild)} commands to {DEV_GUILD_ID}.")
+                    except discord.Forbidden:
+                        print(f"[SYNC] Guild sync forbidden for guild {DEV_GUILD_ID}: Missing Access (50001).")
+                    except Exception as e:
+                        print(f"[SYNC] Guild sync failed for guild {DEV_GUILD_ID}: {type(e).__name__}: {e}")
+                        traceback.print_exception(type(e), e, e.__traceback__)
+            else:
+                print("[SYNC] Guild sync skipped (DEV_GUILD_ID not set).")
 
-            # ---- Global sync (optional; keep if you want) ----
+            # ---- Global sync (safe default) ----
             try:
                 synced_global = await self.tree.sync()
                 print(f"[SYNC] Global synced {len(synced_global)} commands.")
