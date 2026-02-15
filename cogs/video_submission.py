@@ -5,9 +5,10 @@
 # FIXES INCLUDED:
 # - Legacy button compatibility (old approvals after restarts/format changes)
 # - Admin tools: list/repost/force-decide
-# - NEW repair tool: /video_set_submitter key @member  (fixes <@0> broken legacy entries)
-# - SAFETY: approval refuses if submitter_id is missing/0 (prevents silent bad awards)
-# - Awards AP even if submitter isn't cached (fetch_member fallback)
+# - Repair tool: /video_set_submitter key @member  (fixes <@0>)
+# - NEW: /video_recalc key  (re-fetches duration/title and recalculates AP)
+# - NEW: /video_recalc_all_pending  (batch fix backlog AP=0)
+# - SAFETY: approval refuses if submitter missing OR video still has 0 duration/ap
 #
 # Requires:
 # - YOUTUBE_API_KEY
@@ -37,7 +38,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
-print("VIDEO_SUBMISSION LOADED VERSION: 2026-02-15-FULLFIX-REPAIR-SUBMITTER")
+print("VIDEO_SUBMISSION LOADED VERSION: 2026-02-15-FULLFIX+RECALC")
 
 # =====================
 # PERSISTENCE (Railway Volume)
@@ -151,6 +152,13 @@ def iso_to_discord_ts(iso_str: str) -> str:
         return iso_str
 
 
+def unix_to_discord_ts(unix_s: int) -> str:
+    try:
+        return f"<t:{int(unix_s)}:f>"
+    except Exception:
+        return str(unix_s)
+
+
 # =====================
 # PERMISSIONS / ROLES
 # =====================
@@ -195,6 +203,14 @@ def drive_id(url: str):
 def fingerprint(platform: str, duration: float, title: str = ""):
     base = f"{platform}:{round(duration)}:{title.lower().strip()}"
     return hashlib.sha256(base.encode()).hexdigest()
+
+
+def calc_ap(seconds: float) -> int:
+    # 1000 AP per hour
+    try:
+        return int((float(seconds) / 3600.0) * 1000)
+    except Exception:
+        return 0
 
 
 # =====================
@@ -470,7 +486,7 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
             await safe_send(interaction, "❌ This must be used in a server.", ephemeral=True)
             return
 
-        if not self.cog or not can_run_video_report(interaction.user):
+        if not can_run_video_report(interaction.user):
             await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
             return
 
@@ -587,7 +603,6 @@ class VideoSubmissionCog(commands.Cog):
         videos = await load(VIDEO_FILE)
         if not isinstance(videos, dict):
             return
-
         for key, v in videos.items():
             if not isinstance(v, dict):
                 continue
@@ -602,13 +617,10 @@ class VideoSubmissionCog(commands.Cog):
     # -----------------
 
     def _extract_key_from_embed(self, embed: discord.Embed) -> Optional[str]:
-        """Best-effort: parse the URL field or raw description to derive key (YouTube ID or Drive ID)."""
         candidates = []
-
         for f in getattr(embed, "fields", []) or []:
             if isinstance(f.value, str) and "http" in f.value:
                 candidates.append(f.value)
-
         if isinstance(embed.description, str) and "http" in embed.description:
             candidates.append(embed.description)
 
@@ -619,19 +631,9 @@ class VideoSubmissionCog(commands.Cog):
             did = drive_id(text)
             if did:
                 return did
-
         return None
 
     def _parse_custom_id_for_key(self, custom_id: str, interaction: discord.Interaction) -> Tuple[Optional[str], Optional[bool]]:
-        """
-        Returns (key, approve) if recognized.
-        Supports:
-          - video:approve:<key> / video:reject:<key>  (current)
-          - approve:<key>, reject:<key>
-          - video_approve_<key>, video_reject_<key>
-          - approve_video:<key>, reject_video:<key>
-          - approve_video, reject_video (NO key) -> fallback to embed URL
-        """
         cid = str(custom_id or "")
 
         m = re.fullmatch(r"video:(approve|reject):(.+)", cid)
@@ -663,10 +665,6 @@ class VideoSubmissionCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
-        """
-        Catch legacy approval buttons that no longer have a registered View after updates/restarts.
-        If we can parse a key+decision, route to process_decision().
-        """
         try:
             if interaction.type != discord.InteractionType.component:
                 return
@@ -716,8 +714,8 @@ class VideoSubmissionCog(commands.Cog):
 
         title = str(f.get("name", "Untitled"))
         vmeta = f.get("videoMediaMetadata") or {}
-
         ms = vmeta.get("durationMillis")
+
         if ms is None:
             mime = f.get("mimeType")
             size = f.get("size")
@@ -728,6 +726,53 @@ class VideoSubmissionCog(commands.Cog):
 
         sec = int(ms) / 1000
         return float(sec), title
+
+    async def _recalc_entry(self, key: str, v: dict) -> Tuple[bool, str]:
+        """
+        Re-fetch duration/title from YouTube/Drive and recompute AP.
+        Returns (changed?, message)
+        """
+        url = str(v.get("url", "") or "")
+        key = str(key).strip()
+
+        yid = yt_id(url) or (key if re.fullmatch(r"[A-Za-z0-9_-]{11}", key) else None)
+        did = drive_id(url) or (key if not yid else None)
+
+        if not yid and not did:
+            return False, "unsupported url/key"
+
+        try:
+            if yid:
+                seconds, title = await asyncio.to_thread(self.youtube_data_blocking, yid)
+                platform = "youtube"
+                real_key = yid
+            else:
+                seconds, title = await asyncio.to_thread(self.drive_duration_blocking, did)
+                platform = "drive"
+                real_key = did
+        except Exception as e:
+            return False, f"lookup failed: {type(e).__name__}: {e}"
+
+        ap_reward = calc_ap(seconds)
+        fp = fingerprint(platform, seconds, title)
+
+        changed = False
+        if float(v.get("duration", 0) or 0) != float(seconds):
+            v["duration"] = float(seconds)
+            changed = True
+        if str(v.get("title", "") or "") != str(title):
+            v["title"] = str(title)
+            changed = True
+        if int(v.get("ap", 0) or 0) != int(ap_reward):
+            v["ap"] = int(ap_reward)
+            changed = True
+        if str(v.get("fingerprint", "") or "") != str(fp):
+            v["fingerprint"] = str(fp)
+            changed = True
+
+        # If the stored dict key is wrong vs derived key, we won't rename automatically here
+        # (to avoid breaking existing approvals). We'll just update fields.
+        return changed, f"duration={round(seconds/3600,2)}h ap={ap_reward}"
 
     # =====================
     # MANUAL REPORT COMMAND
@@ -818,7 +863,7 @@ class VideoSubmissionCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # =====================
-    # MANAGER TOOLS (FIX STUCK SUBMISSIONS)
+    # MANAGER TOOLS
     # =====================
 
     @app_commands.command(name="video_list_pending", description="List pending (unapproved) video submissions")
@@ -847,20 +892,30 @@ class VideoSubmissionCog(commands.Cog):
             return
 
         lines = []
-        for k, v in pending[:30]:
+        for k, v in pending[:40]:
             title = str(v.get("title", "Untitled"))[:60]
             sub = int(v.get("submitter", 0) or 0)
             ap = int(v.get("ap", 0) or 0)
-            ts = str(v.get("submitted_at", ""))
-            lines.append(f"• **{k}** — {title} — <@{sub}> — **{ap} AP** — {iso_to_discord_ts(ts)}")
+
+            submitted_at = v.get("submitted_at")
+            if isinstance(submitted_at, str) and submitted_at.endswith("Z"):
+                ts_label = iso_to_discord_ts(submitted_at)
+            else:
+                # your list output shows unix; support that too
+                try:
+                    ts_label = unix_to_discord_ts(int(submitted_at))
+                except Exception:
+                    ts_label = str(submitted_at or "")
+
+            lines.append(f"• **{k}** — {title} — <@{sub}> — **{ap} AP** — {ts_label}")
 
         extra = ""
-        if len(pending) > 30:
-            extra = f"\n…and **{len(pending)-30}** more."
+        if len(pending) > 40:
+            extra = f"\n…and **{len(pending)-40}** more."
 
         await safe_send(interaction, "Pending submissions:\n" + "\n".join(lines) + extra, ephemeral=True)
 
-    @app_commands.command(name="video_repost_pending", description="Repost pending approvals with fresh working buttons")
+    @app_commands.command(name="video_repost_pending", description="Repost pending approvals with fresh working buttons (auto-recalc AP if needed)")
     async def video_repost_pending(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True)
 
@@ -881,17 +936,33 @@ class VideoSubmissionCog(commands.Cog):
             await safe_send(interaction, "No submissions found.", ephemeral=True)
             return
 
-        pending = []
-        for k, v in videos.items():
-            if isinstance(v, dict) and v.get("approved") is None:
-                pending.append((str(k), v))
-
-        if not pending:
+        pending_keys = [k for k, v in videos.items() if isinstance(v, dict) and v.get("approved") is None]
+        if not pending_keys:
             await safe_send(interaction, "✅ No pending submissions to repost.", ephemeral=True)
             return
 
+        recalced = 0
         posted = 0
-        for k, v in pending[:50]:  # cap to avoid spam
+
+        # attempt recalc for broken entries before posting
+        for k in pending_keys[:50]:
+            v = videos.get(k)
+            if not isinstance(v, dict):
+                continue
+
+            if int(v.get("ap", 0) or 0) <= 0 or float(v.get("duration", 0) or 0) <= 0:
+                changed, _msg = await self._recalc_entry(str(k), v)
+                if changed:
+                    recalced += 1
+
+        if recalced:
+            await save(VIDEO_FILE, videos)
+
+        for k in pending_keys[:50]:
+            v = videos.get(k)
+            if not isinstance(v, dict):
+                continue
+
             title = str(v.get("title", "Untitled"))
             url = str(v.get("url", ""))
             seconds = float(v.get("duration", 0) or 0)
@@ -907,16 +978,21 @@ class VideoSubmissionCog(commands.Cog):
 
             try:
                 try:
-                    self.bot.add_view(ApprovalView(self, k))
+                    self.bot.add_view(ApprovalView(self, str(k)))
                 except Exception:
                     pass
 
-                await approval_ch.send(embed=embed, view=ApprovalView(self, k))
+                await approval_ch.send(embed=embed, view=ApprovalView(self, str(k)))
                 posted += 1
             except (discord.Forbidden, discord.HTTPException):
                 continue
 
-        await safe_send(interaction, f"✅ Reposted **{posted}** pending approval cards in #{APPROVAL_CHANNEL}.", ephemeral=True)
+        await safe_send(
+            interaction,
+            f"✅ Reposted **{posted}** pending approval cards in #{APPROVAL_CHANNEL}. "
+            f"(Auto-recalculated **{recalced}** entries with 0 AP/duration.)",
+            ephemeral=True
+        )
 
     @app_commands.command(name="video_force_decide", description="Force approve/reject a submission by key (no button click needed)")
     @app_commands.describe(key="Video key (YouTube ID or Drive ID)", decision="approve or reject")
@@ -937,7 +1013,6 @@ class VideoSubmissionCog(commands.Cog):
 
         await self.process_decision(interaction, str(key).strip(), approve=(d == "approve"))
 
-    # NEW: Repair broken legacy entries with submitter_id=0
     @app_commands.command(name="video_set_submitter", description="Repair a submission by setting the correct submitter (fixes <@0>)")
     @app_commands.describe(key="Video key (YouTube ID or Drive ID)", member="Discord member who should receive AP")
     async def video_set_submitter(self, interaction: discord.Interaction, key: str, member: discord.Member):
@@ -964,6 +1039,79 @@ class VideoSubmissionCog(commands.Cog):
 
         await save(VIDEO_FILE, videos)
         await safe_send(interaction, f"✅ Set submitter for `{key}` to {member.mention}.", ephemeral=True)
+
+    @app_commands.command(name="video_recalc", description="Recalculate duration/title/AP for a submission by key (fixes 0 AP legacy rows)")
+    @app_commands.describe(key="Video key (YouTube ID or Drive ID)")
+    async def video_recalc(self, interaction: discord.Interaction, key: str):
+        await safe_defer(interaction, ephemeral=True)
+
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await safe_send(interaction, "❌ Must be used in a server.", ephemeral=True)
+            return
+        if not is_manager(interaction.user):
+            await safe_send(interaction, "❌ Only CEO/Directors can use this.", ephemeral=True)
+            return
+
+        key = str(key).strip()
+        videos = await load(VIDEO_FILE)
+        if not isinstance(videos, dict) or key not in videos or not isinstance(videos[key], dict):
+            await safe_send(interaction, f"❌ Video not found for key `{key}`.", ephemeral=True)
+            return
+
+        changed, msg = await self._recalc_entry(key, videos[key])
+        if changed:
+            await save(VIDEO_FILE, videos)
+            await safe_send(interaction, f"✅ Recalculated `{key}`: {msg}", ephemeral=True)
+        else:
+            await safe_send(interaction, f"⚠️ No change for `{key}` ({msg}).", ephemeral=True)
+
+    @app_commands.command(name="video_recalc_all_pending", description="Batch recalc duration/title/AP for pending submissions where AP/duration are 0")
+    async def video_recalc_all_pending(self, interaction: discord.Interaction):
+        await safe_defer(interaction, ephemeral=True)
+
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await safe_send(interaction, "❌ Must be used in a server.", ephemeral=True)
+            return
+        if not is_manager(interaction.user):
+            await safe_send(interaction, "❌ Only CEO/Directors can use this.", ephemeral=True)
+            return
+
+        videos = await load(VIDEO_FILE)
+        if not isinstance(videos, dict) or not videos:
+            await safe_send(interaction, "No submissions found.", ephemeral=True)
+            return
+
+        changed_count = 0
+        tried = 0
+        failed = 0
+
+        # cap to avoid hammering APIs too hard in one command; raise if needed
+        keys = [k for k, v in videos.items() if isinstance(v, dict) and v.get("approved") is None]
+        for k in keys[:75]:
+            v = videos.get(k)
+            if not isinstance(v, dict):
+                continue
+
+            if int(v.get("ap", 0) or 0) > 0 and float(v.get("duration", 0) or 0) > 0:
+                continue
+
+            tried += 1
+            changed, msg = await self._recalc_entry(str(k), v)
+            if changed:
+                changed_count += 1
+            else:
+                # if lookup failed, msg will say so
+                if "lookup failed" in msg:
+                    failed += 1
+
+        if changed_count:
+            await save(VIDEO_FILE, videos)
+
+        await safe_send(
+            interaction,
+            f"✅ Recalc complete. Tried **{tried}** pending entries; updated **{changed_count}**; lookup failures **{failed}**.",
+            ephemeral=True
+        )
 
     # =====================
     # SUBMISSION / APPROVAL FLOW
@@ -1009,7 +1157,7 @@ class VideoSubmissionCog(commands.Cog):
             await safe_send(interaction, "❌ This video (or a re-upload) was already submitted.", ephemeral=True)
             return
 
-        ap_reward = int((seconds / 3600) * 1000)
+        ap_reward = calc_ap(seconds)
         submitter_had_security = any(r.name == SECURITY_ROLE for r in interaction.user.roles)
 
         if not isinstance(videos, dict):
@@ -1018,9 +1166,9 @@ class VideoSubmissionCog(commands.Cog):
         videos[str(key)] = {
             "url": url,
             "submitter": interaction.user.id,
-            "duration": seconds,
-            "title": title,
-            "ap": ap_reward,
+            "duration": float(seconds),
+            "title": str(title),
+            "ap": int(ap_reward),
             "fingerprint": fp,
             "approved": None,
             "submitted_at": now_iso(),
@@ -1093,13 +1241,20 @@ class VideoSubmissionCog(commands.Cog):
             return
 
         submitter_id = int(video.get("submitter", 0) or 0)
-
-        # SAFETY: refuse if legacy data lost submitter
         if submitter_id <= 0:
             await safe_send(
                 interaction,
                 "❌ This submission has no valid submitter recorded (submitter=0). "
                 f"Fix it with `/video_set_submitter key:{key} member:@User` then approve again.",
+                ephemeral=False
+            )
+            return
+
+        # SAFETY: if legacy row never had metadata, force recalc first
+        if approve and (float(video.get("duration", 0) or 0) <= 0 or int(video.get("ap", 0) or 0) <= 0):
+            await safe_send(
+                interaction,
+                f"❌ This submission still has **0 duration/AP**. Run `/video_recalc key:{key}` first, then approve.",
                 ephemeral=False
             )
             return
