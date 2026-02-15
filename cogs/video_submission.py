@@ -2,10 +2,12 @@
 #
 # Video Submission + Approval (Railway /data persistent, restart-safe)
 #
-# Fixes "previous submissions not processing" by:
-# - Adding legacy button compatibility (custom_id parsing + embed URL fallback)
-# - Adding admin commands to list/repost/force-decide pending videos
-# - Awarding AP even if submitter isn't cached; CEO bonus uses stored flag when available
+# FIXES INCLUDED:
+# - Legacy button compatibility (old approvals after restarts/format changes)
+# - Admin tools: list/repost/force-decide
+# - NEW repair tool: /video_set_submitter key @member  (fixes <@0> broken legacy entries)
+# - SAFETY: approval refuses if submitter_id is missing/0 (prevents silent bad awards)
+# - Awards AP even if submitter isn't cached (fetch_member fallback)
 #
 # Requires:
 # - YOUTUBE_API_KEY
@@ -24,7 +26,7 @@ import base64
 import inspect
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
@@ -35,7 +37,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
-print("VIDEO_SUBMISSION LOADED VERSION: 2026-02-15-LEGACY-BUTTON-FIX+TOOLS")
+print("VIDEO_SUBMISSION LOADED VERSION: 2026-02-15-FULLFIX-REPAIR-SUBMITTER")
 
 # =====================
 # PERSISTENCE (Railway Volume)
@@ -468,7 +470,7 @@ class VideoLengthReportModal(discord.ui.Modal, title="Video Length Report"):
             await safe_send(interaction, "❌ This must be used in a server.", ephemeral=True)
             return
 
-        if not can_run_video_report(interaction.user):
+        if not self.cog or not can_run_video_report(interaction.user):
             await safe_send(interaction, f"❌ Only **{CEO_ROLE}** and **{LYCAN_ROLE}** can run this report.", ephemeral=True)
             return
 
@@ -603,12 +605,10 @@ class VideoSubmissionCog(commands.Cog):
         """Best-effort: parse the URL field or raw description to derive key (YouTube ID or Drive ID)."""
         candidates = []
 
-        # check fields first
         for f in getattr(embed, "fields", []) or []:
             if isinstance(f.value, str) and "http" in f.value:
                 candidates.append(f.value)
 
-        # also scan description
         if isinstance(embed.description, str) and "http" in embed.description:
             candidates.append(embed.description)
 
@@ -634,12 +634,10 @@ class VideoSubmissionCog(commands.Cog):
         """
         cid = str(custom_id or "")
 
-        # Current
         m = re.fullmatch(r"video:(approve|reject):(.+)", cid)
         if m:
             return m.group(2), (m.group(1) == "approve")
 
-        # Common legacy separators
         m = re.fullmatch(r"(approve|reject)[:_](.+)", cid)
         if m:
             return m.group(2), (m.group(1) == "approve")
@@ -652,10 +650,8 @@ class VideoSubmissionCog(commands.Cog):
         if m:
             return m.group(2), (m.group(1).startswith("approve"))
 
-        # Keyless legacy buttons (collision style)
         if cid in ("approve_video", "reject_video", "video_approve", "video_reject", "approve", "reject"):
             approve = cid in ("approve_video", "video_approve", "approve")
-            # try embed URL fallback
             try:
                 if interaction.message and interaction.message.embeds:
                     key = self._extract_key_from_embed(interaction.message.embeds[0])
@@ -685,7 +681,6 @@ class VideoSubmissionCog(commands.Cog):
             if not key or approve is None:
                 return
 
-            # If it's not a manager, let process_decision handle messaging.
             await self.process_decision(interaction, str(key), approve=bool(approve))
         except Exception:
             return
@@ -705,7 +700,6 @@ class VideoSubmissionCog(commands.Cog):
 
     def drive_duration_blocking(self, fid: str):
         def fetch(file_id: str):
-            # FIX: removed invalid field selection "mediaInfo"
             return self.drive.files().get(
                 fileId=file_id,
                 fields="id,name,mimeType,size,videoMediaMetadata,shortcutDetails"
@@ -713,7 +707,6 @@ class VideoSubmissionCog(commands.Cog):
 
         f = fetch(fid)
 
-        # Resolve shortcuts
         if f.get("mimeType") == "application/vnd.google-apps.shortcut":
             sd = f.get("shortcutDetails") or {}
             target_id = sd.get("targetId")
@@ -853,7 +846,6 @@ class VideoSubmissionCog(commands.Cog):
             await safe_send(interaction, "✅ No pending submissions.", ephemeral=True)
             return
 
-        # Build compact message
         lines = []
         for k, v in pending[:30]:
             title = str(v.get("title", "Untitled"))[:60]
@@ -899,7 +891,7 @@ class VideoSubmissionCog(commands.Cog):
             return
 
         posted = 0
-        for k, v in pending[:50]:  # hard cap to avoid spam
+        for k, v in pending[:50]:  # cap to avoid spam
             title = str(v.get("title", "Untitled"))
             url = str(v.get("url", ""))
             seconds = float(v.get("duration", 0) or 0)
@@ -914,7 +906,6 @@ class VideoSubmissionCog(commands.Cog):
             embed.set_footer(text=f"Video Key: {k}")
 
             try:
-                # Ensure view registered
                 try:
                     self.bot.add_view(ApprovalView(self, k))
                 except Exception:
@@ -944,10 +935,35 @@ class VideoSubmissionCog(commands.Cog):
             await safe_send(interaction, "❌ decision must be `approve` or `reject`.", ephemeral=True)
             return
 
-        # We want normal channel output like a button click would do:
-        # We'll run it non-ephemeral by sending a followup to approvals channel if possible.
-        # But process_decision needs an Interaction; we can just call it and let it respond.
         await self.process_decision(interaction, str(key).strip(), approve=(d == "approve"))
+
+    # NEW: Repair broken legacy entries with submitter_id=0
+    @app_commands.command(name="video_set_submitter", description="Repair a submission by setting the correct submitter (fixes <@0>)")
+    @app_commands.describe(key="Video key (YouTube ID or Drive ID)", member="Discord member who should receive AP")
+    async def video_set_submitter(self, interaction: discord.Interaction, key: str, member: discord.Member):
+        await safe_defer(interaction, ephemeral=True)
+
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await safe_send(interaction, "❌ Must be used in a server.", ephemeral=True)
+            return
+        if not is_manager(interaction.user):
+            await safe_send(interaction, "❌ Only CEO/Directors can use this.", ephemeral=True)
+            return
+
+        key = str(key).strip()
+        videos = await load(VIDEO_FILE)
+        if not isinstance(videos, dict) or key not in videos or not isinstance(videos[key], dict):
+            await safe_send(interaction, f"❌ Video not found for key `{key}`.", ephemeral=True)
+            return
+
+        videos[key]["submitter"] = int(member.id)
+        try:
+            videos[key]["submitter_had_security"] = any(r.name == SECURITY_ROLE for r in member.roles)
+        except Exception:
+            pass
+
+        await save(VIDEO_FILE, videos)
+        await safe_send(interaction, f"✅ Set submitter for `{key}` to {member.mention}.", ephemeral=True)
 
     # =====================
     # SUBMISSION / APPROVAL FLOW
@@ -994,7 +1010,6 @@ class VideoSubmissionCog(commands.Cog):
             return
 
         ap_reward = int((seconds / 3600) * 1000)
-
         submitter_had_security = any(r.name == SECURITY_ROLE for r in interaction.user.roles)
 
         if not isinstance(videos, dict):
@@ -1014,7 +1029,6 @@ class VideoSubmissionCog(commands.Cog):
 
         await save(VIDEO_FILE, videos)
 
-        # Register persistent view for this specific key
         try:
             self.bot.add_view(ApprovalView(self, str(key)))
         except Exception:
@@ -1044,7 +1058,6 @@ class VideoSubmissionCog(commands.Cog):
         await safe_send(interaction, "✅ Video submitted for approval.", ephemeral=True)
 
     async def process_decision(self, interaction: discord.Interaction, key: str, approve: bool):
-        # Public in approvals channel by default (matches button behavior)
         await safe_defer(interaction, ephemeral=False)
 
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -1080,9 +1093,18 @@ class VideoSubmissionCog(commands.Cog):
             return
 
         submitter_id = int(video.get("submitter", 0) or 0)
-        submitter = interaction.guild.get_member(submitter_id)
 
-        # Best-effort fetch if not cached (helps role checks & nicer logs)
+        # SAFETY: refuse if legacy data lost submitter
+        if submitter_id <= 0:
+            await safe_send(
+                interaction,
+                "❌ This submission has no valid submitter recorded (submitter=0). "
+                f"Fix it with `/video_set_submitter key:{key} member:@User` then approve again.",
+                ephemeral=False
+            )
+            return
+
+        submitter = interaction.guild.get_member(submitter_id)
         if submitter is None:
             try:
                 submitter = await interaction.guild.fetch_member(submitter_id)
@@ -1100,7 +1122,6 @@ class VideoSubmissionCog(commands.Cog):
             ap_data.setdefault(uid, {"ap": 0})
             ap_data[uid]["ap"] = int(ap_data[uid].get("ap", 0) or 0) + awarded_ap
 
-            # CEO bonus: prefer stored flag from submission time
             had_security = video.get("submitter_had_security")
             if had_security is None and submitter:
                 had_security = any(r.name == SECURITY_ROLE for r in submitter.roles)
@@ -1140,7 +1161,6 @@ class VideoSubmissionCog(commands.Cog):
         await save(VIDEO_FILE, videos)
         await save(AUDIT_FILE, audits)
 
-        # Update the original approval card embed + disable its buttons (if this interaction is on that message)
         try:
             if interaction.message and interaction.message.embeds:
                 base = interaction.message.embeds[0]
@@ -1169,8 +1189,6 @@ class VideoSubmissionCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    # If an old cog was loaded (from an older build), remove it safely first.
     await safe_remove_cog(bot, "VideoSubmission")      # legacy name
     await safe_remove_cog(bot, "VideoSubmissionCog")   # current name
-
     await bot.add_cog(VideoSubmissionCog(bot))
