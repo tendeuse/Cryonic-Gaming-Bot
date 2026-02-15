@@ -1,44 +1,89 @@
 # cogs/arc_hierarchy.py
+#
+# ARC Hierarchy (Unified + Automatic Corp Detection)
+# ==================================================
+# You have exactly TWO corporations:
+#   - ARC Subsidized
+#   - ARC Security
+#
+# Leadership is shared across both (CEO + Directors Council + rank ladder).
+# Member base differs only by which corp role they hold.
+#
+# IMPORTANT:
+# - There is NO /join_corp command here.
+# - Corporation membership is AUTO-DETECTED from Discord roles:
+#       If member has "ARC Subsidized" => corp = ARC Subsidized
+#       Else if member has "ARC Security" => corp = ARC Security
+#       Else => corp = Unassigned
+#
+# - "Security" rank is NOT a Discord role. Lowest rank = no rank-role.
+# - Rank roles apply only to:
+#       ARC Officer, ARC Commander, ARC General
+#   Directors/CEO are by their own protected roles.
+#
+# Persistence: /data (Railway volume) with atomic JSON writes + asyncio lock
+#
+# Commands:
+#   /arc flowchart_refresh
+#   /arc roster_corp  (view roster for a corp grouped by rank)
+#   /arc promote
+#   /arc demote
+#   /arc directive_create
+#   /arc directive_list
+#   /arc directive_done
+#
+# Auto:
+#   - On ready: bootstraps corp role bindings + refreshes flowchart
+#   - On member role update: auto-sync corp_key if corp roles change
+#
+# NOTE: This cog does NOT do AP bonuses. Remove/disable 10% bonus in your AP cog separately.
 
 import os
+import json
+import io
+import asyncio
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
+
 import discord
 from discord.ext import commands
 from discord import app_commands
-import json
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
-import io
-import asyncio
 
 # =====================
 # PERSISTENCE (Railway Volume)
 # =====================
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
-
 DATA_FILE = PERSIST_ROOT / "arc_hierarchy.json"
-
 file_lock = asyncio.Lock()
 
 # =====================
-# ROLES
+# ROLES (AUTHORITY)
 # =====================
 CEO_ROLE = "ARC Security Corporation Leader"            # PROTECTED: NEVER REMOVED BY BOT
 DIRECTOR_ROLE = "ARC Security Administration Council"   # PROTECTED: NEVER REMOVED BY BOT
+
 GENERAL_ROLE = "ARC General"
 COMMANDER_ROLE = "ARC Commander"
 OFFICER_ROLE = "ARC Officer"
-SECURITY_ROLE = "ARC Security"  # PROTECTED: NEVER REMOVED BY BOT
 
-UNITLESS_ROLE = "Unitless"
+# =====================
+# ROLES (CORPORATIONS)
+# =====================
+CORP_ROLE_SECURITY = "ARC Security"
+CORP_ROLE_SUBSIDIZED = "ARC Subsidized"
 
-PROTECTED_RANK_ROLES = {SECURITY_ROLE, DIRECTOR_ROLE, CEO_ROLE}
+# Compatibility role (optional)
+UNITLESS_ROLE = "Unitless"  # used as "Unassigned" fallback if you want
+
+PROTECTED_AUTH_ROLES = {DIRECTOR_ROLE, CEO_ROLE}
 
 # =====================
 # CHANNELS
 # =====================
 LOG_CH = "arc-hierarchy-log"
 FLOWCHART_CH = "corp-flowchart"
+DIRECTIVES_CH = "arc-directives"  # created if possible
 
 # =====================
 # RANKS
@@ -50,8 +95,9 @@ RANK_GENERAL = "general"
 RANK_DIRECTOR = "director"
 RANK_CEO = "ceo"
 
+# Security rank has NO rank-role (corp role handles membership)
 ROLE_BY_RANK = {
-    RANK_SECURITY: SECURITY_ROLE,
+    RANK_SECURITY: None,
     RANK_OFFICER: OFFICER_ROLE,
     RANK_COMMANDER: COMMANDER_ROLE,
     RANK_GENERAL: GENERAL_ROLE,
@@ -73,17 +119,73 @@ DEMOTE_TO = {
 }
 
 # =====================
+# CORPORATION KEYS (FIXED)
+# =====================
+CORP_UNASSIGNED_KEY = "unassigned"
+CORP_SECURITY_KEY = "arc-security"
+CORP_SUBSIDIZED_KEY = "arc-subsidized"
+
+# =====================
 # PERSISTENCE
 # =====================
 def _default_data() -> Dict[str, Any]:
-    return {"members": {}, "units": {}, "flowchart": {}}
+    return {
+        "members": {},
+        "corporations": {
+            CORP_UNASSIGNED_KEY: {"name": "Unassigned", "role_id": None},
+            CORP_SECURITY_KEY: {"name": "ARC Security", "role_id": None},
+            CORP_SUBSIDIZED_KEY: {"name": "ARC Subsidized", "role_id": None},
+        },
+        "directives": {},
+        "flowchart": {},
+    }
 
 def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    payload = json.dumps(data, indent=2)
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
     tmp.write_text(payload, encoding="utf-8")
     tmp.replace(p)
+
+def _coerce_dict(v: Any) -> Dict[str, Any]:
+    return v if isinstance(v, dict) else {}
+
+def _migrate_legacy_units_to_corps(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    If your old file still has:
+      - data["units"] (director-owned)
+      - member["director_id"]
+    We migrate by setting members to Unassigned and removing units.
+    Since you now have ONLY TWO corps, we do NOT keep legacy unit structures.
+    """
+    # Ensure new keys
+    data.setdefault("members", {})
+    data.setdefault("corporations", _default_data()["corporations"])
+    data.setdefault("directives", {})
+    data.setdefault("flowchart", {})
+
+    if "units" in data:
+        # Drop it; corp membership is auto-detected from roles anyway.
+        data.pop("units", None)
+
+    # Convert old member record shape if needed
+    members = _coerce_dict(data.get("members"))
+    for uid_str, rec in list(members.items()):
+        rec = _coerce_dict(rec)
+        if "corp_key" not in rec:
+            members[uid_str] = {
+                "rank": rec.get("rank", RANK_SECURITY) if isinstance(rec.get("rank"), str) else RANK_SECURITY,
+                "corp_key": CORP_UNASSIGNED_KEY,
+            }
+        else:
+            # normalize
+            if not isinstance(rec.get("rank"), str):
+                rec["rank"] = RANK_SECURITY
+            if not isinstance(rec.get("corp_key"), str):
+                rec["corp_key"] = CORP_UNASSIGNED_KEY
+
+    data["members"] = members
+    return data
 
 def load_data() -> Dict[str, Any]:
     try:
@@ -98,15 +200,20 @@ def load_data() -> Dict[str, Any]:
         if not isinstance(data, dict):
             return _default_data()
 
-        data.setdefault("members", {})
-        data.setdefault("units", {})
-        data.setdefault("flowchart", {})
+        data = _migrate_legacy_units_to_corps(data)
 
-        if not isinstance(data["members"], dict):
+        # Ensure the fixed corp keys exist
+        corps = data.setdefault("corporations", {})
+        corps.setdefault(CORP_UNASSIGNED_KEY, {"name": "Unassigned", "role_id": None})
+        corps.setdefault(CORP_SECURITY_KEY, {"name": "ARC Security", "role_id": None})
+        corps.setdefault(CORP_SUBSIDIZED_KEY, {"name": "ARC Subsidized", "role_id": None})
+
+        # Validate shapes
+        if not isinstance(data.get("members"), dict):
             data["members"] = {}
-        if not isinstance(data["units"], dict):
-            data["units"] = {}
-        if not isinstance(data["flowchart"], dict):
+        if not isinstance(data.get("directives"), dict):
+            data["directives"] = {}
+        if not isinstance(data.get("flowchart"), dict):
             data["flowchart"] = {}
 
         return data
@@ -143,11 +250,30 @@ def can_manage(member: discord.Member) -> bool:
     return is_ceo(member) or is_director(member)
 
 def ensure_member_record(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
-    return data.setdefault("members", {}).setdefault(str(user_id), {
+    rec = data.setdefault("members", {}).setdefault(str(user_id), {
         "rank": RANK_SECURITY,
-        "director_id": None,
-        "supervisor_id": None,
+        "corp_key": CORP_UNASSIGNED_KEY,
     })
+    if not isinstance(rec, dict):
+        rec = {"rank": RANK_SECURITY, "corp_key": CORP_UNASSIGNED_KEY}
+        data["members"][str(user_id)] = rec
+    rec.setdefault("rank", RANK_SECURITY)
+    rec.setdefault("corp_key", CORP_UNASSIGNED_KEY)
+    if not isinstance(rec["rank"], str):
+        rec["rank"] = RANK_SECURITY
+    if not isinstance(rec["corp_key"], str):
+        rec["corp_key"] = CORP_UNASSIGNED_KEY
+    return rec
+
+def rank_roles_to_strip(guild: discord.Guild) -> List[discord.Role]:
+    # Only strip the non-protected rank roles (Officer/Commander/General)
+    candidates = [OFFICER_ROLE, COMMANDER_ROLE, GENERAL_ROLE]
+    out: List[discord.Role] = []
+    for name in candidates:
+        r = get_role(guild, name)
+        if r:
+            out.append(r)
+    return out
 
 async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
     ch = discord.utils.get(guild.text_channels, name=LOG_CH)
@@ -160,7 +286,6 @@ async def safe_log(guild: discord.Guild, msg: str) -> None:
         ch = await ensure_log_channel(guild)
         await ch.send(msg[:1900])
     except Exception:
-        # If logging itself fails, we cannot do more safely.
         pass
 
 async def ensure_flowchart_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -173,138 +298,27 @@ async def ensure_flowchart_channel(guild: discord.Guild) -> Optional[discord.Tex
         await safe_log(guild, f"Flowchart: could not create #{FLOWCHART_CH}. Missing perms? `{type(e).__name__}`")
         return None
 
-def unit_role_ids(data: Dict[str, Any]) -> List[int]:
-    ids: List[int] = []
-    for u in data.get("units", {}).values():
-        rid = u.get("unit_role_id")
-        if isinstance(rid, int):
-            ids.append(rid)
-    return ids
-
-def rank_roles_to_strip(guild: discord.Guild) -> List[discord.Role]:
-    candidates = [OFFICER_ROLE, COMMANDER_ROLE, GENERAL_ROLE, CEO_ROLE, DIRECTOR_ROLE]
-    out: List[discord.Role] = []
-    for name in candidates:
-        if name in PROTECTED_RANK_ROLES:
-            continue
-        r = get_role(guild, name)
-        if r:
-            out.append(r)
-    return out
-
-async def strip_member_for_unit_change(
-    member: discord.Member,
-    data: Dict[str, Any]
-) -> Tuple[List[discord.Role], List[discord.Role]]:
-    guild = member.guild
-
-    removed_rank: List[discord.Role] = []
-    for role in rank_roles_to_strip(guild):
-        if role in member.roles:
-            removed_rank.append(role)
-    if removed_rank:
-        await member.remove_roles(*removed_rank, reason="ARC unit transfer: stripping prior ranks")
-
-    removed_unit: List[discord.Role] = []
-    for rid in unit_role_ids(data):
-        r = guild.get_role(rid)
-        if r and r in member.roles:
-            removed_unit.append(r)
-    if removed_unit:
-        await member.remove_roles(*removed_unit, reason="ARC unit transfer: stripping prior unit role(s)")
-
-    return removed_rank, removed_unit
-
-async def remove_unitless_if_present(member: discord.Member) -> None:
-    role = get_role(member.guild, UNITLESS_ROLE)
-    if role and role in member.roles:
-        try:
-            await member.remove_roles(role, reason="ARC unit assignment: removing Unitless")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-def get_member_unit_director_id(data: Dict[str, Any], member_id: int) -> Optional[int]:
-    rec = data.get("members", {}).get(str(member_id))
-    if not rec:
+async def ensure_directives_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    ch = discord.utils.get(guild.text_channels, name=DIRECTIVES_CH)
+    if ch:
+        return ch
+    try:
+        return await guild.create_text_channel(DIRECTIVES_CH)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        await safe_log(guild, f"Directives: could not create #{DIRECTIVES_CH}. Missing perms? `{type(e).__name__}`")
         return None
-    did = rec.get("director_id")
-    return did if isinstance(did, int) else None
 
-async def assign_member_to_unit(
-    member: discord.Member,
-    director: discord.Member,
-    data: Dict[str, Any],
-    *,
-    strip_first: bool = True,
-) -> Tuple[Optional[int], Optional[str]]:
-    guild = member.guild
-
-    unit = data.get("units", {}).get(str(director.id))
-    if not unit:
-        return None, None
-
-    old_director_id = get_member_unit_director_id(data, member.id)
-
-    if strip_first:
-        await strip_member_for_unit_change(member, data)
-
-    role = guild.get_role(unit["unit_role_id"])
-    if role:
-        try:
-            await member.add_roles(role, reason="ARC unit assignment: assigning unit role")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    await remove_unitless_if_present(member)
-
-    rec = ensure_member_record(data, member.id)
-    rec["director_id"] = director.id
-
-    if not (is_director(member) or is_ceo(member)):
-        rec["rank"] = RANK_SECURITY
-
-    return old_director_id, unit.get("unit_name")
-
-async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str, str]:
-    guild = member.guild
-
-    async with file_lock:
-        data = load_data()
-        rec = ensure_member_record(data, member.id)
-
-        old_rank = rec.get("rank", RANK_SECURITY)
-        rec["rank"] = new_rank
-
-        to_remove: List[discord.Role] = []
-        for role in rank_roles_to_strip(guild):
-            if role in member.roles:
-                to_remove.append(role)
-        if to_remove:
-            await member.remove_roles(*to_remove, reason="ARC rank change: removing prior rank roles")
-
-        if new_rank in (RANK_OFFICER, RANK_COMMANDER, RANK_GENERAL, RANK_DIRECTOR, RANK_CEO):
-            role_name = ROLE_BY_RANK.get(new_rank)
-            role_obj = get_role(guild, role_name) if role_name else None
-            if role_obj and role_obj not in member.roles:
-                try:
-                    await member.add_roles(role_obj, reason=f"ARC rank change: set to {new_rank}")
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
-
-        save_data(data)
-        return old_rank, new_rank
-
-async def log_action(guild: discord.Guild, content: str, mention_director_ids: List[int]) -> None:
+async def log_action(guild: discord.Guild, content: str, mention_ids: List[int]) -> None:
     ch = await ensure_log_channel(guild)
 
     uniq: List[int] = []
-    for i in mention_director_ids:
+    for i in mention_ids:
         if isinstance(i, int) and i not in uniq:
             uniq.append(i)
 
-    mentions = []
-    for did in uniq:
-        m = guild.get_member(did)
+    mentions: List[str] = []
+    for uid in uniq:
+        m = guild.get_member(uid)
         if m:
             mentions.append(m.mention)
 
@@ -342,75 +356,180 @@ def _chunk_text(text: str, max_len: int = 1900) -> List[str]:
         chunks.append("\n".join(buf))
     return chunks
 
+def detect_corp_key_from_member(member: discord.Member) -> str:
+    """
+    Auto-detect corp based on Discord roles.
+    Priority: Subsidized > Security > Unassigned
+    """
+    if has_role(member, CORP_ROLE_SUBSIDIZED):
+        return CORP_SUBSIDIZED_KEY
+    if has_role(member, CORP_ROLE_SECURITY):
+        return CORP_SECURITY_KEY
+    return CORP_UNASSIGNED_KEY
+
+def corp_display_name_by_key(corp_key: str) -> str:
+    return {
+        CORP_SECURITY_KEY: "ARC Security",
+        CORP_SUBSIDIZED_KEY: "ARC Subsidized",
+        CORP_UNASSIGNED_KEY: "Unassigned",
+    }.get(corp_key, "Unassigned")
+
+async def bootstrap_fixed_corps(guild: discord.Guild) -> None:
+    """
+    Ensures corporation roles exist and binds their role_id into persistence:
+    - ARC Security
+    - ARC Subsidized
+    """
+    # Ensure roles exist (best effort)
+    security_role = get_role(guild, CORP_ROLE_SECURITY)
+    subsidized_role = get_role(guild, CORP_ROLE_SUBSIDIZED)
+
+    if security_role is None:
+        try:
+            security_role = await guild.create_role(name=CORP_ROLE_SECURITY, reason="ARC corp bootstrap")
+        except (discord.Forbidden, discord.HTTPException):
+            security_role = None
+
+    if subsidized_role is None:
+        try:
+            subsidized_role = await guild.create_role(name=CORP_ROLE_SUBSIDIZED, reason="ARC corp bootstrap")
+        except (discord.Forbidden, discord.HTTPException):
+            subsidized_role = None
+
+    async with file_lock:
+        data = load_data()
+        corps = data.setdefault("corporations", {})
+        corps.setdefault(CORP_UNASSIGNED_KEY, {"name": "Unassigned", "role_id": None})
+        corps.setdefault(CORP_SECURITY_KEY, {"name": "ARC Security", "role_id": None})
+        corps.setdefault(CORP_SUBSIDIZED_KEY, {"name": "ARC Subsidized", "role_id": None})
+
+        corps[CORP_SECURITY_KEY]["name"] = "ARC Security"
+        corps[CORP_SUBSIDIZED_KEY]["name"] = "ARC Subsidized"
+
+        if security_role is not None:
+            corps[CORP_SECURITY_KEY]["role_id"] = security_role.id
+        if subsidized_role is not None:
+            corps[CORP_SUBSIDIZED_KEY]["role_id"] = subsidized_role.id
+
+        save_data(data)
+
+async def sync_member_corp_from_roles(member: discord.Member, *, reason: str) -> Tuple[str, str]:
+    """
+    Syncs member corp_key in persistence to match detected roles.
+    Returns (old_key, new_key)
+    """
+    async with file_lock:
+        data = load_data()
+        rec = ensure_member_record(data, member.id)
+        old_key = rec.get("corp_key", CORP_UNASSIGNED_KEY)
+        new_key = detect_corp_key_from_member(member)
+        if old_key != new_key:
+            rec["corp_key"] = new_key
+            save_data(data)
+        return old_key, new_key
+
+async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str, str]:
+    guild = member.guild
+
+    async with file_lock:
+        data = load_data()
+        rec = ensure_member_record(data, member.id)
+
+        old_rank = rec.get("rank", RANK_SECURITY)
+        rec["rank"] = new_rank
+
+        # remove old rank roles (Officer/Commander/General)
+        to_remove: List[discord.Role] = []
+        for role in rank_roles_to_strip(guild):
+            if role in member.roles:
+                to_remove.append(role)
+        if to_remove:
+            try:
+                await member.remove_roles(*to_remove, reason="ARC rank change: removing prior rank roles")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        # add rank role (if any)
+        role_name = ROLE_BY_RANK.get(new_rank)
+        if role_name:
+            role_obj = get_role(guild, role_name)
+            if role_obj and role_obj not in member.roles:
+                try:
+                    await member.add_roles(role_obj, reason=f"ARC rank change: set to {new_rank}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+        save_data(data)
+        return old_rank, new_rank
+
+# =====================
+# FLOWCHART (BY CORP)
+# =====================
 def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
-    # CEO(s) by role
+    # CEO(s)
     ceo_role = get_role(guild, CEO_ROLE)
     ceos: List[discord.Member] = []
     if ceo_role:
         ceos = _sort_members_casefold([m for m in guild.members if ceo_role in m.roles])
 
-    header = ["ARC Corporate Flowchart", ""]
+    # Directors council
+    director_role = get_role(guild, DIRECTOR_ROLE)
+    directors: List[discord.Member] = []
+    if director_role:
+        directors = _sort_members_casefold([m for m in guild.members if director_role in m.roles])
+
+    header: List[str] = ["ARC Corporate Flowchart (Unified)", ""]
     if not ceos:
         header.append("CEO: (unassigned)")
     elif len(ceos) == 1:
         header.append(f"CEO: {ceos[0].display_name}")
     else:
         header.append("CEO(s): " + ", ".join([m.display_name for m in ceos]))
+
+    if not directors:
+        header.append("Directors Council: (none)")
+    else:
+        header.append("Directors Council: " + ", ".join([m.display_name for m in directors]))
+
+    header.append("")
+    header.append("Corporations:")
     header.append("")
 
-    # Directors: prefer unit owners (data["units"] keys), and include Directors by role even if no unit.
-    unit_owner_ids: List[int] = []
-    for k in data.get("units", {}).keys():
-        try:
-            unit_owner_ids.append(int(k))
-        except Exception:
-            pass
+    # Ensure corp keys exist
+    corps = data.get("corporations", {})
+    for k in (CORP_SECURITY_KEY, CORP_SUBSIDIZED_KEY, CORP_UNASSIGNED_KEY):
+        corps.setdefault(k, {"name": corp_display_name_by_key(k), "role_id": None})
 
-    directors_role = get_role(guild, DIRECTOR_ROLE)
-    if directors_role:
-        for m in guild.members:
-            if directors_role in m.roles and m.id not in unit_owner_ids:
-                unit_owner_ids.append(m.id)
+    # Build members by corp+rank:
+    members_by_corp_rank: Dict[str, Dict[str, List[discord.Member]]] = {
+        CORP_SECURITY_KEY: {},
+        CORP_SUBSIDIZED_KEY: {},
+        CORP_UNASSIGNED_KEY: {},
+    }
 
-    director_members: List[discord.Member] = []
-    for did in unit_owner_ids:
-        dm = guild.get_member(did)
-        if dm:
-            director_members.append(dm)
-    director_members = _sort_members_casefold(director_members)
+    for m in guild.members:
+        rec = data.get("members", {}).get(str(m.id))
+        if not isinstance(rec, dict):
+            # if missing record, still reflect reality
+            corp_key = detect_corp_key_from_member(m)
+            rank = RANK_SECURITY
+        else:
+            corp_key = rec.get("corp_key")
+            if not isinstance(corp_key, str) or corp_key not in members_by_corp_rank:
+                corp_key = detect_corp_key_from_member(m)
+            rank = rec.get("rank", RANK_SECURITY)
+            if not isinstance(rank, str):
+                rank = RANK_SECURITY
+
+        members_by_corp_rank.setdefault(corp_key, {}).setdefault(rank, []).append(m)
 
     lines: List[str] = header[:]
 
-    if not director_members:
-        lines.append("No Directors found.")
-        return "\n".join(lines)
+    for corp_key in (CORP_SUBSIDIZED_KEY, CORP_SECURITY_KEY, CORP_UNASSIGNED_KEY):
+        corp_name = corp_display_name_by_key(corp_key)
+        lines.append(f"├─ {corp_name}")
 
-    for idx, d in enumerate(director_members):
-        unit = data.get("units", {}).get(str(d.id))
-        unit_name = unit.get("unit_name") if isinstance(unit, dict) else None
-        unit_label = f"{d.display_name}" + (f"  [{unit_name}]" if unit_name else "")
-        lines.append(f"├─ Director: {unit_label}")
-
-        # Build roster grouped by stored rank
-        members_for_director: List[Tuple[discord.Member, Dict[str, Any]]] = []
-        for m in guild.members:
-            rec = data.get("members", {}).get(str(m.id))
-            if isinstance(rec, dict) and rec.get("director_id") == d.id:
-                members_for_director.append((m, rec))
-
-        groups: Dict[str, List[discord.Member]] = {
-            RANK_DIRECTOR: [],
-            RANK_GENERAL: [],
-            RANK_COMMANDER: [],
-            RANK_OFFICER: [],
-            RANK_SECURITY: [],
-        }
-        for m, rec in members_for_director:
-            r = rec.get("rank", RANK_SECURITY)
-            if r not in groups:
-                r = RANK_SECURITY
-            groups[r].append(m)
-
+        groups = members_by_corp_rank.get(corp_key, {})
         any_listed = False
         for rank in (RANK_DIRECTOR, RANK_GENERAL, RANK_COMMANDER, RANK_OFFICER, RANK_SECURITY):
             ms = _sort_members_casefold(groups.get(rank, []))
@@ -418,23 +537,16 @@ def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
                 continue
             any_listed = True
             lines.append(f"│  ├─ {_rank_label(rank)} ({len(ms)})")
-            for m in ms:
-                lines.append(f"│  │  • {m.display_name}")
+            for mm in ms:
+                lines.append(f"│  │  • {mm.display_name}")
 
         if not any_listed:
             lines.append("│  └─ (No assigned members)")
-
-        # spacing between directors
         lines.append("")
 
     return "\n".join(lines).strip()
 
 async def update_flowchart(guild: discord.Guild) -> None:
-    """
-    Posts/updates a single flowchart message in #corp-flowchart.
-    Uses plain text (code block) to avoid needing Embed Links permission.
-    """
-    # Ensure channel exists
     ch = await ensure_flowchart_channel(guild)
     if not ch:
         return
@@ -450,19 +562,14 @@ async def update_flowchart(guild: discord.Guild) -> None:
             )
             return
 
-    # Load state and stored message pointer
     async with file_lock:
         data = load_data()
         flow = data.setdefault("flowchart", {})
         stored_message_id = flow.get("message_id")
 
     text = build_flowchart_text(guild, data)
-
-    # If too long, send as multiple messages but still keep the first message tracked and updateable.
-    # First message holds part 1, subsequent parts are sent fresh each time (best-effort).
     parts = _chunk_text(f"```text\n{text}\n```", max_len=1900)
 
-    # Try fetch existing tracked message
     msg: Optional[discord.Message] = None
     if isinstance(stored_message_id, int):
         try:
@@ -482,7 +589,6 @@ async def update_flowchart(guild: discord.Guild) -> None:
                 flow["message_id"] = msg.id
                 save_data(data)
 
-        # Post additional parts (best effort, do not persist their ids)
         for p in parts[1:]:
             try:
                 await ch.send(p)
@@ -493,88 +599,10 @@ async def update_flowchart(guild: discord.Guild) -> None:
         await safe_log(guild, f"Flowchart: failed to send/edit message in #{FLOWCHART_CH}. `{type(e).__name__}`")
 
 # =====================
-# MODAL
+# DIRECTIVES
 # =====================
-class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
-    unit_name = discord.ui.TextInput(label="Unit Name", max_length=64)
-
-    def __init__(self, cog: "ARCHierarchyCog"):
-        super().__init__()
-        self.cog = cog
-
-    async def on_submit(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        director = interaction.user
-
-        if not is_director(director):
-            await interaction.response.send_message("Only Directors may create units.", ephemeral=True)
-            return
-
-        data = load_data()
-        if str(director.id) in data["units"]:
-            await interaction.response.send_message("You already own a unit.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=False, thinking=True)
-
-        try:
-            name = self.unit_name.value.strip()
-            role = await guild.create_role(name=name)
-
-            category = await guild.create_category(
-                f"Unit - {name}",
-                overwrites={
-                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                    role: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-                },
-            )
-
-            text_ch = await guild.create_text_channel("unit-chat", category=category)
-            voice_ch = await guild.create_voice_channel("unit-voice", category=category)
-
-            data["units"][str(director.id)] = {
-                "unit_name": name,
-                "unit_role_id": role.id,
-                "category_id": category.id,
-            }
-
-            old_director_id, _unit_name = await assign_member_to_unit(
-                director,
-                director,
-                data,
-                strip_first=True,
-            )
-
-            rec = ensure_member_record(data, director.id)
-            rec["rank"] = RANK_DIRECTOR
-            rec["director_id"] = director.id
-
-            save_data(data)
-
-            mention_ids: List[int] = []
-            if isinstance(old_director_id, int):
-                mention_ids.append(old_director_id)
-            mention_ids.append(director.id)
-
-            await log_action(
-                guild,
-                f"Unit created: **{name}** by {director.mention}.",
-                mention_director_ids=mention_ids,
-            )
-
-            await interaction.followup.send(
-                f"Unit **{name}** created.\nChannels: {text_ch.mention}, {voice_ch.mention}",
-                ephemeral=False,
-            )
-
-            await update_flowchart(guild)
-
-        except (discord.Forbidden, discord.HTTPException) as e:
-            await interaction.followup.send(
-                f"Unit creation failed due to a permissions/API error.\n`{type(e).__name__}`",
-                ephemeral=True,
-            )
-            await safe_log(guild, f"Create unit failed: `{type(e).__name__}`")
+def _now_unix() -> int:
+    return int(discord.utils.utcnow().timestamp())
 
 # =====================
 # COG
@@ -583,7 +611,7 @@ class ARCHierarchyCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    arc = app_commands.Group(name="arc", description="ARC hierarchy commands")
+    arc = app_commands.Group(name="arc", description="ARC hierarchy (unified) commands")
 
     # -----------------
     # FLOWCHART
@@ -596,267 +624,47 @@ class ARCHierarchyCog(commands.Cog):
             await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
             return
 
+        await bootstrap_fixed_corps(interaction.guild)
+        # sync everyone once (best effort)
+        await self.sync_all_members(interaction.guild, actor_id=actor.id, log=False)
+
         await update_flowchart(interaction.guild)
         await interaction.followup.send("✅ Flowchart refreshed.", ephemeral=True)
 
     # -----------------
-    # UNIT MGMT
+    # ROSTER (CORP)
     # -----------------
-    @arc.command(name="create_unit")
-    async def create_unit(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(CreateUnitModal(self))
-
-    @arc.command(name="join")
-    @app_commands.describe(director="Director you want to join")
-    async def join(self, interaction: discord.Interaction, director: discord.Member):
+    @arc.command(name="roster_corp", description="Show roster for a Corporation (grouped by rank)")
+    @app_commands.describe(corporation="Choose: subsidized | security | unassigned")
+    async def roster_corp(self, interaction: discord.Interaction, corporation: str):
         await interaction.response.defer(ephemeral=False, thinking=True)
 
-        guild = interaction.guild
-        member = interaction.user
-        data = load_data()
-
-        if not is_director(director):
-            await interaction.followup.send("Target must be a Director.", ephemeral=True)
+        corp_in = (corporation or "").strip().lower()
+        if corp_in in ("subsidized", "arc subsidized", "subs", "sub"):
+            corp_key = CORP_SUBSIDIZED_KEY
+        elif corp_in in ("security", "arc security", "sec"):
+            corp_key = CORP_SECURITY_KEY
+        elif corp_in in ("unassigned", "none", "unitless"):
+            corp_key = CORP_UNASSIGNED_KEY
+        else:
+            await interaction.followup.send("Invalid corporation. Use: `subsidized`, `security`, or `unassigned`.", ephemeral=True)
             return
 
-        unit = data["units"].get(str(director.id))
-        if not unit:
-            await interaction.followup.send("That Director has no unit.", ephemeral=True)
-            return
-
-        old_director_id, unit_name = await assign_member_to_unit(
-            member,
-            director,
-            data,
-            strip_first=True,
-        )
-        save_data(data)
-
-        mention_ids: List[int] = []
-        if isinstance(old_director_id, int):
-            mention_ids.append(old_director_id)
-        mention_ids.append(director.id)
-        if can_manage(member):
-            mention_ids.append(member.id)
-
-        await log_action(
-            guild,
-            f"Unit transfer: {member.mention} joined **{unit_name}** (Director: {director.mention}).",
-            mention_director_ids=mention_ids,
-        )
-
-        await interaction.followup.send(
-            f"{member.mention} joined **{unit_name}**.",
-            ephemeral=False,
-        )
-
-        await update_flowchart(guild)
-
-    @arc.command(name="transfer_unit")
-    @app_commands.describe(
-        from_director="Director currently owning the unit",
-        to_director="Director who will receive the unit"
-    )
-    async def transfer_unit(self, interaction: discord.Interaction, from_director: discord.Member, to_director: discord.Member):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        actor = interaction.user
-        guild = interaction.guild
-
-        if not isinstance(actor, discord.Member) or not is_ceo(actor):
-            await interaction.followup.send("Only the CEO may use this command.", ephemeral=True)
-            return
-
-        if not is_director(from_director):
-            await interaction.followup.send("`from_director` must be a Director.", ephemeral=True)
-            return
-
-        if not is_director(to_director):
-            await interaction.followup.send("`to_director` must be a Director.", ephemeral=True)
-            return
-
-        if from_director.id == to_director.id:
-            await interaction.followup.send("Source and destination Directors are the same.", ephemeral=True)
-            return
-
-        moved_count = 0
-        unit: Dict[str, Any] = {}
+        # ensure persistence aligns with reality before reporting
+        await self.sync_all_members(interaction.guild, actor_id=interaction.user.id, log=False)
 
         async with file_lock:
             data = load_data()
 
-            unit = data.get("units", {}).get(str(from_director.id))
-            if not unit:
-                await interaction.followup.send("That source Director has no unit to transfer.", ephemeral=True)
-                return
-
-            if str(to_director.id) in data.get("units", {}):
-                await interaction.followup.send("The destination Director already owns a unit.", ephemeral=True)
-                return
-
-            data["units"][str(to_director.id)] = unit
-            data["units"].pop(str(from_director.id), None)
-
-            members = data.get("members", {})
-            for _uid, rec in members.items():
-                if isinstance(rec, dict) and rec.get("director_id") == from_director.id:
-                    rec["director_id"] = to_director.id
-                    moved_count += 1
-
-            to_rec = ensure_member_record(data, to_director.id)
-            to_rec["rank"] = RANK_DIRECTOR
-            to_rec["director_id"] = to_director.id
-
-            save_data(data)
-
-        try:
-            role_id = unit.get("unit_role_id")
-            role_obj = guild.get_role(role_id) if isinstance(role_id, int) else None
-            if role_obj and role_obj not in to_director.roles:
-                await to_director.add_roles(role_obj, reason="ARC unit transfer: new Director receiving unit role")
-            await remove_unitless_if_present(to_director)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-        await log_action(
-            guild,
-            (
-                f"Unit transferred: **{unit.get('unit_name', 'Unnamed Unit')}**\n"
-                f"From Director: {from_director.mention}\n"
-                f"To Director: {to_director.mention}\n"
-                f"Moved member records: **{moved_count}**"
-            ),
-            mention_director_ids=[from_director.id, to_director.id, actor.id],
-        )
-
-        await interaction.followup.send(
-            f"✅ Transferred unit **{unit.get('unit_name', 'Unnamed Unit')}** from {from_director.mention} to {to_director.mention}.\n"
-            f"Updated **{moved_count}** member record(s).",
-            ephemeral=True,
-        )
-
-        await update_flowchart(guild)
-
-    # -----------------
-    # PROMOTE / DEMOTE
-    # -----------------
-    @arc.command(name="promote")
-    @app_commands.describe(member="Member to promote")
-    async def promote(self, interaction: discord.Interaction, member: discord.Member):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        actor = interaction.user
-        guild = interaction.guild
-
-        if not can_manage(actor):
-            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
-            return
-
-        data = load_data()
-        rec = ensure_member_record(data, member.id)
-        old_rank = rec.get("rank", RANK_SECURITY)
-
-        nxt = PROMOTE_TO.get(old_rank)
-        if not nxt:
-            await interaction.followup.send(
-                f"{member.display_name} cannot be promoted further from **{old_rank}**.",
-                ephemeral=True
-            )
-            return
-
-        prev_rank, new_rank = await apply_rank_change(member, nxt)
-
-        data = load_data()
-        director_id = get_member_unit_director_id(data, member.id)
-
-        mention_ids: List[int] = []
-        if isinstance(director_id, int):
-            mention_ids.append(director_id)
-        if can_manage(actor):
-            mention_ids.append(actor.id)
-
-        await log_action(
-            guild,
-            f"Promotion: {member.mention} **{prev_rank} → {new_rank}** by {actor.mention}.",
-            mention_director_ids=mention_ids,
-        )
-
-        await interaction.followup.send(
-            f"{member.mention} promoted: **{prev_rank} → {new_rank}**.",
-            ephemeral=True,
-        )
-
-        await update_flowchart(guild)
-
-    @arc.command(name="demote")
-    @app_commands.describe(member="Member to demote")
-    async def demote(self, interaction: discord.Interaction, member: discord.Member):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        actor = interaction.user
-        guild = interaction.guild
-
-        if not can_manage(actor):
-            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
-            return
-
-        data = load_data()
-        rec = ensure_member_record(data, member.id)
-        old_rank = rec.get("rank", RANK_SECURITY)
-
-        nxt = DEMOTE_TO.get(old_rank)
-        if not nxt:
-            await interaction.followup.send(
-                f"{member.display_name} cannot be demoted from **{old_rank}**.",
-                ephemeral=True
-            )
-            return
-
-        prev_rank, new_rank = await apply_rank_change(member, nxt)
-
-        data = load_data()
-        director_id = get_member_unit_director_id(data, member.id)
-
-        mention_ids: List[int] = []
-        if isinstance(director_id, int):
-            mention_ids.append(director_id)
-        if can_manage(actor):
-            mention_ids.append(actor.id)
-
-        await log_action(
-            guild,
-            f"Demotion: {member.mention} **{prev_rank} → {new_rank}** by {actor.mention}.",
-            mention_director_ids=mention_ids,
-        )
-
-        await interaction.followup.send(
-            f"{member.mention} demoted: **{prev_rank} → {new_rank}**.",
-            ephemeral=True,
-        )
-
-        await update_flowchart(guild)
-
-    # -----------------
-    # ROSTER (GROUPED)
-    # -----------------
-    @arc.command(name="roster")
-    @app_commands.describe(director="Director whose unit roster you want to view")
-    async def roster(self, interaction: discord.Interaction, director: discord.Member):
-        await interaction.response.defer(ephemeral=False, thinking=True)
-
-        data = load_data()
-        unit = data["units"].get(str(director.id))
-        if not unit:
-            await interaction.followup.send("No unit found for that Director.", ephemeral=True)
-            return
+        corp_name = corp_display_name_by_key(corp_key)
 
         members: List[Tuple[discord.Member, Dict[str, Any]]] = []
         for m in interaction.guild.members:
             rec = data.get("members", {}).get(str(m.id))
-            if rec and rec.get("director_id") == director.id:
+            if isinstance(rec, dict) and rec.get("corp_key") == corp_key:
                 members.append((m, rec))
 
-        groups: Dict[str, List[Tuple[discord.Member, Dict[str, Any]]]] = {
+        groups: Dict[str, List[discord.Member]] = {
             RANK_DIRECTOR: [],
             RANK_GENERAL: [],
             RANK_COMMANDER: [],
@@ -868,23 +676,20 @@ class ARCHierarchyCog(commands.Cog):
             r = rec.get("rank", RANK_SECURITY)
             if r not in groups:
                 r = RANK_SECURITY
-            groups[r].append((m, rec))
+            groups[r].append(m)
 
         def fmt_group(rank: str, title: str) -> List[str]:
-            items = groups.get(rank, [])
-            if not items:
+            ms = _sort_members_casefold(groups.get(rank, []))
+            if not ms:
                 return [f"**{title} (0)**", "- None"]
-            items.sort(key=lambda x: x[0].display_name.lower())
-            lines = [f"**{title} ({len(items)})**"]
-            for m, _rec in items:
-                lines.append(f"- {m.display_name}")
+            lines = [f"**{title} ({len(ms)})**"]
+            for mm in ms:
+                lines.append(f"- {mm.display_name}")
             return lines
 
         lines: List[str] = []
-        lines.append(f"**Unit:** {unit['unit_name']}")
-        lines.append(f"**Director:** {director.mention}")
+        lines.append(f"**Corporation:** {corp_name}")
         lines.append("")
-
         lines.extend(fmt_group(RANK_DIRECTOR, "Directors"))
         lines.append("")
         lines.extend(fmt_group(RANK_GENERAL, "Generals"))
@@ -896,26 +701,285 @@ class ARCHierarchyCog(commands.Cog):
         lines.extend(fmt_group(RANK_SECURITY, "Security"))
 
         text = "\n".join(lines)
-
         if len(text) <= 1900:
             await interaction.followup.send(text, ephemeral=False)
             return
 
         fp = io.BytesIO(text.encode("utf-8"))
-        file = discord.File(fp, filename=f"roster_{unit['unit_name']}.txt")
+        file = discord.File(fp, filename=f"corp_roster_{corp_name}.txt")
         await interaction.followup.send(
             content="Roster is too large for a single message; attached as a file.",
             file=file,
             ephemeral=False,
         )
 
+    # -----------------
+    # PROMOTE / DEMOTE
+    # -----------------
+    @arc.command(name="promote", description="Promote a member (Directors/CEO)")
+    @app_commands.describe(member="Member to promote")
+    async def promote(self, interaction: discord.Interaction, member: discord.Member):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        actor = interaction.user
+        if not isinstance(actor, discord.Member) or not can_manage(actor):
+            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
+            return
+
+        # ensure corp sync before logging
+        await sync_member_corp_from_roles(member, reason="promote: pre-sync")
+
+        async with file_lock:
+            data = load_data()
+            rec = ensure_member_record(data, member.id)
+            old_rank = rec.get("rank", RANK_SECURITY)
+            nxt = PROMOTE_TO.get(old_rank)
+            if not nxt:
+                await interaction.followup.send(
+                    f"{member.display_name} cannot be promoted further from **{old_rank}**.",
+                    ephemeral=True
+                )
+                return
+
+        prev_rank, new_rank = await apply_rank_change(member, nxt)
+
+        async with file_lock:
+            data = load_data()
+            corp_key = detect_corp_key_from_member(member)
+            rec = ensure_member_record(data, member.id)
+            rec["corp_key"] = corp_key
+            save_data(data)
+
+        await log_action(
+            interaction.guild,
+            f"Promotion: {member.mention} **{prev_rank} → {new_rank}** by {actor.mention} (Corp: **{corp_display_name_by_key(corp_key)}**).",
+            mention_ids=[actor.id, member.id],
+        )
+        await interaction.followup.send(
+            f"✅ {member.mention} promoted: **{prev_rank} → {new_rank}**.",
+            ephemeral=True,
+        )
+        await update_flowchart(interaction.guild)
+
+    @arc.command(name="demote", description="Demote a member (Directors/CEO)")
+    @app_commands.describe(member="Member to demote")
+    async def demote(self, interaction: discord.Interaction, member: discord.Member):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        actor = interaction.user
+        if not isinstance(actor, discord.Member) or not can_manage(actor):
+            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
+            return
+
+        await sync_member_corp_from_roles(member, reason="demote: pre-sync")
+
+        async with file_lock:
+            data = load_data()
+            rec = ensure_member_record(data, member.id)
+            old_rank = rec.get("rank", RANK_SECURITY)
+            nxt = DEMOTE_TO.get(old_rank)
+            if not nxt:
+                await interaction.followup.send(
+                    f"{member.display_name} cannot be demoted from **{old_rank}**.",
+                    ephemeral=True
+                )
+                return
+
+        prev_rank, new_rank = await apply_rank_change(member, nxt)
+
+        async with file_lock:
+            data = load_data()
+            corp_key = detect_corp_key_from_member(member)
+            rec = ensure_member_record(data, member.id)
+            rec["corp_key"] = corp_key
+            save_data(data)
+
+        await log_action(
+            interaction.guild,
+            f"Demotion: {member.mention} **{prev_rank} → {new_rank}** by {actor.mention} (Corp: **{corp_display_name_by_key(corp_key)}**).",
+            mention_ids=[actor.id, member.id],
+        )
+        await interaction.followup.send(
+            f"✅ {member.mention} demoted: **{prev_rank} → {new_rank}**.",
+            ephemeral=True,
+        )
+        await update_flowchart(interaction.guild)
+
+    # -----------------
+    # DIRECTIVES (CEO sets; Directors/CEO manage completion)
+    # -----------------
+    @arc.command(name="directive_create", description="Create a directive (CEO/Directors)")
+    @app_commands.describe(title="Short title", body="Details / expected outcome")
+    async def directive_create(self, interaction: discord.Interaction, title: str, body: str):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        actor = interaction.user
+        if not isinstance(actor, discord.Member) or not can_manage(actor):
+            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
+            return
+
+        title = (title or "").strip()[:80]
+        body = (body or "").strip()[:1500]
+        if not title:
+            await interaction.followup.send("Title cannot be empty.", ephemeral=True)
+            return
+        if not body:
+            await interaction.followup.send("Body cannot be empty.", ephemeral=True)
+            return
+
+        directive_id = str(int(discord.utils.utcnow().timestamp() * 1000))
+
+        async with file_lock:
+            data = load_data()
+            data.setdefault("directives", {})[directive_id] = {
+                "title": title,
+                "body": body,
+                "status": "open",
+                "created_by": actor.id,
+                "created_at": _now_unix(),
+            }
+            save_data(data)
+
+        ch = await ensure_directives_channel(interaction.guild)
+        if ch:
+            try:
+                await ch.send(
+                    f"📌 **DIRECTIVE #{directive_id}** — **{title}**\n"
+                    f"By: {actor.mention}\n"
+                    f"{body}"
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        await log_action(
+            interaction.guild,
+            f"Directive created: **#{directive_id} {title}** by {actor.mention}.",
+            mention_ids=[actor.id],
+        )
+        await interaction.followup.send(f"✅ Directive created: **#{directive_id} {title}**", ephemeral=True)
+
+    @arc.command(name="directive_list", description="List open directives")
+    async def directive_list(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        async with file_lock:
+            data = load_data()
+            directives = data.get("directives", {})
+
+        open_items: List[Tuple[str, Dict[str, Any]]] = []
+        for did, d in directives.items():
+            if isinstance(d, dict) and d.get("status") == "open":
+                open_items.append((did, d))
+        open_items.sort(key=lambda x: int(x[1].get("created_at", 0)))
+
+        if not open_items:
+            await interaction.followup.send("No open directives.", ephemeral=True)
+            return
+
+        lines = ["**Open Directives:**"]
+        for did, d in open_items[:25]:
+            lines.append(f"- **#{did}** — {str(d.get('title',''))[:80]}")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    @arc.command(name="directive_done", description="Mark a directive as done (CEO/Directors)")
+    @app_commands.describe(directive_id="Directive ID (numbers)")
+    async def directive_done(self, interaction: discord.Interaction, directive_id: str):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        actor = interaction.user
+        if not isinstance(actor, discord.Member) or not can_manage(actor):
+            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
+            return
+
+        directive_id = (directive_id or "").strip()
+        async with file_lock:
+            data = load_data()
+            d = data.get("directives", {}).get(directive_id)
+            if not isinstance(d, dict):
+                await interaction.followup.send("Directive not found.", ephemeral=True)
+                return
+            d["status"] = "done"
+            save_data(data)
+
+        ch = await ensure_directives_channel(interaction.guild)
+        if ch:
+            try:
+                await ch.send(f"✅ **DIRECTIVE #{directive_id}** marked **DONE** by {actor.mention}.")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        await log_action(
+            interaction.guild,
+            f"Directive done: **#{directive_id}** marked done by {actor.mention}.",
+            mention_ids=[actor.id],
+        )
+        await interaction.followup.send(f"✅ Directive #{directive_id} marked done.", ephemeral=True)
+
+    # -----------------
+    # SYNC HELPERS
+    # -----------------
+    async def sync_all_members(self, guild: discord.Guild, *, actor_id: Optional[int], log: bool) -> int:
+        """
+        One-shot pass to align stored corp_key with actual roles.
+        Returns number of changes applied.
+        """
+        changed = 0
+        async with file_lock:
+            data = load_data()
+            for m in guild.members:
+                rec = ensure_member_record(data, m.id)
+                old_key = rec.get("corp_key", CORP_UNASSIGNED_KEY)
+                new_key = detect_corp_key_from_member(m)
+                if old_key != new_key:
+                    rec["corp_key"] = new_key
+                    changed += 1
+            save_data(data)
+
+        if log and changed:
+            await log_action(guild, f"Corp sync: updated **{changed}** member record(s) from role detection.", mention_ids=[actor_id] if actor_id else [])
+        return changed
+
+    # -----------------
+    # AUTO-SYNC ON ROLE CHANGES
+    # -----------------
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        """
+        If corp roles change, automatically sync persistence and refresh flowchart.
+        """
+        # Quick check: did corp membership roles change?
+        before_sub = has_role(before, CORP_ROLE_SUBSIDIZED)
+        after_sub = has_role(after, CORP_ROLE_SUBSIDIZED)
+        before_sec = has_role(before, CORP_ROLE_SECURITY)
+        after_sec = has_role(after, CORP_ROLE_SECURITY)
+
+        if (before_sub == after_sub) and (before_sec == after_sec):
+            return  # no corp role delta
+
+        old_key, new_key = await sync_member_corp_from_roles(after, reason="role change")
+        if old_key != new_key:
+            await safe_log(
+                after.guild,
+                f"Auto corp sync: {after.display_name} **{corp_display_name_by_key(old_key)} → {corp_display_name_by_key(new_key)}** (role change)."
+            )
+            await update_flowchart(after.guild)
+
+    # -----------------
+    # READY
+    # -----------------
     @commands.Cog.listener()
     async def on_ready(self):
-        # Give Discord a brief moment so channels/guild caches are stable
         await asyncio.sleep(2)
         for g in self.bot.guilds:
-            await ensure_log_channel(g)
-            await update_flowchart(g)
+            try:
+                await ensure_log_channel(g)
+                await ensure_directives_channel(g)
+                await bootstrap_fixed_corps(g)
+                # Initial sync so stored state matches current roles
+                await self.sync_all_members(guild=g, actor_id=None, log=False)
+                await update_flowchart(g)
+            except Exception:
+                pass
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(ARCHierarchyCog(bot))
