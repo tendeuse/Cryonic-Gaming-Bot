@@ -1,1232 +1,921 @@
-# cogs/shop.py
-#
-# MULTI-SHOP VERSION (Main + HS)
-# - Keeps your original goals (no purge, persistent views, atomic JSON, minimal edits)
-# - Adds a SECOND, SEPARATE shop:
-#     Shop display:     ap-eve-shop-hs
-#     Shop controls:    ap-shop-access-hs
-#
-# IMPORTANT:
-# - This is a truly separate inventory (separate shop_hs.json)
-# - Custom IDs are namespaced per shop (main vs hs) to avoid collisions.
-#
-# Channels:
-#   MAIN: ap-eve-shop            (display)  | ap-shop-access            (controls)
-#   HS:   ap-eve-shop-hs         (display)  | ap-shop-access-hs         (controls)
-# Orders (unchanged): ap-shop-orders
+# cogs/arc_hierarchy.py
 
 import os
 import discord
-import json
-import asyncio
-import uuid
-import datetime
-from pathlib import Path
 from discord.ext import commands
 from discord import app_commands
+import json
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
+import io
+import asyncio
 
-# ----------------------------
-# Persistence root (Railway)
-# ----------------------------
+# =====================
+# PERSISTENCE (Railway Volume)
+# =====================
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Separate shop inventories (main + hs)
-SHOP_FILES = {
-    "main": PERSIST_ROOT / "shop.json",
-    "hs": PERSIST_ROOT / "shop_hs.json",
+DATA_FILE = PERSIST_ROOT / "arc_hierarchy.json"
+
+file_lock = asyncio.Lock()
+
+# =====================
+# ROLES
+# =====================
+CEO_ROLE = "ARC Security Corporation Leader"            # PROTECTED: NEVER REMOVED BY BOT
+DIRECTOR_ROLE = "ARC Security Administration Council"   # PROTECTED: NEVER REMOVED BY BOT
+GENERAL_ROLE = "ARC General"
+COMMANDER_ROLE = "ARC Commander"
+OFFICER_ROLE = "ARC Officer"
+SECURITY_ROLE = "ARC Security"  # PROTECTED: NEVER REMOVED BY BOT
+
+UNITLESS_ROLE = "Unitless"
+
+PROTECTED_RANK_ROLES = {SECURITY_ROLE, DIRECTOR_ROLE, CEO_ROLE}
+
+# =====================
+# CHANNELS
+# =====================
+LOG_CH = "arc-hierarchy-log"
+FLOWCHART_CH = "corp-flowchart"
+
+# =====================
+# RANKS
+# =====================
+RANK_SECURITY = "security"
+RANK_OFFICER = "officer"
+RANK_COMMANDER = "commander"
+RANK_GENERAL = "general"
+RANK_DIRECTOR = "director"
+RANK_CEO = "ceo"
+
+ROLE_BY_RANK = {
+    RANK_SECURITY: SECURITY_ROLE,
+    RANK_OFFICER: OFFICER_ROLE,
+    RANK_COMMANDER: COMMANDER_ROLE,
+    RANK_GENERAL: GENERAL_ROLE,
+    RANK_DIRECTOR: DIRECTOR_ROLE,
+    RANK_CEO: CEO_ROLE,
 }
 
-AP_FILE = PERSIST_ROOT / "ap_data.json"
-ORDERS_FILE = PERSIST_ROOT / "shop_orders.json"
-
-# Separate index per shop (to keep things clean + independent)
-INDEX_FILES = {
-    "main": PERSIST_ROOT / "shop_message_index.json",
-    "hs": PERSIST_ROOT / "shop_message_index_hs.json",
+PROMOTE_TO = {
+    RANK_SECURITY: RANK_OFFICER,
+    RANK_OFFICER: RANK_COMMANDER,
+    RANK_COMMANDER: RANK_GENERAL,
+    RANK_GENERAL: None,
 }
 
-for p in list(SHOP_FILES.values()) + [AP_FILE, ORDERS_FILE] + list(INDEX_FILES.values()):
+DEMOTE_TO = {
+    RANK_GENERAL: RANK_COMMANDER,
+    RANK_COMMANDER: RANK_OFFICER,
+    RANK_OFFICER: RANK_SECURITY,
+}
+
+# =====================
+# PERSISTENCE
+# =====================
+def _default_data() -> Dict[str, Any]:
+    return {"members": {}, "units": {}, "flowchart": {}}
+
+def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    payload = json.dumps(data, indent=2)
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(p)
 
-# ----------------------------
-# Channel config
-# ----------------------------
-ORDER_LOG_CHANNEL = "ap-shop-orders"
-
-SHOPS = {
-    "main": {
-        "label": "Main",
-        "shop_channel": "ap-eve-shop",
-        "access_channel": "ap-shop-access",
-    },
-    "hs": {
-        "label": "HS",
-        "shop_channel": "ap-eve-shop-hs",
-        "access_channel": "ap-shop-access-hs",
-    }
-}
-
-ALLOWED_ROLES = {"Shop Steward", "ARC Security Administration Council"}
-
-SHOP_LOCK = asyncio.Lock()
-
-# Global spacing between ANY actual edits (only applied when edit needed)
-GLOBAL_EDIT_MIN_INTERVAL_SECONDS = 1.2
-
-# ----------------------------
-# Interaction safety helpers
-# ----------------------------
-async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True) -> None:
+def load_data() -> Dict[str, Any]:
     try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=ephemeral)
+        if not DATA_FILE.exists():
+            return _default_data()
+
+        txt = DATA_FILE.read_text(encoding="utf-8").strip()
+        if not txt:
+            return _default_data()
+
+        data = json.loads(txt)
+        if not isinstance(data, dict):
+            return _default_data()
+
+        data.setdefault("members", {})
+        data.setdefault("units", {})
+        data.setdefault("flowchart", {})
+
+        if not isinstance(data["members"], dict):
+            data["members"] = {}
+        if not isinstance(data["units"], dict):
+            data["units"] = {}
+        if not isinstance(data["flowchart"], dict):
+            data["flowchart"] = {}
+
+        return data
+
+    except json.JSONDecodeError:
+        try:
+            bak = DATA_FILE.with_suffix(DATA_FILE.suffix + ".bak")
+            DATA_FILE.replace(bak)
+        except Exception:
+            pass
+        return _default_data()
     except Exception:
+        return _default_data()
+
+def save_data(data: Dict[str, Any]) -> None:
+    _atomic_write_json(DATA_FILE, data)
+
+# =====================
+# HELPERS
+# =====================
+def get_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
+    return discord.utils.get(guild.roles, name=name)
+
+def has_role(member: discord.Member, role_name: str) -> bool:
+    return discord.utils.get(member.roles, name=role_name) is not None
+
+def is_director(member: discord.Member) -> bool:
+    return has_role(member, DIRECTOR_ROLE)
+
+def is_ceo(member: discord.Member) -> bool:
+    return has_role(member, CEO_ROLE)
+
+def can_manage(member: discord.Member) -> bool:
+    return is_ceo(member) or is_director(member)
+
+def ensure_member_record(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    return data.setdefault("members", {}).setdefault(str(user_id), {
+        "rank": RANK_SECURITY,
+        "director_id": None,
+        "supervisor_id": None,
+    })
+
+async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
+    ch = discord.utils.get(guild.text_channels, name=LOG_CH)
+    if ch:
+        return ch
+    return await guild.create_text_channel(LOG_CH)
+
+async def safe_log(guild: discord.Guild, msg: str) -> None:
+    try:
+        ch = await ensure_log_channel(guild)
+        await ch.send(msg[:1900])
+    except Exception:
+        # If logging itself fails, we cannot do more safely.
         pass
 
-
-async def safe_reply(interaction: discord.Interaction, content: str, *, ephemeral: bool = True) -> None:
+async def ensure_flowchart_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    ch = discord.utils.get(guild.text_channels, name=FLOWCHART_CH)
+    if ch:
+        return ch
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=ephemeral)
-        else:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-    except Exception:
-        pass
-
-
-async def safe_send_modal(interaction: discord.Interaction, modal: discord.ui.Modal) -> None:
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send("❌ Please try again.", ephemeral=True)
-            return
-        await interaction.response.send_modal(modal)
-    except (discord.InteractionResponded, discord.NotFound):
-        return
-    except Exception:
-        await safe_reply(interaction, "❌ Failed to open the form. Please try again.", ephemeral=True)
-
-
-# ----------------------------
-# JSON helpers (ATOMIC WRITES)
-# ----------------------------
-def _load_json(path: Path, default):
-    try:
-        if not path.exists():
-            return default
-        raw = path.read_text(encoding="utf-8").strip()
-        if not raw:
-            return default
-        return json.loads(raw)
-    except Exception:
-        return default
-
-
-def _save_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
-    tmp.replace(path)
-
-
-def ensure_shop_schema(data: dict) -> dict:
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("items", {})
-    if not isinstance(data["items"], dict):
-        data["items"] = {}
-    return data
-
-
-def load_shop(shop_key: str) -> dict:
-    return ensure_shop_schema(_load_json(SHOP_FILES[shop_key], {}))
-
-
-def save_shop(shop_key: str, data: dict) -> None:
-    _save_json(SHOP_FILES[shop_key], data)
-
-
-def load_ap() -> dict:
-    return _load_json(AP_FILE, {})
-
-
-def save_ap(data: dict) -> None:
-    _save_json(AP_FILE, data)
-
-
-def load_orders() -> dict:
-    return _load_json(ORDERS_FILE, {"orders": {}})
-
-
-def save_orders(data: dict) -> None:
-    _save_json(ORDERS_FILE, data)
-
-
-def load_index(shop_key: str) -> dict:
-    # {
-    #   "<guild_id>": {
-    #      "items": {
-    #         "<item_id>": {"shop_msg_id": 123, "access_msg_id": 456}
-    #      },
-    #      "management_msg_id": 789
-    #   }
-    # }
-    return _load_json(INDEX_FILES[shop_key], {})
-
-
-def save_index(shop_key: str, data: dict) -> None:
-    _save_json(INDEX_FILES[shop_key], data)
-
-
-def utc_iso() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-def is_manager(member: discord.abc.User | discord.Member) -> bool:
-    if not isinstance(member, discord.Member):
-        return False
-    return any(r.name in ALLOWED_ROLES for r in member.roles)
-
-
-# ----------------------------
-# Embed builders
-# ----------------------------
-def build_item_embed(shop_key: str, item_id: str, item: dict) -> discord.Embed:
-    embed = discord.Embed(
-        title=item.get("name", "Unnamed Item"),
-        description=item.get("desc", ""),
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.add_field(name="Price", value=f'{int(item.get("price", 0))} AP', inline=True)
-    embed.add_field(name="Stock", value=str(int(item.get("stock", 0))), inline=True)
-    if item.get("image"):
-        embed.set_image(url=item["image"])
-
-    # Stable footer for recovery (include shop_key)
-    embed.set_footer(text=f"Cryonic Gaming Shop({shop_key}) | id:{item_id}")
-    return embed
-
-
-def build_order_embed(order: dict) -> discord.Embed:
-    status = order.get("status", "PENDING")
-    title = f"Order {order.get('order_id', '')} — {status}"
-
-    embed = discord.Embed(title=title, timestamp=discord.utils.utcnow())
-    embed.add_field(name="Buyer", value=f"<@{order.get('buyer_id')}> ({order.get('buyer_tag')})", inline=False)
-    embed.add_field(name="Shop", value=str(order.get("shop_key", "main")), inline=True)
-    embed.add_field(name="Item", value=str(order.get("item_name", "Unknown")), inline=True)
-    embed.add_field(name="Quantity", value=str(order.get("qty", 0)), inline=True)
-    embed.add_field(name="IGN", value=f"`{order.get('ign', '')}`", inline=True)
-    embed.add_field(name="Cost", value=f"{order.get('cost', 0)} AP", inline=True)
-    embed.add_field(name="Created", value=order.get("created_at", ""), inline=True)
-
-    if status == "DELIVERED":
-        embed.add_field(name="Delivered By", value=f"<@{order.get('delivered_by')}>", inline=True)
-        embed.add_field(name="Delivered At", value=order.get("delivered_at", ""), inline=True)
-
-    if status == "UNDELIVERED":
-        embed.add_field(name="Marked Undelivered By", value=f"<@{order.get('undelivered_by')}>", inline=True)
-        embed.add_field(name="Undelivered At", value=order.get("undelivered_at", ""), inline=True)
-        reason = order.get("undelivered_reason") or "No reason provided."
-        embed.add_field(name="Reason", value=reason[:1024], inline=False)
-
-    embed.set_footer(text="Shop Orders")
-    return embed
-
-
-# ----------------------------
-# Index recovery (best-effort)
-# ----------------------------
-async def rebuild_index_from_channels(guild: discord.Guild, shop_key: str) -> None:
-    shop_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["shop_channel"])
-    access_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["access_channel"])
-    if not shop_ch or not access_ch:
-        return
-
-    idx = load_index(shop_key)
-    gkey = str(guild.id)
-    gidx = idx.setdefault(gkey, {})
-    gidx.setdefault("items", {})
-    items_idx: dict = gidx["items"]
-
-    async def scan_channel(ch: discord.TextChannel, key_name: str):
-        async for msg in ch.history(limit=250):
-            try:
-                me = guild.me  # type: ignore
-                if not me or not msg.author or msg.author.id != me.id:
-                    continue
-                if not msg.embeds:
-                    continue
-                e = msg.embeds[0]
-                footer_text = (e.footer.text or "") if e.footer else ""
-                # Footer contains Cryonic Gaming Shop(shop_key) | id:xxxx
-                if f"Cryonic Gaming Shop({shop_key})" not in footer_text or "id:" not in footer_text:
-                    continue
-                item_id = footer_text.split("id:", 1)[1].strip()
-                if not item_id:
-                    continue
-                entry = items_idx.get(item_id) or {}
-                if not isinstance(entry, dict):
-                    entry = {}
-                entry[key_name] = int(msg.id)
-                items_idx[item_id] = entry
-            except Exception:
-                continue
-
-    await scan_channel(shop_ch, "shop_msg_id")
-    await scan_channel(access_ch, "access_msg_id")
-
-    if not gidx.get("management_msg_id"):
-        async for msg in access_ch.history(limit=150):
-            try:
-                me = guild.me  # type: ignore
-                if me and msg.author and msg.author.id == me.id and msg.content.strip() == f"**Shop Management ({SHOPS[shop_key]['label']})**":
-                    gidx["management_msg_id"] = int(msg.id)
-                    break
-            except Exception:
-                continue
-
-    gidx["items"] = items_idx
-    idx[gkey] = gidx
-    save_index(shop_key, idx)
-
-
-# ----------------------------
-# Undelivered Reason Modal
-# ----------------------------
-class UndeliveredReasonModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog", order_id: str):
-        super().__init__(title="Mark Undelivered")
-        self.cog = cog
-        self.order_id = order_id
-
-        self.reason = discord.ui.TextInput(
-            label="Reason",
-            style=discord.TextStyle.long,
-            placeholder="Why is this undelivered? (e.g., buyer offline, wrong IGN, etc.)",
-            required=True,
-            max_length=1000
-        )
-        self.add_item(self.reason)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_manager(interaction.user):
-            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-            return
-        await safe_defer(interaction, ephemeral=True)
-
-        async with SHOP_LOCK:
-            data = load_orders()
-            orders = data.setdefault("orders", {})
-            o = orders.get(self.order_id)
-            if not o:
-                await safe_reply(interaction, "❌ Order not found.", ephemeral=True)
-                return
-
-            o["status"] = "UNDELIVERED"
-            o["undelivered_by"] = str(interaction.user.id)
-            o["undelivered_at"] = utc_iso()
-            o["undelivered_reason"] = str(self.reason.value).strip()
-
-            o.pop("delivered_by", None)
-            o.pop("delivered_at", None)
-            orders[self.order_id] = o
-            save_orders(data)
-
-        if interaction.guild:
-            await self.cog.refresh_order_message(interaction.guild, self.order_id)
-        await safe_reply(interaction, "✅ Marked as UNDELIVERED.", ephemeral=True)
-
-
-# ----------------------------
-# Persistent Order Buttons
-# ----------------------------
-class DeliveredButton(discord.ui.Button):
-    def __init__(self, cog: "ShopCog", order_id: str):
-        super().__init__(label="Delivered", style=discord.ButtonStyle.success, custom_id=f"order:delivered:{order_id}")
-        self.cog = cog
-        self.order_id = order_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_manager(interaction.user):
-            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-            return
-        await safe_defer(interaction, ephemeral=True)
-
-        async with SHOP_LOCK:
-            data = load_orders()
-            orders = data.setdefault("orders", {})
-            o = orders.get(self.order_id)
-            if not o:
-                await safe_reply(interaction, "❌ Order not found.", ephemeral=True)
-                return
-
-            o["status"] = "DELIVERED"
-            o["delivered_by"] = str(interaction.user.id)
-            o["delivered_at"] = utc_iso()
-
-            o.pop("undelivered_by", None)
-            o.pop("undelivered_at", None)
-            o.pop("undelivered_reason", None)
-            orders[self.order_id] = o
-            save_orders(data)
-
-        if interaction.guild:
-            await self.cog.refresh_order_message(interaction.guild, self.order_id)
-        await safe_reply(interaction, "✅ Marked as DELIVERED.", ephemeral=True)
-
-
-class UndeliveredButton(discord.ui.Button):
-    def __init__(self, cog: "ShopCog", order_id: str):
-        super().__init__(
-            label="Undelivered (Add reason)",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"order:undelivered:{order_id}",
-        )
-        self.cog = cog
-        self.order_id = order_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_manager(interaction.user):
-            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-            return
-        await safe_send_modal(interaction, UndeliveredReasonModal(self.cog, self.order_id))
-
-
-class UndoButton(discord.ui.Button):
-    def __init__(self, cog: "ShopCog", order_id: str):
-        super().__init__(label="Undo", style=discord.ButtonStyle.secondary, custom_id=f"order:undo:{order_id}")
-        self.cog = cog
-        self.order_id = order_id
-
-    async def callback(self, interaction: discord.Interaction):
-        if not is_manager(interaction.user):
-            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-            return
-        await safe_defer(interaction, ephemeral=True)
-
-        async with SHOP_LOCK:
-            data = load_orders()
-            orders = data.setdefault("orders", {})
-            o = orders.get(self.order_id)
-            if not o:
-                await safe_reply(interaction, "❌ Order not found.", ephemeral=True)
-                return
-
-            o["status"] = "PENDING"
-            o.pop("delivered_by", None)
-            o.pop("delivered_at", None)
-            o.pop("undelivered_by", None)
-            o.pop("undelivered_at", None)
-            o.pop("undelivered_reason", None)
-
-            orders[self.order_id] = o
-            save_orders(data)
-
-        if interaction.guild:
-            await self.cog.refresh_order_message(interaction.guild, self.order_id)
-        await safe_reply(interaction, "✅ Status reset to PENDING.", ephemeral=True)
-
-
-class OrderStatusView(discord.ui.View):
-    def __init__(self, cog: "ShopCog", order_id: str):
-        super().__init__(timeout=None)
-        self.add_item(DeliveredButton(cog, order_id))
-        self.add_item(UndeliveredButton(cog, order_id))
-        self.add_item(UndoButton(cog, order_id))
-
-
-# ----------------------------
-# Buy modal (Quantity + IGN)
-# ----------------------------
-class BuyItemModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str):
-        super().__init__(title=f"Buy Item ({SHOPS[shop_key]['label']})")
-        self.cog = cog
-        self.shop_key = shop_key
-        self.item_id = item_id
-
-        self.qty = discord.ui.TextInput(label="Quantity", placeholder="Enter a number (e.g., 1)", required=True)
-        self.ign = discord.ui.TextInput(label="In-Game Name (IGN)", placeholder="Enter your IGN", required=True, max_length=32)
-        self.add_item(self.qty)
-        self.add_item(self.ign)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await safe_defer(interaction, ephemeral=True)
-
+        return await guild.create_text_channel(FLOWCHART_CH)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        await safe_log(guild, f"Flowchart: could not create #{FLOWCHART_CH}. Missing perms? `{type(e).__name__}`")
+        return None
+
+def unit_role_ids(data: Dict[str, Any]) -> List[int]:
+    ids: List[int] = []
+    for u in data.get("units", {}).values():
+        rid = u.get("unit_role_id")
+        if isinstance(rid, int):
+            ids.append(rid)
+    return ids
+
+def rank_roles_to_strip(guild: discord.Guild) -> List[discord.Role]:
+    candidates = [OFFICER_ROLE, COMMANDER_ROLE, GENERAL_ROLE, CEO_ROLE, DIRECTOR_ROLE]
+    out: List[discord.Role] = []
+    for name in candidates:
+        if name in PROTECTED_RANK_ROLES:
+            continue
+        r = get_role(guild, name)
+        if r:
+            out.append(r)
+    return out
+
+async def strip_member_for_unit_change(
+    member: discord.Member,
+    data: Dict[str, Any]
+) -> Tuple[List[discord.Role], List[discord.Role]]:
+    guild = member.guild
+
+    removed_rank: List[discord.Role] = []
+    for role in rank_roles_to_strip(guild):
+        if role in member.roles:
+            removed_rank.append(role)
+    if removed_rank:
+        await member.remove_roles(*removed_rank, reason="ARC unit transfer: stripping prior ranks")
+
+    removed_unit: List[discord.Role] = []
+    for rid in unit_role_ids(data):
+        r = guild.get_role(rid)
+        if r and r in member.roles:
+            removed_unit.append(r)
+    if removed_unit:
+        await member.remove_roles(*removed_unit, reason="ARC unit transfer: stripping prior unit role(s)")
+
+    return removed_rank, removed_unit
+
+async def remove_unitless_if_present(member: discord.Member) -> None:
+    role = get_role(member.guild, UNITLESS_ROLE)
+    if role and role in member.roles:
         try:
-            qty = int(str(self.qty.value).strip())
-            if qty <= 0:
-                raise ValueError
-        except ValueError:
-            await safe_reply(interaction, "❌ Quantity must be a positive whole number.", ephemeral=True)
-            return
+            await member.remove_roles(role, reason="ARC unit assignment: removing Unitless")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
-        ign = str(self.ign.value).strip()
-        if not ign:
-            await safe_reply(interaction, "❌ IGN is required.", ephemeral=True)
-            return
+def get_member_unit_director_id(data: Dict[str, Any], member_id: int) -> Optional[int]:
+    rec = data.get("members", {}).get(str(member_id))
+    if not rec:
+        return None
+    did = rec.get("director_id")
+    return did if isinstance(did, int) else None
 
-        async with SHOP_LOCK:
-            shop = load_shop(self.shop_key)
-            items = shop["items"]
+async def assign_member_to_unit(
+    member: discord.Member,
+    director: discord.Member,
+    data: Dict[str, Any],
+    *,
+    strip_first: bool = True,
+) -> Tuple[Optional[int], Optional[str]]:
+    guild = member.guild
 
-            if self.item_id not in items:
-                await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
-                return
+    unit = data.get("units", {}).get(str(director.id))
+    if not unit:
+        return None, None
 
-            item = items[self.item_id]
-            stock = int(item.get("stock", 0))
-            if stock <= 0:
-                await safe_reply(interaction, "❌ Out of stock.", ephemeral=True)
-                return
-            if qty > stock:
-                await safe_reply(interaction, f"❌ Not enough stock (requested {qty}, available {stock}).", ephemeral=True)
-                return
+    old_director_id = get_member_unit_director_id(data, member.id)
 
-            ap_data = load_ap()
-            uid = str(interaction.user.id)
-            user_entry = ap_data.get(uid)
-            if not user_entry or "ap" not in user_entry:
-                await safe_reply(interaction, "❌ You have no AP account.", ephemeral=True)
-                return
+    if strip_first:
+        await strip_member_for_unit_change(member, data)
 
-            price = int(item.get("price", 0))
-            total_cost = price * qty
-            user_ap = int(float(user_entry.get("ap", 0)))
-            if user_ap < total_cost:
-                await safe_reply(interaction, f"❌ Not enough AP (cost {total_cost}, you have {user_ap}).", ephemeral=True)
-                return
-
-            # Apply AP + stock
-            user_entry["ap"] = user_ap - total_cost
-            item["stock"] = stock - qty
-            items[self.item_id] = item
-            ap_data[uid] = user_entry
-            save_ap(ap_data)
-            save_shop(self.shop_key, shop)
-
-            # Create order record
-            order_id = uuid.uuid4().hex[:10]
-            order = {
-                "order_id": order_id,
-                "status": "PENDING",
-                "created_at": utc_iso(),
-                "guild_id": str(interaction.guild.id) if interaction.guild else None,
-                "channel_name": ORDER_LOG_CHANNEL,
-                "message_id": None,
-                "buyer_id": str(interaction.user.id),
-                "buyer_tag": str(interaction.user),
-                "shop_key": self.shop_key,
-                "item_id": self.item_id,
-                "item_name": item.get("name", self.item_id),
-                "qty": qty,
-                "ign": ign,
-                "cost": total_cost,
-            }
-
-            orders_data = load_orders()
-            orders = orders_data.setdefault("orders", {})
-            orders[order_id] = order
-            save_orders(orders_data)
-
-        if not interaction.guild:
-            await safe_reply(interaction, "❌ Guild context missing.", ephemeral=True)
-            return
-
-        order_ch = discord.utils.get(interaction.guild.text_channels, name=ORDER_LOG_CHANNEL)
-        if not order_ch:
-            await safe_reply(interaction, "❌ Order channel not found. Contact staff.", ephemeral=True)
-            return
-
-        # Ensure persistent order view exists for this order
-        self.cog.register_order_view(order_id)
-
-        embed = build_order_embed(order)
-        msg = await order_ch.send(embed=embed, view=OrderStatusView(self.cog, order_id))
-
-        async with SHOP_LOCK:
-            orders_data = load_orders()
-            orders = orders_data.setdefault("orders", {})
-            if order_id in orders:
-                orders[order_id]["message_id"] = str(msg.id)
-                save_orders(orders_data)
-
-        # Update this item's embeds in the correct shop
-        await self.cog.update_item_messages(interaction.guild, self.shop_key, self.item_id)
-
-        await safe_reply(interaction, "✅ Order placed.", ephemeral=True)
-
-
-# ----------------------------
-# Stock / item management modals
-# ----------------------------
-class AdjustStockModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str, mode: str):
-        super().__init__(title=f"{mode.title()} Stock ({SHOPS[shop_key]['label']})")
-        self.cog = cog
-        self.shop_key = shop_key
-        self.item_id = item_id
-        self.mode = mode
-        self.amount = discord.ui.TextInput(label="Quantity", placeholder="Enter a number", required=True)
-        self.add_item(self.amount)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_manager(interaction.user):
-            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-            return
-
-        await safe_defer(interaction, ephemeral=True)
-
+    role = guild.get_role(unit["unit_role_id"])
+    if role:
         try:
-            amt = int(str(self.amount.value).strip())
-            if amt <= 0:
-                raise ValueError
-        except ValueError:
-            await safe_reply(interaction, "❌ Quantity must be a positive whole number.", ephemeral=True)
-            return
+            await member.add_roles(role, reason="ARC unit assignment: assigning unit role")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
-        async with SHOP_LOCK:
-            shop = load_shop(self.shop_key)
-            items = shop["items"]
-            if self.item_id not in items:
-                await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
-                return
+    await remove_unitless_if_present(member)
 
-            item = items[self.item_id]
-            if self.mode == "add":
-                item["stock"] = int(item.get("stock", 0)) + amt
-            else:
-                item["stock"] = max(0, int(item.get("stock", 0)) - amt)
+    rec = ensure_member_record(data, member.id)
+    rec["director_id"] = director.id
 
-            items[self.item_id] = item
-            save_shop(self.shop_key, shop)
+    if not (is_director(member) or is_ceo(member)):
+        rec["rank"] = RANK_SECURITY
 
-        if interaction.guild:
-            await self.cog.update_item_messages(interaction.guild, self.shop_key, self.item_id)
-        await safe_reply(interaction, "✅ Stock updated.", ephemeral=True)
+    return old_director_id, unit.get("unit_name")
 
+async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str, str]:
+    guild = member.guild
 
-class UpdateItemModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str, item: dict):
-        super().__init__(title=f"Update Item ({SHOPS[shop_key]['label']})")
-        self.cog = cog
-        self.shop_key = shop_key
-        self.item_id = item_id
+    async with file_lock:
+        data = load_data()
+        rec = ensure_member_record(data, member.id)
 
-        self.name = discord.ui.TextInput(label="Item Name", default=item.get("name", ""), required=True)
-        self.desc = discord.ui.TextInput(label="Description", style=discord.TextStyle.long, default=item.get("desc", ""), required=True)
-        self.price = discord.ui.TextInput(label="Price (AP)", default=str(item.get("price", 0)), required=True)
-        self.image = discord.ui.TextInput(label="Image Link (URL)", default=item.get("image") or "", required=False)
+        old_rank = rec.get("rank", RANK_SECURITY)
+        rec["rank"] = new_rank
 
-        for field in (self.name, self.desc, self.price, self.image):
-            self.add_item(field)
+        to_remove: List[discord.Role] = []
+        for role in rank_roles_to_strip(guild):
+            if role in member.roles:
+                to_remove.append(role)
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="ARC rank change: removing prior rank roles")
 
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_manager(interaction.user):
-            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-            return
-
-        await safe_defer(interaction, ephemeral=True)
-
-        try:
-            price = int(str(self.price.value).strip())
-            if price < 0:
-                raise ValueError
-        except ValueError:
-            await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
-            return
-
-        async with SHOP_LOCK:
-            shop = load_shop(self.shop_key)
-            items = shop["items"]
-            if self.item_id not in items:
-                await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
-                return
-
-            item = items[self.item_id]
-            item["name"] = str(self.name.value).strip()
-            item["desc"] = str(self.desc.value).strip()
-            item["price"] = price
-            item["image"] = str(self.image.value).strip() or None
-
-            items[self.item_id] = item
-            save_shop(self.shop_key, shop)
-
-        if interaction.guild:
-            await self.cog.update_item_messages(interaction.guild, self.shop_key, self.item_id)
-        await safe_reply(interaction, "✅ Item updated.", ephemeral=True)
-
-
-class AddNewItemModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog", shop_key: str):
-        super().__init__(title=f"Add New Item ({SHOPS[shop_key]['label']})")
-        self.cog = cog
-        self.shop_key = shop_key
-
-        self.name = discord.ui.TextInput(label="Item Name", required=True)
-        self.desc = discord.ui.TextInput(label="Item Description", style=discord.TextStyle.long, required=True)
-        self.price = discord.ui.TextInput(label="Item Price (AP)", required=True)
-        self.image = discord.ui.TextInput(label="Item Image Link (URL)", required=False)
-
-        for field in (self.name, self.desc, self.price, self.image):
-            self.add_item(field)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_manager(interaction.user):
-            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-            return
-
-        await safe_defer(interaction, ephemeral=True)
-
-        try:
-            price = int(str(self.price.value).strip())
-            if price < 0:
-                raise ValueError
-        except ValueError:
-            await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
-            return
-
-        async with SHOP_LOCK:
-            shop = load_shop(self.shop_key)
-            items = shop["items"]
-
-            item_id = uuid.uuid4().hex[:10]
-            items[item_id] = {
-                "name": str(self.name.value).strip(),
-                "desc": str(self.desc.value).strip(),
-                "price": price,
-                "stock": 0,
-                "image": str(self.image.value).strip() or None
-            }
-            save_shop(self.shop_key, shop)
-
-        if interaction.guild:
-            await self.cog.sync_shop_messages(interaction.guild, self.shop_key)
-        await safe_reply(interaction, "✅ New item added.", ephemeral=True)
-
-
-# ----------------------------
-# Persistent Views (restart-safe)
-# ----------------------------
-class BuyView(discord.ui.View):
-    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str, disabled: bool):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.add_item(discord.ui.Button(
-            label="Buy",
-            style=discord.ButtonStyle.success,
-            custom_id=f"shop:buy:{shop_key}:{item_id}",
-            disabled=disabled
-        ))
-
-
-class ManageView(discord.ui.View):
-    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.add_item(discord.ui.Button(label="Add Stock", style=discord.ButtonStyle.primary, custom_id=f"shop:stock_add:{shop_key}:{item_id}"))
-        self.add_item(discord.ui.Button(label="Remove Stock", style=discord.ButtonStyle.danger, custom_id=f"shop:stock_remove:{shop_key}:{item_id}"))
-        self.add_item(discord.ui.Button(label="Update Item", style=discord.ButtonStyle.secondary, custom_id=f"shop:update:{shop_key}:{item_id}"))
-        self.add_item(discord.ui.Button(label="Remove Item", style=discord.ButtonStyle.danger, custom_id=f"shop:remove:{shop_key}:{item_id}"))
-
-
-class ShopManagementView(discord.ui.View):
-    def __init__(self, cog: "ShopCog", shop_key: str):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.shop_key = shop_key
-        self.add_item(discord.ui.Button(
-            label=f"Add New Item ({SHOPS[shop_key]['label']})",
-            style=discord.ButtonStyle.success,
-            custom_id=f"shop:add_new:{shop_key}"
-        ))
-
-
-# ----------------------------
-# App command permission checks
-# ----------------------------
-def has_required_role():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return False
-        return is_manager(interaction.user)
-    return app_commands.check(predicate)
-
-
-# ----------------------------
-# Cog
-# ----------------------------
-class ShopCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self._registered_order_views: set[str] = set()
-        self._startup_done: set[int] = set()
-
-        # global edit rate limiter
-        self._edit_lock = asyncio.Lock()
-        self._global_last_edit_at = 0.0
-
-    async def cog_load(self):
-        asyncio.create_task(self._startup())
-
-    # ----------------------------
-    # Compare helpers (NO EDIT unless needed)
-    # ----------------------------
-    def _embed_to_dict(self, e: discord.Embed | None) -> dict | None:
-        if not e:
-            return None
-        try:
-            return e.to_dict()
-        except Exception:
-            return None
-
-    async def safe_edit_if_needed(
-        self,
-        msg: discord.Message,
-        *,
-        content: str | None = None,
-        embed: discord.Embed | None = None,
-        view: discord.ui.View | None = None,
-    ) -> bool:
-        """
-        Edits ONLY if needed:
-        - content differs (when provided)
-        - embed differs (when provided)
-        View edits are skipped by default because persistent views are registered on startup.
-        Also includes a GLOBAL spacing between edits when an edit is necessary.
-        """
-        try:
-            need_edit = False
-
-            if content is not None:
-                if (msg.content or "") != (content or ""):
-                    need_edit = True
-
-            if embed is not None:
-                cur = msg.embeds[0] if msg.embeds else None
-                if self._embed_to_dict(cur) != self._embed_to_dict(embed):
-                    need_edit = True
-
-            if not need_edit:
-                return False
-
-            async with self._edit_lock:
-                now = asyncio.get_running_loop().time()
-                wait_for = (self._global_last_edit_at + GLOBAL_EDIT_MIN_INTERVAL_SECONDS) - now
-                if wait_for > 0:
-                    await asyncio.sleep(wait_for)
-
-                await msg.edit(content=content, embed=embed, view=view)
-
-                self._global_last_edit_at = asyncio.get_running_loop().time()
-                return True
-
-        except Exception:
-            return False
-
-    async def _startup(self):
-        await self.bot.wait_until_ready()
-        await asyncio.sleep(1.0)
-
-        # Register persistent views
-        # - management views (one per shop)
-        for shop_key in SHOPS.keys():
-            self.bot.add_view(ShopManagementView(self, shop_key))
-
-        # - order views
-        self.restore_order_views()
-
-        for guild in self.bot.guilds:
-            if guild.id in self._startup_done:
-                continue
-            self._startup_done.add(guild.id)
-
-            await self.ensure_channels(guild)
-
-            # recover indexes + sync both shops
-            for shop_key in SHOPS.keys():
+        if new_rank in (RANK_OFFICER, RANK_COMMANDER, RANK_GENERAL, RANK_DIRECTOR, RANK_CEO):
+            role_name = ROLE_BY_RANK.get(new_rank)
+            role_obj = get_role(guild, role_name) if role_name else None
+            if role_obj and role_obj not in member.roles:
                 try:
-                    idx = load_index(shop_key)
-                    gidx = idx.get(str(guild.id), {})
-                    items_idx = (gidx.get("items") or {})
-                    if not isinstance(items_idx, dict) or not items_idx:
-                        await rebuild_index_from_channels(guild, shop_key)
-                except Exception:
+                    await member.add_roles(role_obj, reason=f"ARC rank change: set to {new_rank}")
+                except (discord.Forbidden, discord.HTTPException):
                     pass
 
-                await self.sync_shop_messages(guild, shop_key)
+        save_data(data)
+        return old_rank, new_rank
 
-    # ----------------------------
-    # Persistent interaction router (shop buttons)
-    # ----------------------------
-    @commands.Cog.listener()
-    async def on_interaction(self, interaction: discord.Interaction):
+async def log_action(guild: discord.Guild, content: str, mention_director_ids: List[int]) -> None:
+    ch = await ensure_log_channel(guild)
+
+    uniq: List[int] = []
+    for i in mention_director_ids:
+        if isinstance(i, int) and i not in uniq:
+            uniq.append(i)
+
+    mentions = []
+    for did in uniq:
+        m = guild.get_member(did)
+        if m:
+            mentions.append(m.mention)
+
+    prefix = (" ".join(mentions) + "\n") if mentions else ""
+    await ch.send(prefix + content)
+
+def _rank_label(rank: str) -> str:
+    return {
+        RANK_CEO: "CEO",
+        RANK_DIRECTOR: "Director",
+        RANK_GENERAL: "General",
+        RANK_COMMANDER: "Commander",
+        RANK_OFFICER: "Officer",
+        RANK_SECURITY: "Security",
+    }.get(rank, rank)
+
+def _sort_members_casefold(members: List[discord.Member]) -> List[discord.Member]:
+    return sorted(members, key=lambda x: (x.display_name or "").casefold())
+
+def _chunk_text(text: str, max_len: int = 1900) -> List[str]:
+    lines = text.split("\n")
+    chunks: List[str] = []
+    buf: List[str] = []
+    cur = 0
+    for line in lines:
+        add = len(line) + 1
+        if buf and (cur + add) > max_len:
+            chunks.append("\n".join(buf))
+            buf = [line]
+            cur = len(line) + 1
+        else:
+            buf.append(line)
+            cur += add
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
+    # CEO(s) by role
+    ceo_role = get_role(guild, CEO_ROLE)
+    ceos: List[discord.Member] = []
+    if ceo_role:
+        ceos = _sort_members_casefold([m for m in guild.members if ceo_role in m.roles])
+
+    header = ["ARC Corporate Flowchart", ""]
+    if not ceos:
+        header.append("CEO: (unassigned)")
+    elif len(ceos) == 1:
+        header.append(f"CEO: {ceos[0].display_name}")
+    else:
+        header.append("CEO(s): " + ", ".join([m.display_name for m in ceos]))
+    header.append("")
+
+    # Directors: prefer unit owners (data["units"] keys), and include Directors by role even if no unit.
+    unit_owner_ids: List[int] = []
+    for k in data.get("units", {}).keys():
         try:
-            data = interaction.data or {}
-            custom_id = data.get("custom_id")
-            if not custom_id or not isinstance(custom_id, str):
-                return
-            if not custom_id.startswith("shop:"):
-                return
-
-            parts = custom_id.split(":")
-            # Expected:
-            # shop:buy:<shop_key>:<item_id>
-            # shop:add_new:<shop_key>
-            # shop:stock_add:<shop_key>:<item_id> etc
-            if len(parts) < 3:
-                return
-
-            action = parts[1]
-            shop_key = parts[2]
-            item_id = parts[3] if len(parts) >= 4 else None
-
-            if shop_key not in SHOPS:
-                return
-
-            if action == "buy" and item_id:
-                await safe_send_modal(interaction, BuyItemModal(self, shop_key, item_id))
-                return
-
-            if action == "add_new":
-                if not is_manager(interaction.user):
-                    await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-                    return
-                await safe_send_modal(interaction, AddNewItemModal(self, shop_key))
-                return
-
-            if action in ("stock_add", "stock_remove", "update", "remove") and item_id:
-                if not is_manager(interaction.user):
-                    await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
-                    return
-
-                if action == "stock_add":
-                    await safe_send_modal(interaction, AdjustStockModal(self, shop_key, item_id, "add"))
-                    return
-
-                if action == "stock_remove":
-                    await safe_send_modal(interaction, AdjustStockModal(self, shop_key, item_id, "remove"))
-                    return
-
-                if action == "update":
-                    shop = load_shop(shop_key)
-                    items = shop["items"]
-                    if item_id not in items:
-                        await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
-                        return
-                    await safe_send_modal(interaction, UpdateItemModal(self, shop_key, item_id, items[item_id]))
-                    return
-
-                if action == "remove":
-                    await safe_defer(interaction, ephemeral=True)
-
-                    async with SHOP_LOCK:
-                        shop = load_shop(shop_key)
-                        items = shop["items"]
-                        if item_id not in items:
-                            await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
-                            return
-
-                        item_name = items[item_id].get("name", item_id)
-                        items.pop(item_id, None)
-                        save_shop(shop_key, shop)
-
-                        if interaction.guild:
-                            idx = load_index(shop_key)
-                            gidx = idx.get(str(interaction.guild.id), {})
-                            items_idx = gidx.get("items", {})
-                            if isinstance(items_idx, dict):
-                                items_idx.pop(item_id, None)
-                            gidx["items"] = items_idx if isinstance(items_idx, dict) else {}
-                            idx[str(interaction.guild.id)] = gidx
-                            save_index(shop_key, idx)
-
-                    if interaction.guild:
-                        await self.sync_shop_messages(interaction.guild, shop_key)
-
-                    await safe_reply(interaction, f"🗑️ Removed **{item_name}** from **{SHOPS[shop_key]['label']}** shop.", ephemeral=True)
-                    return
-
+            unit_owner_ids.append(int(k))
         except Exception:
-            return
+            pass
 
-    # ----------------------------
-    # Order persistence
-    # ----------------------------
-    def restore_order_views(self):
-        data = load_orders()
-        for order_id in (data.get("orders", {}) or {}).keys():
-            self.register_order_view(order_id)
+    directors_role = get_role(guild, DIRECTOR_ROLE)
+    if directors_role:
+        for m in guild.members:
+            if directors_role in m.roles and m.id not in unit_owner_ids:
+                unit_owner_ids.append(m.id)
 
-    def register_order_view(self, order_id: str):
-        if order_id in self._registered_order_views:
-            return
-        self.bot.add_view(OrderStatusView(self, order_id))
-        self._registered_order_views.add(order_id)
+    director_members: List[discord.Member] = []
+    for did in unit_owner_ids:
+        dm = guild.get_member(did)
+        if dm:
+            director_members.append(dm)
+    director_members = _sort_members_casefold(director_members)
 
-    # ----------------------------
-    # Channel setup
-    # ----------------------------
-    async def ensure_channels(self, guild: discord.Guild):
-        everyone = guild.default_role
-        me = guild.me  # type: ignore
+    lines: List[str] = header[:]
 
-        # Orders channel (unchanged)
-        orders_overwrites = {
-            everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
+    if not director_members:
+        lines.append("No Directors found.")
+        return "\n".join(lines)
+
+    for idx, d in enumerate(director_members):
+        unit = data.get("units", {}).get(str(d.id))
+        unit_name = unit.get("unit_name") if isinstance(unit, dict) else None
+        unit_label = f"{d.display_name}" + (f"  [{unit_name}]" if unit_name else "")
+        lines.append(f"├─ Director: {unit_label}")
+
+        # Build roster grouped by stored rank
+        members_for_director: List[Tuple[discord.Member, Dict[str, Any]]] = []
+        for m in guild.members:
+            rec = data.get("members", {}).get(str(m.id))
+            if isinstance(rec, dict) and rec.get("director_id") == d.id:
+                members_for_director.append((m, rec))
+
+        groups: Dict[str, List[discord.Member]] = {
+            RANK_DIRECTOR: [],
+            RANK_GENERAL: [],
+            RANK_COMMANDER: [],
+            RANK_OFFICER: [],
+            RANK_SECURITY: [],
         }
-        if me:
-            orders_overwrites[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
+        for m, rec in members_for_director:
+            r = rec.get("rank", RANK_SECURITY)
+            if r not in groups:
+                r = RANK_SECURITY
+            groups[r].append(m)
+
+        any_listed = False
+        for rank in (RANK_DIRECTOR, RANK_GENERAL, RANK_COMMANDER, RANK_OFFICER, RANK_SECURITY):
+            ms = _sort_members_casefold(groups.get(rank, []))
+            if not ms:
+                continue
+            any_listed = True
+            lines.append(f"│  ├─ {_rank_label(rank)} ({len(ms)})")
+            for m in ms:
+                lines.append(f"│  │  • {m.display_name}")
+
+        if not any_listed:
+            lines.append("│  └─ (No assigned members)")
+
+        # spacing between directors
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+async def update_flowchart(guild: discord.Guild) -> None:
+    """
+    Posts/updates a single flowchart message in #corp-flowchart.
+    Uses plain text (code block) to avoid needing Embed Links permission.
+    """
+    # Ensure channel exists
+    ch = await ensure_flowchart_channel(guild)
+    if not ch:
+        return
+
+    me = guild.me
+    if me:
+        perms = ch.permissions_for(me)
+        if not perms.view_channel or not perms.send_messages:
+            await safe_log(
+                guild,
+                f"Flowchart: cannot post in #{FLOWCHART_CH}. "
+                f"Need View Channel + Send Messages. Current: view={perms.view_channel}, send={perms.send_messages}"
+            )
+            return
+
+    # Load state and stored message pointer
+    async with file_lock:
+        data = load_data()
+        flow = data.setdefault("flowchart", {})
+        stored_message_id = flow.get("message_id")
+
+    text = build_flowchart_text(guild, data)
+
+    # If too long, send as multiple messages but still keep the first message tracked and updateable.
+    # First message holds part 1, subsequent parts are sent fresh each time (best-effort).
+    parts = _chunk_text(f"```text\n{text}\n```", max_len=1900)
+
+    # Try fetch existing tracked message
+    msg: Optional[discord.Message] = None
+    if isinstance(stored_message_id, int):
+        try:
+            msg = await ch.fetch_message(stored_message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            msg = None
+
+    try:
+        if msg:
+            await msg.edit(content=parts[0])
+        else:
+            msg = await ch.send(parts[0])
+            async with file_lock:
+                data = load_data()
+                flow = data.setdefault("flowchart", {})
+                flow["channel_id"] = ch.id
+                flow["message_id"] = msg.id
+                save_data(data)
+
+        # Post additional parts (best effort, do not persist their ids)
+        for p in parts[1:]:
+            try:
+                await ch.send(p)
+            except (discord.Forbidden, discord.HTTPException):
+                break
+
+    except (discord.Forbidden, discord.HTTPException) as e:
+        await safe_log(guild, f"Flowchart: failed to send/edit message in #{FLOWCHART_CH}. `{type(e).__name__}`")
+
+# =====================
+# MODAL
+# =====================
+class CreateUnitModal(discord.ui.Modal, title="Create ARC Unit"):
+    unit_name = discord.ui.TextInput(label="Unit Name", max_length=64)
+
+    def __init__(self, cog: "ARCHierarchyCog"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        director = interaction.user
+
+        if not is_director(director):
+            await interaction.response.send_message("Only Directors may create units.", ephemeral=True)
+            return
+
+        data = load_data()
+        if str(director.id) in data["units"]:
+            await interaction.response.send_message("You already own a unit.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=False, thinking=True)
+
+        try:
+            name = self.unit_name.value.strip()
+            role = await guild.create_role(name=name)
+
+            category = await guild.create_category(
+                f"Unit - {name}",
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    role: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                },
             )
 
-        # Create/update orders channel
-        orders_ch = discord.utils.get(guild.text_channels, name=ORDER_LOG_CHANNEL)
-        if not orders_ch:
-            try:
-                await guild.create_text_channel(ORDER_LOG_CHANNEL, overwrites=orders_overwrites)
-            except discord.Forbidden:
-                pass
-        else:
-            try:
-                await orders_ch.edit(overwrites=orders_overwrites)
-            except discord.Forbidden:
-                pass
+            text_ch = await guild.create_text_channel("unit-chat", category=category)
+            voice_ch = await guild.create_voice_channel("unit-voice", category=category)
 
-        # Per-shop channels
-        for shop_key, cfg in SHOPS.items():
-            shop_name = cfg["shop_channel"]
-            access_name = cfg["access_channel"]
-
-            shop_overwrites = {
-                everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
+            data["units"][str(director.id)] = {
+                "unit_name": name,
+                "unit_role_id": role.id,
+                "category_id": category.id,
             }
-            if me:
-                shop_overwrites[me] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
-                )
 
-            access_overwrites = {
-                everyone: discord.PermissionOverwrite(view_channel=False),
-            }
-            if me:
-                access_overwrites[me] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
-                )
-            for role_name in ALLOWED_ROLES:
-                role = discord.utils.get(guild.roles, name=role_name)
-                if role:
-                    access_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            old_director_id, _unit_name = await assign_member_to_unit(
+                director,
+                director,
+                data,
+                strip_first=True,
+            )
 
-            for name, overwrites in (
-                (shop_name, shop_overwrites),
-                (access_name, access_overwrites),
-            ):
-                ch = discord.utils.get(guild.text_channels, name=name)
-                if not ch:
-                    try:
-                        await guild.create_text_channel(name, overwrites=overwrites)
-                    except discord.Forbidden:
-                        pass
-                else:
-                    try:
-                        await ch.edit(overwrites=overwrites)
-                    except discord.Forbidden:
-                        pass
+            rec = ensure_member_record(data, director.id)
+            rec["rank"] = RANK_DIRECTOR
+            rec["director_id"] = director.id
 
-    # ----------------------------
-    # Shop message sync (NO PURGE) + NO EDIT unless needed
-    # ----------------------------
-    async def sync_shop_messages(self, guild: discord.Guild, shop_key: str):
-        shop_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["shop_channel"])
-        access_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["access_channel"])
-        if not shop_ch or not access_ch:
+            save_data(data)
+
+            mention_ids: List[int] = []
+            if isinstance(old_director_id, int):
+                mention_ids.append(old_director_id)
+            mention_ids.append(director.id)
+
+            await log_action(
+                guild,
+                f"Unit created: **{name}** by {director.mention}.",
+                mention_director_ids=mention_ids,
+            )
+
+            await interaction.followup.send(
+                f"Unit **{name}** created.\nChannels: {text_ch.mention}, {voice_ch.mention}",
+                ephemeral=False,
+            )
+
+            await update_flowchart(guild)
+
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.followup.send(
+                f"Unit creation failed due to a permissions/API error.\n`{type(e).__name__}`",
+                ephemeral=True,
+            )
+            await safe_log(guild, f"Create unit failed: `{type(e).__name__}`")
+
+# =====================
+# COG
+# =====================
+class ARCHierarchyCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    arc = app_commands.Group(name="arc", description="ARC hierarchy commands")
+
+    # -----------------
+    # FLOWCHART
+    # -----------------
+    @arc.command(name="flowchart_refresh", description="Force refresh the corp flowchart in #corp-flowchart")
+    async def flowchart_refresh(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        actor = interaction.user
+        if not isinstance(actor, discord.Member) or not can_manage(actor):
+            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
             return
 
-        async with SHOP_LOCK:
-            shop = load_shop(shop_key)
-            items = shop["items"]
+        await update_flowchart(interaction.guild)
+        await interaction.followup.send("✅ Flowchart refreshed.", ephemeral=True)
 
-            idx = load_index(shop_key)
-            gkey = str(guild.id)
-            gidx = idx.setdefault(gkey, {})
-            gidx.setdefault("items", {})
-            items_idx = gidx["items"]
-            if not isinstance(items_idx, dict):
-                items_idx = {}
-                gidx["items"] = items_idx
+    # -----------------
+    # UNIT MGMT
+    # -----------------
+    @arc.command(name="create_unit")
+    async def create_unit(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CreateUnitModal(self))
 
-            # If empty, try recovery once
-            if not items_idx:
-                try:
-                    await rebuild_index_from_channels(guild, shop_key)
-                except Exception:
-                    pass
-                idx = load_index(shop_key)
-                gidx = idx.setdefault(gkey, {})
-                gidx.setdefault("items", {})
-                items_idx = gidx["items"]
-                if not isinstance(items_idx, dict):
-                    items_idx = {}
-                    gidx["items"] = items_idx
+    @arc.command(name="join")
+    @app_commands.describe(director="Director you want to join")
+    async def join(self, interaction: discord.Interaction, director: discord.Member):
+        await interaction.response.defer(ephemeral=False, thinking=True)
 
-            # Upsert each item message (shop + access)
-            for item_id, item in items.items():
-                embed = build_item_embed(shop_key, item_id, item)
-                out_of_stock = int(item.get("stock", 0)) <= 0
+        guild = interaction.guild
+        member = interaction.user
+        data = load_data()
 
-                shop_msg_id = None
-                access_msg_id = None
-                if item_id in items_idx and isinstance(items_idx[item_id], dict):
-                    shop_msg_id = items_idx[item_id].get("shop_msg_id")
-                    access_msg_id = items_idx[item_id].get("access_msg_id")
-
-                # shop message
-                shop_msg = None
-                if shop_msg_id:
-                    try:
-                        shop_msg = await shop_ch.fetch_message(int(shop_msg_id))
-                    except Exception:
-                        shop_msg = None
-                if shop_msg is None:
-                    shop_msg = await shop_ch.send(embed=embed, view=BuyView(self, shop_key, item_id, disabled=out_of_stock))
-                    shop_msg_id = shop_msg.id
-                else:
-                    await self.safe_edit_if_needed(
-                        shop_msg,
-                        embed=embed,
-                        view=BuyView(self, shop_key, item_id, disabled=out_of_stock),
-                    )
-
-                # access message
-                access_msg = None
-                if access_msg_id:
-                    try:
-                        access_msg = await access_ch.fetch_message(int(access_msg_id))
-                    except Exception:
-                        access_msg = None
-                if access_msg is None:
-                    access_msg = await access_ch.send(embed=embed, view=ManageView(self, shop_key, item_id))
-                    access_msg_id = access_msg.id
-                else:
-                    await self.safe_edit_if_needed(
-                        access_msg,
-                        embed=embed,
-                        view=ManageView(self, shop_key, item_id),
-                    )
-
-                items_idx[item_id] = {"shop_msg_id": int(shop_msg_id), "access_msg_id": int(access_msg_id)}
-
-            # Management message (single per shop)
-            mgmt_id = gidx.get("management_msg_id")
-            mgmt_msg = None
-            if mgmt_id:
-                try:
-                    mgmt_msg = await access_ch.fetch_message(int(mgmt_id))
-                except Exception:
-                    mgmt_msg = None
-
-            desired_content = f"**Shop Management ({SHOPS[shop_key]['label']})**"
-            desired_view = ShopManagementView(self, shop_key)
-
-            if mgmt_msg is None:
-                mgmt_msg = await access_ch.send(desired_content, view=desired_view)
-                gidx["management_msg_id"] = mgmt_msg.id
-            else:
-                await self.safe_edit_if_needed(
-                    mgmt_msg,
-                    content=desired_content,
-                    embed=None,
-                    view=desired_view,
-                )
-
-            gidx["items"] = items_idx
-            idx[gkey] = gidx
-            save_index(shop_key, idx)
-
-    async def update_item_messages(self, guild: discord.Guild, shop_key: str, item_id: str):
-        shop = load_shop(shop_key)
-        items = shop["items"]
-        if item_id not in items:
-            await self.sync_shop_messages(guild, shop_key)
+        if not is_director(director):
+            await interaction.followup.send("Target must be a Director.", ephemeral=True)
             return
 
-        item = items[item_id]
-        embed = build_item_embed(shop_key, item_id, item)
-        out_of_stock = int(item.get("stock", 0)) <= 0
-
-        idx = load_index(shop_key)
-        gidx = idx.get(str(guild.id), {})
-        items_idx = (gidx.get("items") or {})
-        entry = items_idx.get(item_id)
-
-        shop_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["shop_channel"])
-        access_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["access_channel"])
-        if not shop_ch or not access_ch or not isinstance(entry, dict):
-            await self.sync_shop_messages(guild, shop_key)
+        unit = data["units"].get(str(director.id))
+        if not unit:
+            await interaction.followup.send("That Director has no unit.", ephemeral=True)
             return
 
-        try:
-            shop_msg = await shop_ch.fetch_message(int(entry["shop_msg_id"]))
-            await self.safe_edit_if_needed(shop_msg, embed=embed, view=BuyView(self, shop_key, item_id, disabled=out_of_stock))
-        except Exception:
-            await self.sync_shop_messages(guild, shop_key)
-            return
+        old_director_id, unit_name = await assign_member_to_unit(
+            member,
+            director,
+            data,
+            strip_first=True,
+        )
+        save_data(data)
 
-        try:
-            access_msg = await access_ch.fetch_message(int(entry["access_msg_id"]))
-            await self.safe_edit_if_needed(access_msg, embed=embed, view=ManageView(self, shop_key, item_id))
-        except Exception:
-            await self.sync_shop_messages(guild, shop_key)
-            return
+        mention_ids: List[int] = []
+        if isinstance(old_director_id, int):
+            mention_ids.append(old_director_id)
+        mention_ids.append(director.id)
+        if can_manage(member):
+            mention_ids.append(member.id)
 
-    async def refresh_order_message(self, guild: discord.Guild, order_id: str):
-        orders_ch = discord.utils.get(guild.text_channels, name=ORDER_LOG_CHANNEL)
-        if not orders_ch:
-            return
+        await log_action(
+            guild,
+            f"Unit transfer: {member.mention} joined **{unit_name}** (Director: {director.mention}).",
+            mention_director_ids=mention_ids,
+        )
 
-        data = load_orders()
-        o = (data.get("orders") or {}).get(order_id)
-        if not o or not o.get("message_id"):
-            return
+        await interaction.followup.send(
+            f"{member.mention} joined **{unit_name}**.",
+            ephemeral=False,
+        )
 
-        try:
-            msg = await orders_ch.fetch_message(int(o["message_id"]))
-        except Exception:
-            return
+        await update_flowchart(guild)
 
-        self.register_order_view(order_id)
-        await self.safe_edit_if_needed(msg, embed=build_order_embed(o), view=OrderStatusView(self, order_id))
-
-    # ----------------------------
-    # Slash Command
-    # ----------------------------
-    @app_commands.command(
-        name="shop_rebuild",
-        description="Sync BOTH shops (main + HS) without purging (Shop Steward / Admin Council only)."
+    @arc.command(name="transfer_unit")
+    @app_commands.describe(
+        from_director="Director currently owning the unit",
+        to_director="Director who will receive the unit"
     )
-    @has_required_role()
-    async def shop_rebuild(self, interaction: discord.Interaction):
-        await safe_defer(interaction, ephemeral=True)
-        if not interaction.guild:
-            await safe_reply(interaction, "❌ Must be used in a server.", ephemeral=True)
+    async def transfer_unit(self, interaction: discord.Interaction, from_director: discord.Member, to_director: discord.Member):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        actor = interaction.user
+        guild = interaction.guild
+
+        if not isinstance(actor, discord.Member) or not is_ceo(actor):
+            await interaction.followup.send("Only the CEO may use this command.", ephemeral=True)
             return
-        await self.ensure_channels(interaction.guild)
 
-        for shop_key in SHOPS.keys():
-            await self.sync_shop_messages(interaction.guild, shop_key)
-
-        await safe_reply(interaction, "✅ Shops synced (main + HS), no purge.", ephemeral=True)
-
-    @shop_rebuild.error
-    async def shop_rebuild_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.CheckFailure):
-            await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
+        if not is_director(from_director):
+            await interaction.followup.send("`from_director` must be a Director.", ephemeral=True)
             return
-        await safe_reply(interaction, "❌ An error occurred.", ephemeral=True)
-        raise error
 
+        if not is_director(to_director):
+            await interaction.followup.send("`to_director` must be a Director.", ephemeral=True)
+            return
+
+        if from_director.id == to_director.id:
+            await interaction.followup.send("Source and destination Directors are the same.", ephemeral=True)
+            return
+
+        moved_count = 0
+        unit: Dict[str, Any] = {}
+
+        async with file_lock:
+            data = load_data()
+
+            unit = data.get("units", {}).get(str(from_director.id))
+            if not unit:
+                await interaction.followup.send("That source Director has no unit to transfer.", ephemeral=True)
+                return
+
+            if str(to_director.id) in data.get("units", {}):
+                await interaction.followup.send("The destination Director already owns a unit.", ephemeral=True)
+                return
+
+            data["units"][str(to_director.id)] = unit
+            data["units"].pop(str(from_director.id), None)
+
+            members = data.get("members", {})
+            for _uid, rec in members.items():
+                if isinstance(rec, dict) and rec.get("director_id") == from_director.id:
+                    rec["director_id"] = to_director.id
+                    moved_count += 1
+
+            to_rec = ensure_member_record(data, to_director.id)
+            to_rec["rank"] = RANK_DIRECTOR
+            to_rec["director_id"] = to_director.id
+
+            save_data(data)
+
+        try:
+            role_id = unit.get("unit_role_id")
+            role_obj = guild.get_role(role_id) if isinstance(role_id, int) else None
+            if role_obj and role_obj not in to_director.roles:
+                await to_director.add_roles(role_obj, reason="ARC unit transfer: new Director receiving unit role")
+            await remove_unitless_if_present(to_director)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        await log_action(
+            guild,
+            (
+                f"Unit transferred: **{unit.get('unit_name', 'Unnamed Unit')}**\n"
+                f"From Director: {from_director.mention}\n"
+                f"To Director: {to_director.mention}\n"
+                f"Moved member records: **{moved_count}**"
+            ),
+            mention_director_ids=[from_director.id, to_director.id, actor.id],
+        )
+
+        await interaction.followup.send(
+            f"✅ Transferred unit **{unit.get('unit_name', 'Unnamed Unit')}** from {from_director.mention} to {to_director.mention}.\n"
+            f"Updated **{moved_count}** member record(s).",
+            ephemeral=True,
+        )
+
+        await update_flowchart(guild)
+
+    # -----------------
+    # PROMOTE / DEMOTE
+    # -----------------
+    @arc.command(name="promote")
+    @app_commands.describe(member="Member to promote")
+    async def promote(self, interaction: discord.Interaction, member: discord.Member):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        actor = interaction.user
+        guild = interaction.guild
+
+        if not can_manage(actor):
+            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
+            return
+
+        data = load_data()
+        rec = ensure_member_record(data, member.id)
+        old_rank = rec.get("rank", RANK_SECURITY)
+
+        nxt = PROMOTE_TO.get(old_rank)
+        if not nxt:
+            await interaction.followup.send(
+                f"{member.display_name} cannot be promoted further from **{old_rank}**.",
+                ephemeral=True
+            )
+            return
+
+        prev_rank, new_rank = await apply_rank_change(member, nxt)
+
+        data = load_data()
+        director_id = get_member_unit_director_id(data, member.id)
+
+        mention_ids: List[int] = []
+        if isinstance(director_id, int):
+            mention_ids.append(director_id)
+        if can_manage(actor):
+            mention_ids.append(actor.id)
+
+        await log_action(
+            guild,
+            f"Promotion: {member.mention} **{prev_rank} → {new_rank}** by {actor.mention}.",
+            mention_director_ids=mention_ids,
+        )
+
+        await interaction.followup.send(
+            f"{member.mention} promoted: **{prev_rank} → {new_rank}**.",
+            ephemeral=True,
+        )
+
+        await update_flowchart(guild)
+
+    @arc.command(name="demote")
+    @app_commands.describe(member="Member to demote")
+    async def demote(self, interaction: discord.Interaction, member: discord.Member):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        actor = interaction.user
+        guild = interaction.guild
+
+        if not can_manage(actor):
+            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
+            return
+
+        data = load_data()
+        rec = ensure_member_record(data, member.id)
+        old_rank = rec.get("rank", RANK_SECURITY)
+
+        nxt = DEMOTE_TO.get(old_rank)
+        if not nxt:
+            await interaction.followup.send(
+                f"{member.display_name} cannot be demoted from **{old_rank}**.",
+                ephemeral=True
+            )
+            return
+
+        prev_rank, new_rank = await apply_rank_change(member, nxt)
+
+        data = load_data()
+        director_id = get_member_unit_director_id(data, member.id)
+
+        mention_ids: List[int] = []
+        if isinstance(director_id, int):
+            mention_ids.append(director_id)
+        if can_manage(actor):
+            mention_ids.append(actor.id)
+
+        await log_action(
+            guild,
+            f"Demotion: {member.mention} **{prev_rank} → {new_rank}** by {actor.mention}.",
+            mention_director_ids=mention_ids,
+        )
+
+        await interaction.followup.send(
+            f"{member.mention} demoted: **{prev_rank} → {new_rank}**.",
+            ephemeral=True,
+        )
+
+        await update_flowchart(guild)
+
+    # -----------------
+    # ROSTER (GROUPED)
+    # -----------------
+    @arc.command(name="roster")
+    @app_commands.describe(director="Director whose unit roster you want to view")
+    async def roster(self, interaction: discord.Interaction, director: discord.Member):
+        await interaction.response.defer(ephemeral=False, thinking=True)
+
+        data = load_data()
+        unit = data["units"].get(str(director.id))
+        if not unit:
+            await interaction.followup.send("No unit found for that Director.", ephemeral=True)
+            return
+
+        members: List[Tuple[discord.Member, Dict[str, Any]]] = []
+        for m in interaction.guild.members:
+            rec = data.get("members", {}).get(str(m.id))
+            if rec and rec.get("director_id") == director.id:
+                members.append((m, rec))
+
+        groups: Dict[str, List[Tuple[discord.Member, Dict[str, Any]]]] = {
+            RANK_DIRECTOR: [],
+            RANK_GENERAL: [],
+            RANK_COMMANDER: [],
+            RANK_OFFICER: [],
+            RANK_SECURITY: [],
+        }
+
+        for m, rec in members:
+            r = rec.get("rank", RANK_SECURITY)
+            if r not in groups:
+                r = RANK_SECURITY
+            groups[r].append((m, rec))
+
+        def fmt_group(rank: str, title: str) -> List[str]:
+            items = groups.get(rank, [])
+            if not items:
+                return [f"**{title} (0)**", "- None"]
+            items.sort(key=lambda x: x[0].display_name.lower())
+            lines = [f"**{title} ({len(items)})**"]
+            for m, _rec in items:
+                lines.append(f"- {m.display_name}")
+            return lines
+
+        lines: List[str] = []
+        lines.append(f"**Unit:** {unit['unit_name']}")
+        lines.append(f"**Director:** {director.mention}")
+        lines.append("")
+
+        lines.extend(fmt_group(RANK_DIRECTOR, "Directors"))
+        lines.append("")
+        lines.extend(fmt_group(RANK_GENERAL, "Generals"))
+        lines.append("")
+        lines.extend(fmt_group(RANK_COMMANDER, "Commanders"))
+        lines.append("")
+        lines.extend(fmt_group(RANK_OFFICER, "Officers"))
+        lines.append("")
+        lines.extend(fmt_group(RANK_SECURITY, "Security"))
+
+        text = "\n".join(lines)
+
+        if len(text) <= 1900:
+            await interaction.followup.send(text, ephemeral=False)
+            return
+
+        fp = io.BytesIO(text.encode("utf-8"))
+        file = discord.File(fp, filename=f"roster_{unit['unit_name']}.txt")
+        await interaction.followup.send(
+            content="Roster is too large for a single message; attached as a file.",
+            file=file,
+            ephemeral=False,
+        )
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # Give Discord a brief moment so channels/guild caches are stable
+        await asyncio.sleep(2)
+        for g in self.bot.guilds:
+            await ensure_log_channel(g)
+            await update_flowchart(g)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(ShopCog(bot))
+    await bot.add_cog(ARCHierarchyCog(bot))

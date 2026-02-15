@@ -1,12 +1,19 @@
 # cogs/shop.py
 #
-# FULL COPY/PASTE FIX
-# - Fixes: ClientException: Cog named 'ShopCog' already loaded
-# - Keeps your behavior (no purge, persistent views, atomic JSON, no unnecessary edits)
+# MULTI-SHOP VERSION (Main + HS)
+# - Keeps your original goals (no purge, persistent views, atomic JSON, minimal edits)
+# - Adds a SECOND, SEPARATE shop:
+#     Shop display:     ap-eve-shop-hs
+#     Shop controls:    ap-shop-access-hs
 #
-# NOTE: This is your file with ONLY the necessary safety fixes:
-#   1) setup() is idempotent (won't crash if extension loads twice)
-#   2) startup task is tracked/cancelled to avoid duplicate startup loops on reloads
+# IMPORTANT:
+# - This is a truly separate inventory (separate shop_hs.json)
+# - Custom IDs are namespaced per shop (main vs hs) to avoid collisions.
+#
+# Channels:
+#   MAIN: ap-eve-shop            (display)  | ap-shop-access            (controls)
+#   HS:   ap-eve-shop-hs         (display)  | ap-shop-access-hs         (controls)
+# Orders (unchanged): ap-shop-orders
 
 import os
 import discord
@@ -24,17 +31,41 @@ from discord import app_commands
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
-SHOP_FILE = PERSIST_ROOT / "shop.json"
+# Separate shop inventories (main + hs)
+SHOP_FILES = {
+    "main": PERSIST_ROOT / "shop.json",
+    "hs": PERSIST_ROOT / "shop_hs.json",
+}
+
 AP_FILE = PERSIST_ROOT / "ap_data.json"
 ORDERS_FILE = PERSIST_ROOT / "shop_orders.json"
-INDEX_FILE = PERSIST_ROOT / "shop_message_index.json"
 
-for p in (SHOP_FILE, AP_FILE, ORDERS_FILE, INDEX_FILE):
+# Separate index per shop (to keep things clean + independent)
+INDEX_FILES = {
+    "main": PERSIST_ROOT / "shop_message_index.json",
+    "hs": PERSIST_ROOT / "shop_message_index_hs.json",
+}
+
+for p in list(SHOP_FILES.values()) + [AP_FILE, ORDERS_FILE] + list(INDEX_FILES.values()):
     p.parent.mkdir(parents=True, exist_ok=True)
 
-SHOP_CHANNEL = "ap-eve-shop"
-ACCESS_CHANNEL = "ap-shop-access"
+# ----------------------------
+# Channel config
+# ----------------------------
 ORDER_LOG_CHANNEL = "ap-shop-orders"
+
+SHOPS = {
+    "main": {
+        "label": "Main",
+        "shop_channel": "ap-eve-shop",
+        "access_channel": "ap-shop-access",
+    },
+    "hs": {
+        "label": "HS",
+        "shop_channel": "ap-eve-shop-hs",
+        "access_channel": "ap-shop-access-hs",
+    }
+}
 
 ALLOWED_ROLES = {"Shop Steward", "ARC Security Administration Council"}
 
@@ -98,14 +129,6 @@ def _save_json(path: Path, data) -> None:
     tmp.replace(path)
 
 
-def load_shop() -> dict:
-    return _load_json(SHOP_FILE, {})
-
-
-def save_shop(data: dict) -> None:
-    _save_json(SHOP_FILE, data)
-
-
 def ensure_shop_schema(data: dict) -> dict:
     if not isinstance(data, dict):
         data = {}
@@ -113,6 +136,14 @@ def ensure_shop_schema(data: dict) -> dict:
     if not isinstance(data["items"], dict):
         data["items"] = {}
     return data
+
+
+def load_shop(shop_key: str) -> dict:
+    return ensure_shop_schema(_load_json(SHOP_FILES[shop_key], {}))
+
+
+def save_shop(shop_key: str, data: dict) -> None:
+    _save_json(SHOP_FILES[shop_key], data)
 
 
 def load_ap() -> dict:
@@ -131,7 +162,7 @@ def save_orders(data: dict) -> None:
     _save_json(ORDERS_FILE, data)
 
 
-def load_index() -> dict:
+def load_index(shop_key: str) -> dict:
     # {
     #   "<guild_id>": {
     #      "items": {
@@ -140,11 +171,11 @@ def load_index() -> dict:
     #      "management_msg_id": 789
     #   }
     # }
-    return _load_json(INDEX_FILE, {})
+    return _load_json(INDEX_FILES[shop_key], {})
 
 
-def save_index(data: dict) -> None:
-    _save_json(INDEX_FILE, data)
+def save_index(shop_key: str, data: dict) -> None:
+    _save_json(INDEX_FILES[shop_key], data)
 
 
 def utc_iso() -> str:
@@ -160,7 +191,7 @@ def is_manager(member: discord.abc.User | discord.Member) -> bool:
 # ----------------------------
 # Embed builders
 # ----------------------------
-def build_item_embed(item_id: str, item: dict) -> discord.Embed:
+def build_item_embed(shop_key: str, item_id: str, item: dict) -> discord.Embed:
     embed = discord.Embed(
         title=item.get("name", "Unnamed Item"),
         description=item.get("desc", ""),
@@ -170,8 +201,9 @@ def build_item_embed(item_id: str, item: dict) -> discord.Embed:
     embed.add_field(name="Stock", value=str(int(item.get("stock", 0))), inline=True)
     if item.get("image"):
         embed.set_image(url=item["image"])
-    # Keep stable footer for recovery
-    embed.set_footer(text=f"Cryonic Gaming Shop | id:{item_id}")
+
+    # Stable footer for recovery (include shop_key)
+    embed.set_footer(text=f"Cryonic Gaming Shop({shop_key}) | id:{item_id}")
     return embed
 
 
@@ -181,6 +213,7 @@ def build_order_embed(order: dict) -> discord.Embed:
 
     embed = discord.Embed(title=title, timestamp=discord.utils.utcnow())
     embed.add_field(name="Buyer", value=f"<@{order.get('buyer_id')}> ({order.get('buyer_tag')})", inline=False)
+    embed.add_field(name="Shop", value=str(order.get("shop_key", "main")), inline=True)
     embed.add_field(name="Item", value=str(order.get("item_name", "Unknown")), inline=True)
     embed.add_field(name="Quantity", value=str(order.get("qty", 0)), inline=True)
     embed.add_field(name="IGN", value=f"`{order.get('ign', '')}`", inline=True)
@@ -204,13 +237,13 @@ def build_order_embed(order: dict) -> discord.Embed:
 # ----------------------------
 # Index recovery (best-effort)
 # ----------------------------
-async def rebuild_index_from_channels(guild: discord.Guild) -> None:
-    shop_ch = discord.utils.get(guild.text_channels, name=SHOP_CHANNEL)
-    access_ch = discord.utils.get(guild.text_channels, name=ACCESS_CHANNEL)
+async def rebuild_index_from_channels(guild: discord.Guild, shop_key: str) -> None:
+    shop_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["shop_channel"])
+    access_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["access_channel"])
     if not shop_ch or not access_ch:
         return
 
-    idx = load_index()
+    idx = load_index(shop_key)
     gkey = str(guild.id)
     gidx = idx.setdefault(gkey, {})
     gidx.setdefault("items", {})
@@ -226,7 +259,8 @@ async def rebuild_index_from_channels(guild: discord.Guild) -> None:
                     continue
                 e = msg.embeds[0]
                 footer_text = (e.footer.text or "") if e.footer else ""
-                if "Cryonic Gaming Shop" not in footer_text or "id:" not in footer_text:
+                # Footer contains Cryonic Gaming Shop(shop_key) | id:xxxx
+                if f"Cryonic Gaming Shop({shop_key})" not in footer_text or "id:" not in footer_text:
                     continue
                 item_id = footer_text.split("id:", 1)[1].strip()
                 if not item_id:
@@ -246,7 +280,7 @@ async def rebuild_index_from_channels(guild: discord.Guild) -> None:
         async for msg in access_ch.history(limit=150):
             try:
                 me = guild.me  # type: ignore
-                if me and msg.author and msg.author.id == me.id and msg.content.strip() == "**Shop Management**":
+                if me and msg.author and msg.author.id == me.id and msg.content.strip() == f"**Shop Management ({SHOPS[shop_key]['label']})**":
                     gidx["management_msg_id"] = int(msg.id)
                     break
             except Exception:
@@ -254,7 +288,7 @@ async def rebuild_index_from_channels(guild: discord.Guild) -> None:
 
     gidx["items"] = items_idx
     idx[gkey] = gidx
-    save_index(idx)
+    save_index(shop_key, idx)
 
 
 # ----------------------------
@@ -406,9 +440,10 @@ class OrderStatusView(discord.ui.View):
 # Buy modal (Quantity + IGN)
 # ----------------------------
 class BuyItemModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog", item_id: str):
-        super().__init__(title="Buy Item")
+    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str):
+        super().__init__(title=f"Buy Item ({SHOPS[shop_key]['label']})")
         self.cog = cog
+        self.shop_key = shop_key
         self.item_id = item_id
 
         self.qty = discord.ui.TextInput(label="Quantity", placeholder="Enter a number (e.g., 1)", required=True)
@@ -433,7 +468,7 @@ class BuyItemModal(discord.ui.Modal):
             return
 
         async with SHOP_LOCK:
-            shop = ensure_shop_schema(load_shop())
+            shop = load_shop(self.shop_key)
             items = shop["items"]
 
             if self.item_id not in items:
@@ -469,7 +504,7 @@ class BuyItemModal(discord.ui.Modal):
             items[self.item_id] = item
             ap_data[uid] = user_entry
             save_ap(ap_data)
-            save_shop(shop)
+            save_shop(self.shop_key, shop)
 
             # Create order record
             order_id = uuid.uuid4().hex[:10]
@@ -482,6 +517,7 @@ class BuyItemModal(discord.ui.Modal):
                 "message_id": None,
                 "buyer_id": str(interaction.user.id),
                 "buyer_tag": str(interaction.user),
+                "shop_key": self.shop_key,
                 "item_id": self.item_id,
                 "item_name": item.get("name", self.item_id),
                 "qty": qty,
@@ -516,8 +552,8 @@ class BuyItemModal(discord.ui.Modal):
                 orders[order_id]["message_id"] = str(msg.id)
                 save_orders(orders_data)
 
-        # Update this item's embeds WITHOUT forcing edits unless needed
-        await self.cog.update_item_messages(interaction.guild, self.item_id)
+        # Update this item's embeds in the correct shop
+        await self.cog.update_item_messages(interaction.guild, self.shop_key, self.item_id)
 
         await safe_reply(interaction, "✅ Order placed.", ephemeral=True)
 
@@ -526,9 +562,10 @@ class BuyItemModal(discord.ui.Modal):
 # Stock / item management modals
 # ----------------------------
 class AdjustStockModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog", item_id: str, mode: str):
-        super().__init__(title=f"{mode.title()} Stock")
+    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str, mode: str):
+        super().__init__(title=f"{mode.title()} Stock ({SHOPS[shop_key]['label']})")
         self.cog = cog
+        self.shop_key = shop_key
         self.item_id = item_id
         self.mode = mode
         self.amount = discord.ui.TextInput(label="Quantity", placeholder="Enter a number", required=True)
@@ -550,7 +587,7 @@ class AdjustStockModal(discord.ui.Modal):
             return
 
         async with SHOP_LOCK:
-            shop = ensure_shop_schema(load_shop())
+            shop = load_shop(self.shop_key)
             items = shop["items"]
             if self.item_id not in items:
                 await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
@@ -563,17 +600,18 @@ class AdjustStockModal(discord.ui.Modal):
                 item["stock"] = max(0, int(item.get("stock", 0)) - amt)
 
             items[self.item_id] = item
-            save_shop(shop)
+            save_shop(self.shop_key, shop)
 
         if interaction.guild:
-            await self.cog.update_item_messages(interaction.guild, self.item_id)
+            await self.cog.update_item_messages(interaction.guild, self.shop_key, self.item_id)
         await safe_reply(interaction, "✅ Stock updated.", ephemeral=True)
 
 
 class UpdateItemModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog", item_id: str, item: dict):
-        super().__init__(title="Update Item")
+    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str, item: dict):
+        super().__init__(title=f"Update Item ({SHOPS[shop_key]['label']})")
         self.cog = cog
+        self.shop_key = shop_key
         self.item_id = item_id
 
         self.name = discord.ui.TextInput(label="Item Name", default=item.get("name", ""), required=True)
@@ -600,7 +638,7 @@ class UpdateItemModal(discord.ui.Modal):
             return
 
         async with SHOP_LOCK:
-            shop = ensure_shop_schema(load_shop())
+            shop = load_shop(self.shop_key)
             items = shop["items"]
             if self.item_id not in items:
                 await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
@@ -613,17 +651,18 @@ class UpdateItemModal(discord.ui.Modal):
             item["image"] = str(self.image.value).strip() or None
 
             items[self.item_id] = item
-            save_shop(shop)
+            save_shop(self.shop_key, shop)
 
         if interaction.guild:
-            await self.cog.update_item_messages(interaction.guild, self.item_id)
+            await self.cog.update_item_messages(interaction.guild, self.shop_key, self.item_id)
         await safe_reply(interaction, "✅ Item updated.", ephemeral=True)
 
 
 class AddNewItemModal(discord.ui.Modal):
-    def __init__(self, cog: "ShopCog"):
-        super().__init__(title="Add New Item")
+    def __init__(self, cog: "ShopCog", shop_key: str):
+        super().__init__(title=f"Add New Item ({SHOPS[shop_key]['label']})")
         self.cog = cog
+        self.shop_key = shop_key
 
         self.name = discord.ui.TextInput(label="Item Name", required=True)
         self.desc = discord.ui.TextInput(label="Item Description", style=discord.TextStyle.long, required=True)
@@ -649,7 +688,7 @@ class AddNewItemModal(discord.ui.Modal):
             return
 
         async with SHOP_LOCK:
-            shop = ensure_shop_schema(load_shop())
+            shop = load_shop(self.shop_key)
             items = shop["items"]
 
             item_id = uuid.uuid4().hex[:10]
@@ -660,10 +699,10 @@ class AddNewItemModal(discord.ui.Modal):
                 "stock": 0,
                 "image": str(self.image.value).strip() or None
             }
-            save_shop(shop)
+            save_shop(self.shop_key, shop)
 
         if interaction.guild:
-            await self.cog.sync_shop_messages(interaction.guild)
+            await self.cog.sync_shop_messages(interaction.guild, self.shop_key)
         await safe_reply(interaction, "✅ New item added.", ephemeral=True)
 
 
@@ -671,32 +710,37 @@ class AddNewItemModal(discord.ui.Modal):
 # Persistent Views (restart-safe)
 # ----------------------------
 class BuyView(discord.ui.View):
-    def __init__(self, cog: "ShopCog", item_id: str, disabled: bool):
+    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str, disabled: bool):
         super().__init__(timeout=None)
         self.cog = cog
         self.add_item(discord.ui.Button(
             label="Buy",
             style=discord.ButtonStyle.success,
-            custom_id=f"shop:buy:{item_id}",
+            custom_id=f"shop:buy:{shop_key}:{item_id}",
             disabled=disabled
         ))
 
 
 class ManageView(discord.ui.View):
-    def __init__(self, cog: "ShopCog", item_id: str):
+    def __init__(self, cog: "ShopCog", shop_key: str, item_id: str):
         super().__init__(timeout=None)
         self.cog = cog
-        self.add_item(discord.ui.Button(label="Add Stock", style=discord.ButtonStyle.primary, custom_id=f"shop:stock_add:{item_id}"))
-        self.add_item(discord.ui.Button(label="Remove Stock", style=discord.ButtonStyle.danger, custom_id=f"shop:stock_remove:{item_id}"))
-        self.add_item(discord.ui.Button(label="Update Item", style=discord.ButtonStyle.secondary, custom_id=f"shop:update:{item_id}"))
-        self.add_item(discord.ui.Button(label="Remove Item", style=discord.ButtonStyle.danger, custom_id=f"shop:remove:{item_id}"))
+        self.add_item(discord.ui.Button(label="Add Stock", style=discord.ButtonStyle.primary, custom_id=f"shop:stock_add:{shop_key}:{item_id}"))
+        self.add_item(discord.ui.Button(label="Remove Stock", style=discord.ButtonStyle.danger, custom_id=f"shop:stock_remove:{shop_key}:{item_id}"))
+        self.add_item(discord.ui.Button(label="Update Item", style=discord.ButtonStyle.secondary, custom_id=f"shop:update:{shop_key}:{item_id}"))
+        self.add_item(discord.ui.Button(label="Remove Item", style=discord.ButtonStyle.danger, custom_id=f"shop:remove:{shop_key}:{item_id}"))
 
 
 class ShopManagementView(discord.ui.View):
-    def __init__(self, cog: "ShopCog"):
+    def __init__(self, cog: "ShopCog", shop_key: str):
         super().__init__(timeout=None)
         self.cog = cog
-        self.add_item(discord.ui.Button(label="Add New Item", style=discord.ButtonStyle.success, custom_id="shop:add_new"))
+        self.shop_key = shop_key
+        self.add_item(discord.ui.Button(
+            label=f"Add New Item ({SHOPS[shop_key]['label']})",
+            style=discord.ButtonStyle.success,
+            custom_id=f"shop:add_new:{shop_key}"
+        ))
 
 
 # ----------------------------
@@ -723,23 +767,12 @@ class ShopCog(commands.Cog):
         self._edit_lock = asyncio.Lock()
         self._global_last_edit_at = 0.0
 
-        # (FIX) track startup task to prevent duplicates on reload
-        self._startup_task: asyncio.Task | None = None
-
     async def cog_load(self):
-        # (FIX) Don't spawn multiple startup tasks for the same cog instance
-        if self._startup_task and not self._startup_task.done():
-            return
-        self._startup_task = asyncio.create_task(self._startup())
+        asyncio.create_task(self._startup())
 
-    def cog_unload(self):
-        # (FIX) Cancel background task on unload/reload
-        if self._startup_task and not self._startup_task.done():
-            self._startup_task.cancel()
-
-    # -----------------
+    # ----------------------------
     # Compare helpers (NO EDIT unless needed)
-    # -----------------
+    # ----------------------------
     def _embed_to_dict(self, e: discord.Embed | None) -> dict | None:
         if not e:
             return None
@@ -756,6 +789,13 @@ class ShopCog(commands.Cog):
         embed: discord.Embed | None = None,
         view: discord.ui.View | None = None,
     ) -> bool:
+        """
+        Edits ONLY if needed:
+        - content differs (when provided)
+        - embed differs (when provided)
+        View edits are skipped by default because persistent views are registered on startup.
+        Also includes a GLOBAL spacing between edits when an edit is necessary.
+        """
         try:
             need_edit = False
 
@@ -789,7 +829,12 @@ class ShopCog(commands.Cog):
         await self.bot.wait_until_ready()
         await asyncio.sleep(1.0)
 
-        self.bot.add_view(ShopManagementView(self))
+        # Register persistent views
+        # - management views (one per shop)
+        for shop_key in SHOPS.keys():
+            self.bot.add_view(ShopManagementView(self, shop_key))
+
+        # - order views
         self.restore_order_views()
 
         for guild in self.bot.guilds:
@@ -799,16 +844,18 @@ class ShopCog(commands.Cog):
 
             await self.ensure_channels(guild)
 
-            try:
-                idx = load_index()
-                gidx = idx.get(str(guild.id), {})
-                items_idx = (gidx.get("items") or {})
-                if not isinstance(items_idx, dict) or not items_idx:
-                    await rebuild_index_from_channels(guild)
-            except Exception:
-                pass
+            # recover indexes + sync both shops
+            for shop_key in SHOPS.keys():
+                try:
+                    idx = load_index(shop_key)
+                    gidx = idx.get(str(guild.id), {})
+                    items_idx = (gidx.get("items") or {})
+                    if not isinstance(items_idx, dict) or not items_idx:
+                        await rebuild_index_from_channels(guild, shop_key)
+                except Exception:
+                    pass
 
-            await self.sync_shop_messages(guild)
+                await self.sync_shop_messages(guild, shop_key)
 
     # ----------------------------
     # Persistent interaction router (shop buttons)
@@ -824,21 +871,29 @@ class ShopCog(commands.Cog):
                 return
 
             parts = custom_id.split(":")
-            if len(parts) < 2:
+            # Expected:
+            # shop:buy:<shop_key>:<item_id>
+            # shop:add_new:<shop_key>
+            # shop:stock_add:<shop_key>:<item_id> etc
+            if len(parts) < 3:
                 return
 
             action = parts[1]
-            item_id = parts[2] if len(parts) >= 3 else None
+            shop_key = parts[2]
+            item_id = parts[3] if len(parts) >= 4 else None
+
+            if shop_key not in SHOPS:
+                return
 
             if action == "buy" and item_id:
-                await safe_send_modal(interaction, BuyItemModal(self, item_id))
+                await safe_send_modal(interaction, BuyItemModal(self, shop_key, item_id))
                 return
 
             if action == "add_new":
                 if not is_manager(interaction.user):
                     await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
                     return
-                await safe_send_modal(interaction, AddNewItemModal(self))
+                await safe_send_modal(interaction, AddNewItemModal(self, shop_key))
                 return
 
             if action in ("stock_add", "stock_remove", "update", "remove") and item_id:
@@ -847,27 +902,27 @@ class ShopCog(commands.Cog):
                     return
 
                 if action == "stock_add":
-                    await safe_send_modal(interaction, AdjustStockModal(self, item_id, "add"))
+                    await safe_send_modal(interaction, AdjustStockModal(self, shop_key, item_id, "add"))
                     return
 
                 if action == "stock_remove":
-                    await safe_send_modal(interaction, AdjustStockModal(self, item_id, "remove"))
+                    await safe_send_modal(interaction, AdjustStockModal(self, shop_key, item_id, "remove"))
                     return
 
                 if action == "update":
-                    shop = ensure_shop_schema(load_shop())
+                    shop = load_shop(shop_key)
                     items = shop["items"]
                     if item_id not in items:
                         await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
                         return
-                    await safe_send_modal(interaction, UpdateItemModal(self, item_id, items[item_id]))
+                    await safe_send_modal(interaction, UpdateItemModal(self, shop_key, item_id, items[item_id]))
                     return
 
                 if action == "remove":
                     await safe_defer(interaction, ephemeral=True)
 
                     async with SHOP_LOCK:
-                        shop = ensure_shop_schema(load_shop())
+                        shop = load_shop(shop_key)
                         items = shop["items"]
                         if item_id not in items:
                             await safe_reply(interaction, "❌ This item no longer exists.", ephemeral=True)
@@ -875,22 +930,22 @@ class ShopCog(commands.Cog):
 
                         item_name = items[item_id].get("name", item_id)
                         items.pop(item_id, None)
-                        save_shop(shop)
+                        save_shop(shop_key, shop)
 
                         if interaction.guild:
-                            idx = load_index()
+                            idx = load_index(shop_key)
                             gidx = idx.get(str(interaction.guild.id), {})
                             items_idx = gidx.get("items", {})
                             if isinstance(items_idx, dict):
                                 items_idx.pop(item_id, None)
                             gidx["items"] = items_idx if isinstance(items_idx, dict) else {}
                             idx[str(interaction.guild.id)] = gidx
-                            save_index(idx)
+                            save_index(shop_key, idx)
 
                     if interaction.guild:
-                        await self.sync_shop_messages(interaction.guild)
+                        await self.sync_shop_messages(interaction.guild, shop_key)
 
-                    await safe_reply(interaction, f"🗑️ Removed **{item_name}**.", ephemeral=True)
+                    await safe_reply(interaction, f"🗑️ Removed **{item_name}** from **{SHOPS[shop_key]['label']}** shop.", ephemeral=True)
                     return
 
         except Exception:
@@ -917,14 +972,7 @@ class ShopCog(commands.Cog):
         everyone = guild.default_role
         me = guild.me  # type: ignore
 
-        shop_overwrites = {
-            everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
-        }
-        if me:
-            shop_overwrites[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
-            )
-
+        # Orders channel (unchanged)
         orders_overwrites = {
             everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
         }
@@ -933,49 +981,74 @@ class ShopCog(commands.Cog):
                 view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
             )
 
-        access_overwrites = {
-            everyone: discord.PermissionOverwrite(view_channel=False),
-        }
-        if me:
-            access_overwrites[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
-            )
-        for role_name in ALLOWED_ROLES:
-            role = discord.utils.get(guild.roles, name=role_name)
-            if role:
-                access_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        # Create/update orders channel
+        orders_ch = discord.utils.get(guild.text_channels, name=ORDER_LOG_CHANNEL)
+        if not orders_ch:
+            try:
+                await guild.create_text_channel(ORDER_LOG_CHANNEL, overwrites=orders_overwrites)
+            except discord.Forbidden:
+                pass
+        else:
+            try:
+                await orders_ch.edit(overwrites=orders_overwrites)
+            except discord.Forbidden:
+                pass
 
-        for name, overwrites in (
-            (SHOP_CHANNEL, shop_overwrites),
-            (ORDER_LOG_CHANNEL, orders_overwrites),
-            (ACCESS_CHANNEL, access_overwrites),
-        ):
-            ch = discord.utils.get(guild.text_channels, name=name)
-            if not ch:
-                try:
-                    await guild.create_text_channel(name, overwrites=overwrites)
-                except discord.Forbidden:
-                    pass
-            else:
-                try:
-                    await ch.edit(overwrites=overwrites)
-                except discord.Forbidden:
-                    pass
+        # Per-shop channels
+        for shop_key, cfg in SHOPS.items():
+            shop_name = cfg["shop_channel"]
+            access_name = cfg["access_channel"]
+
+            shop_overwrites = {
+                everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
+            }
+            if me:
+                shop_overwrites[me] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
+                )
+
+            access_overwrites = {
+                everyone: discord.PermissionOverwrite(view_channel=False),
+            }
+            if me:
+                access_overwrites[me] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
+                )
+            for role_name in ALLOWED_ROLES:
+                role = discord.utils.get(guild.roles, name=role_name)
+                if role:
+                    access_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+            for name, overwrites in (
+                (shop_name, shop_overwrites),
+                (access_name, access_overwrites),
+            ):
+                ch = discord.utils.get(guild.text_channels, name=name)
+                if not ch:
+                    try:
+                        await guild.create_text_channel(name, overwrites=overwrites)
+                    except discord.Forbidden:
+                        pass
+                else:
+                    try:
+                        await ch.edit(overwrites=overwrites)
+                    except discord.Forbidden:
+                        pass
 
     # ----------------------------
     # Shop message sync (NO PURGE) + NO EDIT unless needed
     # ----------------------------
-    async def sync_shop_messages(self, guild: discord.Guild):
-        shop_ch = discord.utils.get(guild.text_channels, name=SHOP_CHANNEL)
-        access_ch = discord.utils.get(guild.text_channels, name=ACCESS_CHANNEL)
+    async def sync_shop_messages(self, guild: discord.Guild, shop_key: str):
+        shop_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["shop_channel"])
+        access_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["access_channel"])
         if not shop_ch or not access_ch:
             return
 
         async with SHOP_LOCK:
-            shop = ensure_shop_schema(load_shop())
+            shop = load_shop(shop_key)
             items = shop["items"]
 
-            idx = load_index()
+            idx = load_index(shop_key)
             gkey = str(guild.id)
             gidx = idx.setdefault(gkey, {})
             gidx.setdefault("items", {})
@@ -984,12 +1057,13 @@ class ShopCog(commands.Cog):
                 items_idx = {}
                 gidx["items"] = items_idx
 
+            # If empty, try recovery once
             if not items_idx:
                 try:
-                    await rebuild_index_from_channels(guild)
+                    await rebuild_index_from_channels(guild, shop_key)
                 except Exception:
                     pass
-                idx = load_index()
+                idx = load_index(shop_key)
                 gidx = idx.setdefault(gkey, {})
                 gidx.setdefault("items", {})
                 items_idx = gidx["items"]
@@ -997,8 +1071,9 @@ class ShopCog(commands.Cog):
                     items_idx = {}
                     gidx["items"] = items_idx
 
+            # Upsert each item message (shop + access)
             for item_id, item in items.items():
-                embed = build_item_embed(item_id, item)
+                embed = build_item_embed(shop_key, item_id, item)
                 out_of_stock = int(item.get("stock", 0)) <= 0
 
                 shop_msg_id = None
@@ -1007,6 +1082,7 @@ class ShopCog(commands.Cog):
                     shop_msg_id = items_idx[item_id].get("shop_msg_id")
                     access_msg_id = items_idx[item_id].get("access_msg_id")
 
+                # shop message
                 shop_msg = None
                 if shop_msg_id:
                     try:
@@ -1014,15 +1090,16 @@ class ShopCog(commands.Cog):
                     except Exception:
                         shop_msg = None
                 if shop_msg is None:
-                    shop_msg = await shop_ch.send(embed=embed, view=BuyView(self, item_id, disabled=out_of_stock))
+                    shop_msg = await shop_ch.send(embed=embed, view=BuyView(self, shop_key, item_id, disabled=out_of_stock))
                     shop_msg_id = shop_msg.id
                 else:
                     await self.safe_edit_if_needed(
                         shop_msg,
                         embed=embed,
-                        view=BuyView(self, item_id, disabled=out_of_stock),
+                        view=BuyView(self, shop_key, item_id, disabled=out_of_stock),
                     )
 
+                # access message
                 access_msg = None
                 if access_msg_id:
                     try:
@@ -1030,17 +1107,18 @@ class ShopCog(commands.Cog):
                     except Exception:
                         access_msg = None
                 if access_msg is None:
-                    access_msg = await access_ch.send(embed=embed, view=ManageView(self, item_id))
+                    access_msg = await access_ch.send(embed=embed, view=ManageView(self, shop_key, item_id))
                     access_msg_id = access_msg.id
                 else:
                     await self.safe_edit_if_needed(
                         access_msg,
                         embed=embed,
-                        view=ManageView(self, item_id),
+                        view=ManageView(self, shop_key, item_id),
                     )
 
                 items_idx[item_id] = {"shop_msg_id": int(shop_msg_id), "access_msg_id": int(access_msg_id)}
 
+            # Management message (single per shop)
             mgmt_id = gidx.get("management_msg_id")
             mgmt_msg = None
             if mgmt_id:
@@ -1049,8 +1127,8 @@ class ShopCog(commands.Cog):
                 except Exception:
                     mgmt_msg = None
 
-            desired_content = "**Shop Management**"
-            desired_view = ShopManagementView(self)
+            desired_content = f"**Shop Management ({SHOPS[shop_key]['label']})**"
+            desired_view = ShopManagementView(self, shop_key)
 
             if mgmt_msg is None:
                 mgmt_msg = await access_ch.send(desired_content, view=desired_view)
@@ -1065,42 +1143,42 @@ class ShopCog(commands.Cog):
 
             gidx["items"] = items_idx
             idx[gkey] = gidx
-            save_index(idx)
+            save_index(shop_key, idx)
 
-    async def update_item_messages(self, guild: discord.Guild, item_id: str):
-        shop = ensure_shop_schema(load_shop())
+    async def update_item_messages(self, guild: discord.Guild, shop_key: str, item_id: str):
+        shop = load_shop(shop_key)
         items = shop["items"]
         if item_id not in items:
-            await self.sync_shop_messages(guild)
+            await self.sync_shop_messages(guild, shop_key)
             return
 
         item = items[item_id]
-        embed = build_item_embed(item_id, item)
+        embed = build_item_embed(shop_key, item_id, item)
         out_of_stock = int(item.get("stock", 0)) <= 0
 
-        idx = load_index()
+        idx = load_index(shop_key)
         gidx = idx.get(str(guild.id), {})
         items_idx = (gidx.get("items") or {})
         entry = items_idx.get(item_id)
 
-        shop_ch = discord.utils.get(guild.text_channels, name=SHOP_CHANNEL)
-        access_ch = discord.utils.get(guild.text_channels, name=ACCESS_CHANNEL)
+        shop_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["shop_channel"])
+        access_ch = discord.utils.get(guild.text_channels, name=SHOPS[shop_key]["access_channel"])
         if not shop_ch or not access_ch or not isinstance(entry, dict):
-            await self.sync_shop_messages(guild)
+            await self.sync_shop_messages(guild, shop_key)
             return
 
         try:
             shop_msg = await shop_ch.fetch_message(int(entry["shop_msg_id"]))
-            await self.safe_edit_if_needed(shop_msg, embed=embed, view=BuyView(self, item_id, disabled=out_of_stock))
+            await self.safe_edit_if_needed(shop_msg, embed=embed, view=BuyView(self, shop_key, item_id, disabled=out_of_stock))
         except Exception:
-            await self.sync_shop_messages(guild)
+            await self.sync_shop_messages(guild, shop_key)
             return
 
         try:
             access_msg = await access_ch.fetch_message(int(entry["access_msg_id"]))
-            await self.safe_edit_if_needed(access_msg, embed=embed, view=ManageView(self, item_id))
+            await self.safe_edit_if_needed(access_msg, embed=embed, view=ManageView(self, shop_key, item_id))
         except Exception:
-            await self.sync_shop_messages(guild)
+            await self.sync_shop_messages(guild, shop_key)
             return
 
     async def refresh_order_message(self, guild: discord.Guild, order_id: str):
@@ -1126,7 +1204,7 @@ class ShopCog(commands.Cog):
     # ----------------------------
     @app_commands.command(
         name="shop_rebuild",
-        description="Sync shop displays without purging (Shop Steward / Admin Council only)."
+        description="Sync BOTH shops (main + HS) without purging (Shop Steward / Admin Council only)."
     )
     @has_required_role()
     async def shop_rebuild(self, interaction: discord.Interaction):
@@ -1135,8 +1213,11 @@ class ShopCog(commands.Cog):
             await safe_reply(interaction, "❌ Must be used in a server.", ephemeral=True)
             return
         await self.ensure_channels(interaction.guild)
-        await self.sync_shop_messages(interaction.guild)
-        await safe_reply(interaction, "✅ Shop synced (no purge).", ephemeral=True)
+
+        for shop_key in SHOPS.keys():
+            await self.sync_shop_messages(interaction.guild, shop_key)
+
+        await safe_reply(interaction, "✅ Shops synced (main + HS), no purge.", ephemeral=True)
 
     @shop_rebuild.error
     async def shop_rebuild_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -1148,7 +1229,4 @@ class ShopCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    # (FIX) Idempotent setup: prevents "Cog named 'ShopCog' already loaded"
-    if bot.get_cog("ShopCog") is not None:
-        return
     await bot.add_cog(ShopCog(bot))
