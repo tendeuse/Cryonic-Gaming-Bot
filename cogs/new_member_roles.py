@@ -5,6 +5,7 @@ import asyncio
 import json
 import time
 import os
+from datetime import datetime, timedelta, timezone
 
 DATA_DIR = "/data"
 DATA_FILE = os.path.join(DATA_DIR, "member_roles.json")
@@ -15,7 +16,7 @@ SUBSIDIZED_ROLE = "ARC Subsidized"
 SCHEDULING_ROLE = "Scheduling"
 ONBOARDING_ROLE = "Onboarding"
 
-# ✅ NEW TRIGGER ROLE
+# Trigger role (selected by new players)
 EVE_ROLE = "EVE online"
 
 # Permission roles
@@ -27,6 +28,9 @@ LOG_CHANNEL_NAME = "roles-log"
 
 DELAY_SECONDS = 3600  # 1 hour
 
+# ✅ Only treat members as "new" for this many days after joining
+NEW_PLAYER_WINDOW_DAYS = 14
+
 
 # ----------------- Persistence -----------------
 
@@ -36,9 +40,8 @@ def ensure_data():
         with open(DATA_FILE, "w") as f:
             json.dump(
                 {
-                    "pending": {},       # user_id -> unix timestamp
-                    "rewarded": [],      # [user_id] (New Member removal reward)
-                    "eve_awarded": []    # ✅ [user_id] (EVE role trigger processed)
+                    "pending": {},     # user_id -> unix timestamp
+                    "rewarded": []     # [user_id]
                 },
                 f,
                 indent=2
@@ -49,13 +52,12 @@ def load_data():
     ensure_data()
     with open(DATA_FILE, "r") as f:
         data = json.load(f)
-    # ✅ backfill keys safely for existing files
+
+    # backfill keys safely
     if "pending" not in data or not isinstance(data["pending"], dict):
         data["pending"] = {}
     if "rewarded" not in data or not isinstance(data["rewarded"], list):
         data["rewarded"] = []
-    if "eve_awarded" not in data or not isinstance(data["eve_awarded"], list):
-        data["eve_awarded"] = []
     return data
 
 
@@ -90,9 +92,6 @@ class NewMemberRoles(commands.Cog):
         channel = self.get_log_channel(guild)
         if channel:
             await channel.send(message)
-
-    def user_has_any_role(self, member: discord.Member, role_names: set[str]) -> bool:
-        return any(r.name in role_names for r in member.roles)
 
     # ---------- Core Rule: Subsidy Swap ----------
 
@@ -139,15 +138,41 @@ class NewMemberRoles(commands.Cog):
                 f"⚠️ **Subsidy swap failed** for {member.mention}: HTTP error: {e}"
             )
 
-    # ---------- ✅ NEW: EVE Role Flow ----------
+    # ---------- ✅ New Player Detection ----------
+
+    async def is_new_player(self, member: discord.Member) -> bool:
+        """
+        Treat as new if:
+          - has New Member role, OR
+          - is still in pending (joined within the first hour flow), OR
+          - joined within NEW_PLAYER_WINDOW_DAYS
+        """
+        guild = member.guild
+        nm_role = self.get_role(guild, NEW_MEMBER_ROLE)
+
+        if nm_role and nm_role in member.roles:
+            return True
+
+        async with self._data_lock:
+            data = load_data()
+            if str(member.id) in data.get("pending", {}):
+                return True
+
+        if member.joined_at:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=NEW_PLAYER_WINDOW_DAYS)
+            if member.joined_at >= cutoff:
+                return True
+
+        return False
+
+    # ---------- ✅ EVE Role Flow (NEW PLAYERS ONLY) ----------
 
     async def handle_eve_role_added(self, member: discord.Member, reason: str = "EVE role trigger"):
         """
-        When member gets EVE online role:
+        When NEW player gets EVE online:
           1) Add ARC Subsidized
-          2) If they had Security OR Subsidized -> add Scheduling + Onboarding
+          2) If they have Security OR Subsidized -> add Scheduling + Onboarding
           3) Run subsidy swap again (Security removed if Onboarding now present)
-        One-time per user (tracked by eve_awarded in JSON).
         """
         guild = member.guild
         eve = self.get_role(guild, EVE_ROLE)
@@ -161,15 +186,9 @@ class NewMemberRoles(commands.Cog):
         if not subsidized:
             return
 
-        uid = str(member.id)
-
-        async with self._data_lock:
-            data = load_data()
-            if uid in data["eve_awarded"]:
-                return
-            # mark processed immediately to avoid double-processing on rapid updates
-            data["eve_awarded"].append(uid)
-            save_data(data)
+        # ✅ Only apply to NEW players
+        if not await self.is_new_player(member):
+            return
 
         # Step 1: ensure subsidized
         try:
@@ -182,14 +201,12 @@ class NewMemberRoles(commands.Cog):
             await self.log(guild, f"⚠️ Could not add **{SUBSIDIZED_ROLE}** to {member.mention}: {e}")
             return
 
-        # Step 2: if they had Security OR Subsidized, add Scheduling + Onboarding
-        # (After step 1, they definitely have Subsidized; this condition will be true
-        # for anyone in the program.)
+        # Step 2: if they had Security or Subsidized -> add Scheduling + Onboarding
         has_security = (security in member.roles) if security else False
         has_subsidized = subsidized in member.roles
 
         roles_to_add = []
-        if (has_security or has_subsidized):
+        if has_security or has_subsidized:
             if sched and sched not in member.roles:
                 roles_to_add.append(sched)
             if onboard and onboard not in member.roles:
@@ -206,20 +223,19 @@ class NewMemberRoles(commands.Cog):
         # Step 3: run swap again (if Onboarding present and Security present -> remove Security)
         await self.enforce_subsidy_swap(member, reason=f"{reason} (post-onboarding swap)")
 
-        # Log summary
-        try:
-            await self.log(
-                guild,
-                f"🟦 **EVE trigger**: {member.mention} received **{EVE_ROLE}** → added **{SUBSIDIZED_ROLE}**"
-                f"{' + Scheduling + Onboarding' if roles_to_add else ''}."
-            )
-        except Exception:
-            pass
+        await self.log(
+            guild,
+            f"🟦 **EVE trigger (new player)**: {member.mention} received **{EVE_ROLE}** → ensured **{SUBSIDIZED_ROLE}**"
+            f"{' + Scheduling + Onboarding' if roles_to_add else ''}."
+        )
 
     # ---------- Bootstrap Existing Members ----------
 
     async def bootstrap_existing_members(self):
-        """Mark existing New Member holders as rewarded (no retro triggers) AND enforce subsidy swap AND enforce EVE rule."""
+        """
+        Ensure existing members are safely marked to avoid retroactive triggers AND enforce subsidy swap.
+        ✅ Does NOT retro-apply the EVE role rule anymore.
+        """
         await self.bot.wait_until_ready()
 
         async with self._data_lock:
@@ -229,9 +245,6 @@ class NewMemberRoles(commands.Cog):
 
         for guild in self.bot.guilds:
             nm_role = self.get_role(guild, NEW_MEMBER_ROLE)
-            eve_role = self.get_role(guild, EVE_ROLE)
-
-            # 1) Avoid retroactive New Member reward triggers
             if nm_role:
                 for member in guild.members:
                     if nm_role in member.roles:
@@ -240,24 +253,8 @@ class NewMemberRoles(commands.Cog):
                             data["rewarded"].append(uid)
                             changed = True
 
-            # 2) Enforce subsidy swap for all members
             for member in guild.members:
                 await self.enforce_subsidy_swap(member, reason="Bootstrap subsidy swap")
-
-            # 3) ✅ Enforce EVE rule for existing EVE holders (ensure Subsidized),
-            #    but do NOT auto-add Scheduling/Onboarding unless you want that retroactively.
-            #    We will only ensure Subsidized is present without marking eve_awarded,
-            #    so future EVE add events still work properly.
-            if eve_role:
-                subsidized = self.get_role(guild, SUBSIDIZED_ROLE)
-                if subsidized:
-                    for member in guild.members:
-                        if eve_role in member.roles and subsidized not in member.roles:
-                            try:
-                                await member.add_roles(subsidized, reason="Bootstrap: EVE holders get Subsidized")
-                                await self.log(guild, f"🟦 **Bootstrap**: Added **{SUBSIDIZED_ROLE}** to {member.mention} (has **{EVE_ROLE}**).")
-                            except Exception:
-                                pass
 
         if changed:
             async with self._data_lock:
@@ -309,7 +306,7 @@ class NewMemberRoles(commands.Cog):
             async with self._data_lock:
                 save_data(data)
 
-    # ---------- Role Update Handling (New Member + EVE Trigger + Swap Hook) ----------
+    # ---------- Role Update Handling + Subsidy Swap Hook ----------
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -319,7 +316,7 @@ class NewMemberRoles(commands.Cog):
         # Always enforce the swap rule on any update
         await self.enforce_subsidy_swap(after, reason="Role update subsidy swap")
 
-        # ✅ NEW: detect EVE role being added
+        # ✅ NEW: detect EVE role being added and only then apply to NEW players
         if (EVE_ROLE in after_roles) and (EVE_ROLE not in before_roles):
             await self.handle_eve_role_added(after, reason="EVE role added")
 
@@ -348,6 +345,7 @@ class NewMemberRoles(commands.Cog):
             async with self._data_lock:
                 data = load_data()
                 uid = str(after.id)
+
                 if uid in data["rewarded"]:
                     return
 
@@ -365,7 +363,6 @@ class NewMemberRoles(commands.Cog):
                 except discord.Forbidden:
                     return
 
-            # Swap again after reward
             await self.enforce_subsidy_swap(after, reason="Post-reward subsidy swap")
 
             async with self._data_lock:
