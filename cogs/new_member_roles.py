@@ -75,10 +75,12 @@ class NewMemberRoles(commands.Cog):
         self._data_lock = asyncio.Lock()
 
         self.timer_task.start()
-        bot.loop.create_task(self.bootstrap_existing_members())
+        self._boot_task = bot.loop.create_task(self.bootstrap_existing_members())
 
     def cog_unload(self):
         self.timer_task.cancel()
+        if hasattr(self, "_boot_task") and self._boot_task and not self._boot_task.done():
+            self._boot_task.cancel()
 
     # ---------- Utilities ----------
 
@@ -316,7 +318,7 @@ class NewMemberRoles(commands.Cog):
         # Always enforce the swap rule on any update
         await self.enforce_subsidy_swap(after, reason="Role update subsidy swap")
 
-        # ✅ NEW: detect EVE role being added and only then apply to NEW players
+        # ✅ detect EVE role being added and only then apply to NEW players
         if (EVE_ROLE in after_roles) and (EVE_ROLE not in before_roles):
             await self.handle_eve_role_added(after, reason="EVE role added")
 
@@ -503,6 +505,70 @@ class NewMemberRoles(commands.Cog):
                 "Member does not have Onboarding role.",
                 ephemeral=True
             )
+
+    # ✅✅✅ ROLLBACK COMMAND (your request)
+    @app_commands.command(
+        name="rollback_subsidized_from_security",
+        description="Rollback: remove ARC Subsidized from anyone who has ARC Security."
+    )
+    @genesis_only()
+    async def rollback_subsidized_from_security(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        security = self.get_role(guild, SECURITY_ROLE)
+        subsidized = self.get_role(guild, SUBSIDIZED_ROLE)
+
+        if not security or not subsidized:
+            await interaction.followup.send(
+                f"Missing roles. Need **{SECURITY_ROLE}** and **{SUBSIDIZED_ROLE}** to exist.",
+                ephemeral=True
+            )
+            return
+
+        removed = 0
+        failed = 0
+
+        # Fetch all members (more reliable than guild.members cache)
+        try:
+            async for member in guild.fetch_members(limit=None):
+                if security not in member.roles:
+                    continue
+                if subsidized not in member.roles:
+                    continue
+
+                try:
+                    await member.remove_roles(
+                        subsidized,
+                        reason="Rollback: Subsidized was mistakenly granted to Security members"
+                    )
+                    removed += 1
+                    await asyncio.sleep(0.35)  # throttle to reduce rate-limit risk
+                except (discord.Forbidden, discord.HTTPException):
+                    failed += 1
+
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ I can't fetch members. Enable **Server Members Intent** and make sure I have permission.",
+                ephemeral=True
+            )
+            return
+
+        await self.log(
+            guild,
+            f"🧹 **Rollback complete**: removed **{SUBSIDIZED_ROLE}** from {removed} members who had **{SECURITY_ROLE}** "
+            f"(failed {failed})."
+        )
+
+        await interaction.followup.send(
+            f"✅ Rollback done.\nRemoved: {removed}\nFailed: {failed}\n"
+            f"Details posted in **#{LOG_CHANNEL_NAME}** (if it exists).",
+            ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):
