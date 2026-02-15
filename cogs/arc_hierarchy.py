@@ -13,15 +13,25 @@
 #
 # Leadership is shared across both corps (CEO + Directors + ranks).
 #
-# Compact Flowchart rules:
-#   1) "Officers and up" are listed globally by rank (Officer/Commander/General/Director/CEO),
-#      with a corp tag per name.
-#   2) Corporations are shown as a compact summary (counts only). No long member lists.
-#   3) Use /arc roster_corp to see full membership per corp.
+# Flowchart format (as you requested):
+#   ARC Corporate Flowchart (Compact)
+#   Total Members: N
+#   LEADERSHIP (All Corps)
+#   - CEO(s): list of names + [SEC]/[SUB]/[—]
+#   - Directors Council: list
+#   - Generals: list
+#   - Commanders: list
+#   - Officers: list
+#   CORP (Summary): totals only
+#
+# NOTE:
+# - Lowest rank (Security) has NO rank role; corp role covers membership.
+# - Rank roles: ARC Officer / ARC Commander / ARC General
+# - Directors/CEO are determined by their roles (protected).
 #
 # Commands:
 #   /arc flowchart_refresh
-#   /arc roster_corp   (subsidized|security|unassigned)
+#   /arc roster_corp (subsidized|security|unassigned)
 #   /arc promote
 #   /arc demote
 #   /arc directive_create
@@ -29,10 +39,8 @@
 #   /arc directive_done
 #
 # Auto:
-#   - on_ready: bootstraps corp role bindings, syncs corp keys, refresh flowchart
+#   - on_ready: bootstrap roles, sync corp keys, refresh flowchart
 #   - on_member_update: auto-sync corp key if corp roles change, refresh flowchart
-#
-# NOTE: This cog does NOT handle AP bonuses.
 
 import os
 import json
@@ -69,15 +77,12 @@ OFFICER_ROLE = "ARC Officer"
 CORP_ROLE_SECURITY = "ARC Security"
 CORP_ROLE_SUBSIDIZED = "ARC Subsidized"
 
-# Compatibility role (optional)
-UNITLESS_ROLE = "Unitless"  # used as "Unassigned" fallback if you want
-
 # =====================
 # CHANNELS
 # =====================
 LOG_CH = "arc-hierarchy-log"
 FLOWCHART_CH = "corp-flowchart"
-DIRECTIVES_CH = "arc-directives"  # created if possible
+DIRECTIVES_CH = "arc-directives"
 
 # =====================
 # RANKS
@@ -145,10 +150,7 @@ def _coerce_dict(v: Any) -> Dict[str, Any]:
     return v if isinstance(v, dict) else {}
 
 def _migrate_legacy_units_to_corps(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    If your old file still has "units" / "director_id", we drop that structure.
-    Members are normalized to {rank, corp_key}. Corp membership is auto-detected from roles.
-    """
+    # Drop any old "units" structure; normalize member records
     data.setdefault("members", {})
     data.setdefault("corporations", _default_data()["corporations"])
     data.setdefault("directives", {})
@@ -242,6 +244,7 @@ def ensure_member_record(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     if not isinstance(rec, dict):
         rec = {"rank": RANK_SECURITY, "corp_key": CORP_UNASSIGNED_KEY}
         data["members"][str(user_id)] = rec
+
     rec.setdefault("rank", RANK_SECURITY)
     rec.setdefault("corp_key", CORP_UNASSIGNED_KEY)
     if not isinstance(rec["rank"], str):
@@ -251,6 +254,7 @@ def ensure_member_record(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     return rec
 
 def rank_roles_to_strip(guild: discord.Guild) -> List[discord.Role]:
+    # Strip only non-protected rank roles
     candidates = [OFFICER_ROLE, COMMANDER_ROLE, GENERAL_ROLE]
     out: List[discord.Role] = []
     for name in candidates:
@@ -308,16 +312,6 @@ async def log_action(guild: discord.Guild, content: str, mention_ids: List[int])
     prefix = (" ".join(mentions) + "\n") if mentions else ""
     await ch.send(prefix + content)
 
-def _rank_label(rank: str) -> str:
-    return {
-        RANK_CEO: "CEO",
-        RANK_DIRECTOR: "Director",
-        RANK_GENERAL: "General",
-        RANK_COMMANDER: "Commander",
-        RANK_OFFICER: "Officer",
-        RANK_SECURITY: "Security",
-    }.get(rank, rank)
-
 def _sort_members_casefold(members: List[discord.Member]) -> List[discord.Member]:
     return sorted(members, key=lambda x: (x.display_name or "").casefold())
 
@@ -355,10 +349,9 @@ def corp_display_name_by_key(corp_key: str) -> str:
     }.get(corp_key, "Unassigned")
 
 def corp_tag(corp_key: str) -> str:
-    # compact tag shown next to leadership names
     return {
-        CORP_SUBSIDIZED_KEY: "[SUB]",
         CORP_SECURITY_KEY: "[SEC]",
+        CORP_SUBSIDIZED_KEY: "[SUB]",
         CORP_UNASSIGNED_KEY: "[—]",
     }.get(corp_key, "[—]")
 
@@ -409,7 +402,6 @@ async def sync_member_corp_from_roles(member: discord.Member, *, reason: str) ->
 
 async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str, str]:
     guild = member.guild
-
     async with file_lock:
         data = load_data()
         rec = ensure_member_record(data, member.id)
@@ -442,66 +434,54 @@ async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str,
         return old_rank, new_rank
 
 # =====================
-# COMPACT FLOWCHART
+# FLOWCHART (Compact Officer+ names)
 # =====================
-def _format_name_list(members: List[discord.Member], max_items: int = 18) -> List[str]:
-    """
-    Returns list of lines with compact bullet points, truncating after max_items.
-    """
+def _format_rank_block(title: str, members: List[discord.Member]) -> List[str]:
+    lines: List[str] = [f"{title}:"]
     ms = _sort_members_casefold(members)
     if not ms:
-        return ["- None"]
-    shown = ms[:max_items]
-    lines = [f"- {m.display_name}" for m in shown]
-    if len(ms) > max_items:
-        lines.append(f"- … +{len(ms) - max_items} more")
+        lines.append("- None")
+        return lines
+    for m in ms:
+        ck = detect_corp_key_from_member(m)
+        lines.append(f"- {m.display_name} {corp_tag(ck)}")
     return lines
 
 def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
-    # Ensure corp keys exist
-    corps = data.get("corporations", {})
-    for k in (CORP_SUBSIDIZED_KEY, CORP_SECURITY_KEY, CORP_UNASSIGNED_KEY):
-        corps.setdefault(k, {"name": corp_display_name_by_key(k), "role_id": None})
+    members_map = data.get("members", {})
 
-    # CEO(s) by role
-    ceo_role = get_role(guild, CEO_ROLE)
+    # Collect leadership buckets
     ceos: List[discord.Member] = []
-    if ceo_role:
-        ceos = [m for m in guild.members if ceo_role in m.roles]
-
-    # Directors council by role
-    director_role = get_role(guild, DIRECTOR_ROLE)
     directors: List[discord.Member] = []
-    if director_role:
-        directors = [m for m in guild.members if director_role in m.roles]
+    generals: List[discord.Member] = []
+    commanders: List[discord.Member] = []
+    officers: List[discord.Member] = []
 
-    # Build corp + rank stats and leadership rosters (Officer+)
+    # Corp summary counts
     corp_counts = {
         CORP_SUBSIDIZED_KEY: {"total": 0, "security": 0, "officer_plus": 0},
         CORP_SECURITY_KEY: {"total": 0, "security": 0, "officer_plus": 0},
         CORP_UNASSIGNED_KEY: {"total": 0, "security": 0, "officer_plus": 0},
     }
 
-    officers: List[discord.Member] = []
-    commanders: List[discord.Member] = []
-    generals: List[discord.Member] = []
-
-    # We trust stored rank primarily, but corp is detected from roles (authoritative)
-    members_map = data.get("members", {})
-
     for m in guild.members:
         corp_key = detect_corp_key_from_member(m)
         corp_counts[corp_key]["total"] += 1
+
+        # CEO/Director buckets are role-based
+        if is_ceo(m):
+            ceos.append(m)
+            corp_counts[corp_key]["officer_plus"] += 1
+            continue
+        if is_director(m):
+            directors.append(m)
+            corp_counts[corp_key]["officer_plus"] += 1
+            continue
 
         rec = members_map.get(str(m.id))
         rank = rec.get("rank", RANK_SECURITY) if isinstance(rec, dict) else RANK_SECURITY
         if not isinstance(rank, str):
             rank = RANK_SECURITY
-
-        # Directors/CEO are handled by roles (not stored rank), but we still allow stored ranks for others
-        if is_ceo(m) or is_director(m):
-            corp_counts[corp_key]["officer_plus"] += 1
-            continue
 
         if rank == RANK_GENERAL:
             generals.append(m)
@@ -515,56 +495,30 @@ def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
         else:
             corp_counts[corp_key]["security"] += 1
 
-    # Sort leadership lists
-    ceos = _sort_members_casefold(ceos)
-    directors = _sort_members_casefold(directors)
-    generals = _sort_members_casefold(generals)
-    commanders = _sort_members_casefold(commanders)
-    officers = _sort_members_casefold(officers)
-
-    def tagged_names(ms: List[discord.Member], max_items: int = 24) -> List[str]:
-        if not ms:
-            return ["- None"]
-        lines: List[str] = []
-        for m in ms[:max_items]:
-            ck = detect_corp_key_from_member(m)
-            lines.append(f"- {m.display_name} {corp_tag(ck)}")
-        if len(ms) > max_items:
-            lines.append(f"- … +{len(ms) - max_items} more")
-        return lines
-
     total_members = sum(v["total"] for v in corp_counts.values())
 
     lines: List[str] = []
     lines.append("ARC Corporate Flowchart (Compact)")
     lines.append("")
-
-    # Top summary
     lines.append(f"Total Members: {total_members}")
     lines.append("")
-
-    # Leadership section
     lines.append("LEADERSHIP (All Corps)")
     lines.append("---------------------")
-    lines.append("CEO(s):")
-    lines.extend(tagged_names(ceos, max_items=10))
-    lines.append("")
-    lines.append("Directors Council:")
-    lines.extend(tagged_names(directors, max_items=16))
-    lines.append("")
-    lines.append("Generals:")
-    lines.extend(tagged_names(generals, max_items=20))
-    lines.append("")
-    lines.append("Commanders:")
-    lines.extend(tagged_names(commanders, max_items=20))
-    lines.append("")
-    lines.append("Officers:")
-    lines.extend(tagged_names(officers, max_items=28))
-    lines.append("")
 
-    # Corporation compact summary
+    lines.extend(_format_rank_block("CEO(s)", ceos))
+    lines.append("")
+    lines.extend(_format_rank_block("Directors Council", directors))
+    lines.append("")
+    lines.extend(_format_rank_block("Generals", generals))
+    lines.append("")
+    lines.extend(_format_rank_block("Commanders", commanders))
+    lines.append("")
+    lines.extend(_format_rank_block("Officers", officers))
+    lines.append("")
     lines.append("CORPORATIONS (Summary)")
     lines.append("---------------------")
+
+    # Order to match your example
     for ck in (CORP_SUBSIDIZED_KEY, CORP_SECURITY_KEY, CORP_UNASSIGNED_KEY):
         c = corp_counts[ck]
         lines.append(
@@ -574,7 +528,6 @@ def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
 
     lines.append("")
     lines.append("Tip: Use /arc roster_corp (subsidized|security|unassigned) for full member lists.")
-
     return "\n".join(lines).strip()
 
 async def update_flowchart(guild: discord.Guild) -> None:
@@ -690,10 +643,12 @@ class ARCHierarchyCog(commands.Cog):
         members: List[Tuple[discord.Member, Dict[str, Any]]] = []
         for m in interaction.guild.members:
             rec = data.get("members", {}).get(str(m.id))
+            # if record missing, treat as security+unassigned until next sync; but roster should reflect stored corp_key
             if isinstance(rec, dict) and rec.get("corp_key") == corp_key:
                 members.append((m, rec))
 
         groups: Dict[str, List[discord.Member]] = {
+            "ceo": [],
             RANK_DIRECTOR: [],
             RANK_GENERAL: [],
             RANK_COMMANDER: [],
@@ -702,9 +657,8 @@ class ARCHierarchyCog(commands.Cog):
         }
 
         for m, rec in members:
-            # Directors/CEO are role-based; still list them
             if is_ceo(m):
-                groups[RANK_CEO] = groups.get(RANK_CEO, []) + [m]
+                groups["ceo"].append(m)
                 continue
             if is_director(m):
                 groups[RANK_DIRECTOR].append(m)
@@ -715,8 +669,11 @@ class ARCHierarchyCog(commands.Cog):
                 r = RANK_SECURITY
             groups[r].append(m)
 
-        def fmt_group(rank: str, title: str) -> List[str]:
-            ms = _sort_members_casefold(groups.get(rank, []))
+        def sort_names(ms: List[discord.Member]) -> List[discord.Member]:
+            return sorted(ms, key=lambda x: (x.display_name or "").casefold())
+
+        def fmt_group(key: str, title: str) -> List[str]:
+            ms = sort_names(groups.get(key, []))
             if not ms:
                 return [f"**{title} (0)**", "- None"]
             lines = [f"**{title} ({len(ms)})**"]
@@ -727,10 +684,8 @@ class ARCHierarchyCog(commands.Cog):
         lines: List[str] = []
         lines.append(f"**Corporation:** {corp_name}")
         lines.append("")
-        # CEO and Directors are special
-        if "ceo" in groups:
-            lines.extend(fmt_group("ceo", "CEO(s)"))
-            lines.append("")
+        lines.extend(fmt_group("ceo", "CEO(s)"))
+        lines.append("")
         lines.extend(fmt_group(RANK_DIRECTOR, "Directors"))
         lines.append("")
         lines.extend(fmt_group(RANK_GENERAL, "Generals"))
@@ -742,6 +697,7 @@ class ARCHierarchyCog(commands.Cog):
         lines.extend(fmt_group(RANK_SECURITY, "Security"))
 
         text = "\n".join(lines)
+
         if len(text) <= 1900:
             await interaction.followup.send(text, ephemeral=False)
             return
@@ -876,7 +832,7 @@ class ARCHierarchyCog(commands.Cog):
                 "body": body,
                 "status": "open",
                 "created_by": actor.id,
-                "created_at": _now_unix(),
+                "created_at": int(discord.utils.utcnow().timestamp()),
             }
             save_data(data)
 
@@ -976,7 +932,7 @@ class ARCHierarchyCog(commands.Cog):
         return changed
 
     # -----------------
-    # AUTO-SYNC ON ROLE CHANGES
+    # AUTO-SYNC ON CORP ROLE CHANGES
     # -----------------
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
