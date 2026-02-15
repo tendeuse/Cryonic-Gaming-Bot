@@ -7,13 +7,17 @@
 # - Restart-safe: stores only primitives (ids, bools, ints, strings)
 # - FIX: Avoid message EDIT burst on startup (prevents 429 rate limits)
 # - FIX: Global edit throttle for any unavoidable edits
+#
+# ✅ NEW FEATURE:
+# - Auto "clock out" on shift rollover (checkpoint change) if someone forgot to end the shift.
+#   This records duration + logs the auto clock-out event so you don't lose the session.
 
 import asyncio
 import json
 import os
 from datetime import datetime, timezone, timedelta, time as dtime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
@@ -373,6 +377,11 @@ class ShiftMonitor(commands.Cog):
                 "activated_ts": None,
                 "start_ts": None,
                 "last_render_key": None,
+                # ✅ NEW: last session audit (optional)
+                "last_end_ts": None,
+                "last_duration_s": None,
+                "last_end_reason": None,
+                "last_ended_by": None,
             }
             shift_state[timer_id] = st
 
@@ -396,7 +405,6 @@ class ShiftMonitor(commands.Cog):
 
         # IMPORTANT FIX:
         # - If we did NOT create the message, do NOT edit it on startup.
-        #   Existing components already exist; persistent view registration keeps them clickable.
         if created:
             await self.render_shift_if_needed(guild, timer_id)
 
@@ -416,9 +424,6 @@ class ShiftMonitor(commands.Cog):
 
         view = ShiftView(self, guild.id, timer_id, int(st["shift_num"]))
 
-        # If the message already has components AND this is "first render after restart",
-        # skip editing to prevent startup edit storms. It will update naturally at next checkpoint,
-        # or when a user interacts.
         if st.get("last_render_key") is None and msg.components:
             st["last_render_key"] = render_key
             self.save_state()
@@ -428,6 +433,41 @@ class ShiftMonitor(commands.Cog):
         if ok:
             st["last_render_key"] = render_key
             self.save_state()
+
+    # ----------------- ✅ Shift session ending (manual + rollover) -----------------
+    def _end_shift_session_unsafe(
+        self,
+        st: Dict[str, Any],
+        *,
+        reason: str,
+        ended_by: Optional[int],
+        end_ts: int,
+    ) -> int:
+        """
+        Must be called under self._lock.
+        Returns duration seconds (0 if unknown).
+        """
+        start_ts = st.get("start_ts")
+        dur_s = 0
+        if start_ts:
+            try:
+                dur_s = max(0, int(end_ts) - int(start_ts))
+            except Exception:
+                dur_s = 0
+
+        st["running"] = False
+        st["started_by"] = None
+        st["start_ts"] = None
+        st["escalated"] = False  # optional reset on end
+        st["last_render_key"] = None
+
+        # audit trail
+        st["last_end_ts"] = int(end_ts)
+        st["last_duration_s"] = int(dur_s)
+        st["last_end_reason"] = str(reason)
+        st["last_ended_by"] = int(ended_by) if ended_by is not None else None
+
+        return int(dur_s)
 
     # ----------------- Escalation -----------------
     async def escalate_shift(self, guild: discord.Guild, shift_num: int, reason: str):
@@ -532,6 +572,10 @@ class ShiftMonitor(commands.Cog):
         if not interaction.guild or interaction.guild.id != guild_id:
             return
 
+        end_ts = int(now_utc().timestamp())
+        duration_s = 0
+        shift_num = None
+
         async with self._lock:
             shift_state = self.get_shift_state(guild_id)
             st = shift_state.get(timer_id)
@@ -539,19 +583,37 @@ class ShiftMonitor(commands.Cog):
                 await interaction.response.send_message("❌ Shift state missing.", ephemeral=True)
                 return
 
+            shift_num = st.get("shift_num")
             started_by = st.get("started_by")
             if interaction.user.id not in (int(started_by) if started_by else -1, interaction.guild.owner_id):
                 await interaction.response.send_message("❌ You did not start this shift.", ephemeral=True)
                 return
 
-            st["running"] = False
-            st["started_by"] = None
-            st["start_ts"] = None
-            st["last_render_key"] = None
+            if not st.get("running"):
+                await interaction.response.send_message("❌ Shift is not running.", ephemeral=True)
+                return
+
+            duration_s = self._end_shift_session_unsafe(
+                st,
+                reason="Manual clock out",
+                ended_by=interaction.user.id,
+                end_ts=end_ts,
+            )
             self.save_state()
 
         await self.render_shift_if_needed(interaction.guild, timer_id)
-        await interaction.response.send_message("🔴 Shift ended.", ephemeral=True)
+
+        pretty = fmt_td(timedelta(seconds=duration_s))
+        await interaction.response.send_message(f"🔴 Shift ended. **Duration:** {pretty}", ephemeral=True)
+
+        # log after interaction response (safe)
+        try:
+            await self.log(
+                interaction.guild,
+                f"🔴 Shift {shift_num} ended by {interaction.user.display_name} | Duration: {pretty} (<t:{end_ts}:f>)",
+            )
+        except Exception:
+            pass
 
     async def handle_escalation_claim(self, interaction: discord.Interaction, guild_id: int, shift_num: int):
         if not interaction.guild or interaction.guild.id != guild_id:
@@ -604,6 +666,7 @@ class ShiftMonitor(commands.Cog):
 
             to_escalate: list[int] = []
             to_render: set[str] = set()
+            to_log: list[str] = []
 
             async with self._lock:
                 for timer_id, st in shift_state.items():
@@ -622,9 +685,23 @@ class ShiftMonitor(commands.Cog):
                         to_render.add(timer_id)
 
                     elif (not should_be_active) and st.get("active"):
+                        # ✅ NEW: Auto clock-out on rollover if user forgot to end
+                        if st.get("running"):
+                            duration_s = self._end_shift_session_unsafe(
+                                st,
+                                reason="Auto clock out on shift rollover",
+                                ended_by=None,
+                                end_ts=now_ts,
+                            )
+                            pretty = fmt_td(timedelta(seconds=duration_s))
+                            to_log.append(
+                                f"⏱️✅ **Auto clock-out**: Shift {sn} rolled over while running | Duration: {pretty} (<t:{now_ts}:f>)"
+                            )
+
                         st["active"] = False
                         st["activated_ts"] = None
                         st["escalated"] = False
+                        # (running/start info already cleared above if it was running)
                         st["running"] = False
                         st["started_by"] = None
                         st["start_ts"] = None
@@ -647,6 +724,10 @@ class ShiftMonitor(commands.Cog):
 
             for timer_id in to_render:
                 await self.render_shift_if_needed(guild, timer_id)
+
+            # log rollover auto clock-outs (outside lock)
+            for msg in to_log:
+                await self.log(guild, msg)
 
             for sn in to_escalate:
                 if str(sn) not in escalation_state:
