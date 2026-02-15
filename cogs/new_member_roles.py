@@ -318,7 +318,7 @@ class NewMemberRoles(commands.Cog):
         # Always enforce the swap rule on any update
         await self.enforce_subsidy_swap(after, reason="Role update subsidy swap")
 
-        # ✅ detect EVE role being added and only then apply to NEW players
+        # detect EVE role being added and only then apply to NEW players
         if (EVE_ROLE in after_roles) and (EVE_ROLE not in before_roles):
             await self.handle_eve_role_added(after, reason="EVE role added")
 
@@ -506,13 +506,13 @@ class NewMemberRoles(commands.Cog):
                 ephemeral=True
             )
 
-    # ✅✅✅ ROLLBACK COMMAND (your request)
+    # ✅ ROLLBACK COMMAND (short name <= 32 chars)
     @app_commands.command(
-        name="rollback_subsidized_from_security",
+        name="rollback_subsidy_security",
         description="Rollback: remove ARC Subsidized from anyone who has ARC Security."
     )
     @genesis_only()
-    async def rollback_subsidized_from_security(self, interaction: discord.Interaction):
+    async def rollback_subsidy_security(self, interaction: discord.Interaction):
         guild = interaction.guild
         if not guild:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
