@@ -1,0 +1,14 @@
+{
+  "alpha_compatible_skills": [
+    3327,
+    3413,
+    3426,
+    3442
+  ],
+  "omega_only_skills": [
+    3436,
+    3450,
+    3348
+  ],
+  "notes": "Use this ruleset to branch skill-path missions in overlay Skill Plan view."
+}

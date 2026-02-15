@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ArcOverlay", "src\\ArcOverlay\\ArcOverlay.csproj", "{9E7E450D-A2F0-4D59-8CB5-E80B2DBA56CC}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ArcOverlay.Core", "src\\ArcOverlay.Core\\ArcOverlay.Core.csproj", "{5EDEBF62-27FF-49B5-9B8C-77F79AF63D20}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ArcOverlay.Data", "src\\ArcOverlay.Data\\ArcOverlay.Data.csproj", "{0A122D33-C312-44D1-9D87-4B7A4D34D4D4}"
+EndProject
+Global
+    GlobalSection(SolutionConfigurationPlatforms) = preSolution
+        Debug|Any CPU = Debug|Any CPU
+        Release|Any CPU = Release|Any CPU
+    EndGlobalSection
+    GlobalSection(ProjectConfigurationPlatforms) = postSolution
+        {9E7E450D-A2F0-4D59-8CB5-E80B2DBA56CC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+        {9E7E450D-A2F0-4D59-8CB5-E80B2DBA56CC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+        {9E7E450D-A2F0-4D59-8CB5-E80B2DBA56CC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+        {9E7E450D-A2F0-4D59-8CB5-E80B2DBA56CC}.Release|Any CPU.Build.0 = Release|Any CPU
+        {5EDEBF62-27FF-49B5-9B8C-77F79AF63D20}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+        {5EDEBF62-27FF-49B5-9B8C-77F79AF63D20}.Debug|Any CPU.Build.0 = Debug|Any CPU
+        {5EDEBF62-27FF-49B5-9B8C-77F79AF63D20}.Release|Any CPU.ActiveCfg = Release|Any CPU
+        {5EDEBF62-27FF-49B5-9B8C-77F79AF63D20}.Release|Any CPU.Build.0 = Release|Any CPU
+        {0A122D33-C312-44D1-9D87-4B7A4D34D4D4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+        {0A122D33-C312-44D1-9D87-4B7A4D34D4D4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+        {0A122D33-C312-44D1-9D87-4B7A4D34D4D4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+        {0A122D33-C312-44D1-9D87-4B7A4D34D4D4}.Release|Any CPU.Build.0 = Release|Any CPU
+    EndGlobalSection
+EndGlobal

@@ -1,0 +1,111 @@
+{
+  "packs": [
+    {
+      "pack_id": "default-caldari",
+      "name": "Caldari State Ascension",
+      "description": "Guided progression toward Caldari Navy standings and LP.",
+      "faction": "CALDARI",
+      "published": true,
+      "mission_ids": ["caldari-001", "caldari-002", "caldari-skill-001"]
+    },
+    {
+      "pack_id": "ore-industrial",
+      "name": "ORE Industrial Path",
+      "description": "Mining and logistics focused mission pack.",
+      "faction": "ORE",
+      "published": true,
+      "mission_ids": []
+    },
+    {
+      "pack_id": "concord-response",
+      "name": "CONCORD Response Drills",
+      "description": "Safety and response missions.",
+      "faction": "CONCORD",
+      "published": true,
+      "mission_ids": []
+    },
+    {
+      "pack_id": "edencom-front",
+      "name": "EDENCOM Frontline",
+      "description": "Triglavian defense support progression.",
+      "faction": "EDENCOM",
+      "published": true,
+      "mission_ids": []
+    },
+    {
+      "pack_id": "soe-expedition",
+      "name": "Sisters of EVE Expedition",
+      "description": "Exploration and humanitarian mission chain.",
+      "faction": "SOE",
+      "published": true,
+      "mission_ids": []
+    }
+  ],
+  "missions": [
+    {
+      "mission_id": "caldari-001",
+      "pack_id": "default-caldari",
+      "title": "For the State: First Steps",
+      "lore": "Report to a Caldari Navy agent and complete your first security operations for the State.",
+      "faction": "CALDARI",
+      "objectives": [
+        {
+          "id": "obj-standings",
+          "type": "standings_at_least",
+          "target": {"npc_corp_id": 1000035, "value": 1.0},
+          "display": "Reach 1.0 standing with Caldari Navy"
+        }
+      ],
+      "rewards": {"ap": 50, "badge": "State Initiate"},
+      "alpha_omega": "BOTH",
+      "tags": ["newbro", "caldari", "standings"],
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "mission_id": "caldari-002",
+      "pack_id": "default-caldari",
+      "title": "State Loyalty Ledger",
+      "lore": "Build operational trust by running repeatable security assignments for LP accumulation.",
+      "faction": "CALDARI",
+      "objectives": [
+        {
+          "id": "obj-lp",
+          "type": "lp_earned_total",
+          "target": {"npc_corp_id": 1000035, "value": 5000},
+          "display": "Earn 5,000 LP with Caldari Navy",
+          "manual_confirmation_allowed": true
+        }
+      ],
+      "rewards": {"ap": 75, "badge": "Navy Contributor"},
+      "alpha_omega": "BOTH",
+      "tags": ["lp", "caldari"],
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "mission_id": "caldari-skill-001",
+      "pack_id": "default-caldari",
+      "title": "Doctrinal Training: Missile Systems",
+      "lore": "Prepare for corporation fits by training core missile and shield operation skills.",
+      "faction": "CALDARI",
+      "objectives": [
+        {
+          "id": "obj-skill",
+          "type": "skills_trained",
+          "target": {"skill_id": 3327, "level": 3},
+          "display": "Train Missile Launcher Operation to III"
+        }
+      ],
+      "rewards": {"ap": 40, "badge": "Doctrine Cadet"},
+      "alpha_omega": "BOTH",
+      "skill_path": {
+        "alpha": ["Missile Launcher Operation III", "Shield Operation III"],
+        "omega": ["Missile Launcher Operation IV", "Shield Operation IV", "Weapon Upgrades IV"]
+      },
+      "tags": ["skills", "alpha", "omega"],
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
