@@ -5,6 +5,7 @@ import asyncio
 import json
 import time
 import os
+import aiohttp
 from datetime import datetime, timedelta, timezone
 
 DATA_DIR = "/data"
@@ -31,6 +32,9 @@ DELAY_SECONDS = 3600  # 1 hour
 # ✅ Only treat members as "new" for this many days after joining
 NEW_PLAYER_WINDOW_DAYS = 14
 
+# Throttle between role operations to reduce bursts/timeouts
+ROLE_OP_THROTTLE_SECONDS = 0.35
+
 
 # ----------------- Persistence -----------------
 
@@ -38,14 +42,7 @@ def ensure_data():
     os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w") as f:
-            json.dump(
-                {
-                    "pending": {},     # user_id -> unix timestamp
-                    "rewarded": []     # [user_id]
-                },
-                f,
-                indent=2
-            )
+            json.dump({"pending": {}, "rewarded": []}, f, indent=2)
 
 
 def load_data():
@@ -64,6 +61,46 @@ def load_data():
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+# ----------------- Robust Discord HTTP retry -----------------
+
+async def _retry_discord_http(action_coro_factory,
+                             *,
+                             attempts: int = 5,
+                             base_delay: float = 2.0,
+                             max_delay: float = 45.0):
+    """
+    Retries a Discord HTTP action that can fail due to transient network issues.
+    action_coro_factory: a zero-arg callable that returns an awaitable.
+    """
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return await action_coro_factory()
+        except (aiohttp.ClientConnectionError,
+                aiohttp.ClientConnectorError,
+                aiohttp.ServerTimeoutError,
+                aiohttp.ClientOSError,
+                asyncio.TimeoutError) as e:
+            # Pure connectivity/timeout issues -> retry
+            last_exc = e
+        except discord.HTTPException as e:
+            # 5xx or sporadic transport issues can be retried.
+            # 4xx (except 429) are usually permanent (missing perms, missing role/member).
+            last_exc = e
+            if 400 <= getattr(e, "status", 0) < 500 and getattr(e, "status", 0) != 429:
+                raise
+        # discord.Forbidden / discord.NotFound should not be retried typically
+        except (discord.Forbidden, discord.NotFound):
+            raise
+
+        # exponential backoff with tiny jitter
+        delay = min(max_delay, base_delay * (2 ** i))
+        delay = delay * (0.85 + 0.3 * ((asyncio.get_running_loop().time() % 1.0)))
+        await asyncio.sleep(delay)
+
+    raise last_exc
 
 
 # ----------------- Cog -----------------
@@ -93,7 +130,23 @@ class NewMemberRoles(commands.Cog):
     async def log(self, guild: discord.Guild, message: str):
         channel = self.get_log_channel(guild)
         if channel:
-            await channel.send(message)
+            try:
+                await _retry_discord_http(lambda: channel.send(message), attempts=3, base_delay=1.0, max_delay=10.0)
+            except Exception:
+                # Never let logging kill the cog
+                pass
+
+    async def _safe_add_roles(self, member: discord.Member, *roles: discord.Role, reason: str):
+        if not roles:
+            return
+        await _retry_discord_http(lambda: member.add_roles(*roles, reason=reason))
+        await asyncio.sleep(ROLE_OP_THROTTLE_SECONDS)
+
+    async def _safe_remove_roles(self, member: discord.Member, *roles: discord.Role, reason: str):
+        if not roles:
+            return
+        await _retry_discord_http(lambda: member.remove_roles(*roles, reason=reason))
+        await asyncio.sleep(ROLE_OP_THROTTLE_SECONDS)
 
     # ---------- Core Rule: Subsidy Swap ----------
 
@@ -110,19 +163,17 @@ class NewMemberRoles(commands.Cog):
         if not onboarding or not security or not subsidized:
             return
 
-        has_onboarding = onboarding in member.roles
-        has_security = security in member.roles
-        has_subsidized = subsidized in member.roles
-
-        if not (has_onboarding and has_security):
+        if onboarding not in member.roles or security not in member.roles:
             return
 
         try:
-            if not has_subsidized:
-                await member.add_roles(subsidized, reason=reason)
+            # Add subsidized first
+            if subsidized not in member.roles:
+                await self._safe_add_roles(member, subsidized, reason=reason)
 
+            # Remove security
             if security in member.roles:
-                await member.remove_roles(security, reason=reason)
+                await self._safe_remove_roles(member, security, reason=reason)
 
             await self.log(
                 guild,
@@ -134,11 +185,11 @@ class NewMemberRoles(commands.Cog):
                 guild,
                 f"⚠️ **Subsidy swap failed** for {member.mention}: missing permissions or role hierarchy issue."
             )
-        except discord.HTTPException as e:
-            await self.log(
-                guild,
-                f"⚠️ **Subsidy swap failed** for {member.mention}: HTTP error: {e}"
-            )
+        except discord.NotFound:
+            # Member left
+            pass
+        except Exception as e:
+            await self.log(guild, f"⚠️ **Subsidy swap error** for {member.mention}: {type(e).__name__}")
 
     # ---------- ✅ New Player Detection ----------
 
@@ -195,12 +246,12 @@ class NewMemberRoles(commands.Cog):
         # Step 1: ensure subsidized
         try:
             if subsidized not in member.roles:
-                await member.add_roles(subsidized, reason=reason)
+                await self._safe_add_roles(member, subsidized, reason=reason)
         except discord.Forbidden:
             await self.log(guild, f"⚠️ Could not add **{SUBSIDIZED_ROLE}** to {member.mention} (permissions/hierarchy).")
             return
-        except discord.HTTPException as e:
-            await self.log(guild, f"⚠️ Could not add **{SUBSIDIZED_ROLE}** to {member.mention}: {e}")
+        except Exception:
+            await self.log(guild, f"⚠️ Could not add **{SUBSIDIZED_ROLE}** to {member.mention} (transient error).")
             return
 
         # Step 2: if they had Security or Subsidized -> add Scheduling + Onboarding
@@ -216,11 +267,11 @@ class NewMemberRoles(commands.Cog):
 
         if roles_to_add:
             try:
-                await member.add_roles(*roles_to_add, reason=f"{reason} (add Scheduling + Onboarding)")
+                await self._safe_add_roles(member, *roles_to_add, reason=f"{reason} (add Scheduling + Onboarding)")
             except discord.Forbidden:
                 await self.log(guild, f"⚠️ Could not add Scheduling/Onboarding to {member.mention} (permissions/hierarchy).")
-            except discord.HTTPException as e:
-                await self.log(guild, f"⚠️ Could not add Scheduling/Onboarding to {member.mention}: {e}")
+            except Exception:
+                await self.log(guild, f"⚠️ Could not add Scheduling/Onboarding to {member.mention} (transient error).")
 
         # Step 3: run swap again (if Onboarding present and Security present -> remove Security)
         await self.enforce_subsidy_swap(member, reason=f"{reason} (post-onboarding swap)")
@@ -280,29 +331,31 @@ class NewMemberRoles(commands.Cog):
         changed = False
 
         for user_id, due in list(data["pending"].items()):
-            if now >= due:
-                member = None
-                for guild in self.bot.guilds:
-                    member = guild.get_member(int(user_id))
-                    if member:
-                        break
+            if now < due:
+                continue
 
+            member = None
+            for guild in self.bot.guilds:
+                member = guild.get_member(int(user_id))
                 if member:
-                    role = self.get_role(member.guild, NEW_MEMBER_ROLE)
-                    if role and role not in member.roles:
-                        try:
-                            await member.add_roles(role, reason="Auto New Member role")
-                            await self.log(
-                                member.guild,
-                                f"🟢 **New Member added** to {member.mention} (auto)"
-                            )
-                        except discord.Forbidden:
-                            pass
+                    break
 
-                    await self.enforce_subsidy_swap(member, reason="Timer task subsidy swap")
+            if member:
+                role = self.get_role(member.guild, NEW_MEMBER_ROLE)
+                if role and role not in member.roles:
+                    try:
+                        await self._safe_add_roles(member, role, reason="Auto New Member role")
+                        await self.log(member.guild, f"🟢 **New Member added** to {member.mention} (auto)")
+                    except discord.Forbidden:
+                        await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (permissions/hierarchy).")
+                    except Exception:
+                        await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (transient error).")
 
-                del data["pending"][user_id]
-                changed = True
+                await self.enforce_subsidy_swap(member, reason="Timer task subsidy swap")
+
+            # Remove pending regardless (prevents infinite retries)
+            del data["pending"][user_id]
+            changed = True
 
         if changed:
             async with self._data_lock:
@@ -326,20 +379,16 @@ class NewMemberRoles(commands.Cog):
         if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
             actor = "Unknown"
             try:
-                async for entry in after.guild.audit_logs(
-                    limit=5,
-                    action=discord.AuditLogAction.member_role_update
-                ):
-                    if entry.target.id == after.id:
+                async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
+                    if entry.target and entry.target.id == after.id:
                         actor = entry.user.mention
                         break
             except discord.Forbidden:
                 actor = "Audit log unavailable"
+            except Exception:
+                actor = "Audit log error"
 
-            await self.log(
-                after.guild,
-                f"🔴 **New Member removed** from {after.mention} by {actor}"
-            )
+            await self.log(after.guild, f"🔴 **New Member removed** from {after.mention} by {actor}")
 
             if SECURITY_ROLE not in before_roles:
                 return
@@ -347,22 +396,20 @@ class NewMemberRoles(commands.Cog):
             async with self._data_lock:
                 data = load_data()
                 uid = str(after.id)
-
                 if uid in data["rewarded"]:
                     return
 
             sched = self.get_role(after.guild, SCHEDULING_ROLE)
             onboard = self.get_role(after.guild, ONBOARDING_ROLE)
-
             roles_to_add = [r for r in (sched, onboard) if r]
 
             if roles_to_add:
                 try:
-                    await after.add_roles(
-                        *roles_to_add,
-                        reason="Security onboarding reward"
-                    )
+                    await self._safe_add_roles(after, *roles_to_add, reason="Security onboarding reward")
                 except discord.Forbidden:
+                    return
+                except Exception:
+                    # transient failure; don't mark rewarded
                     return
 
             await self.enforce_subsidy_swap(after, reason="Post-reward subsidy swap")
@@ -394,11 +441,7 @@ class NewMemberRoles(commands.Cog):
         description="Transfer a member from ARC Subsidized to ARC Security"
     )
     @leadership_only()
-    async def transfer_to_security(
-        self,
-        interaction: discord.Interaction,
-        member: discord.Member
-    ):
+    async def transfer_to_security(self, interaction: discord.Interaction, member: discord.Member):
         guild = interaction.guild
         if not guild:
             await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
@@ -430,8 +473,8 @@ class NewMemberRoles(commands.Cog):
             )
 
         try:
-            await member.add_roles(security, reason=f"Transfer to security by {interaction.user}")
-            await member.remove_roles(subsidized, reason=f"Transfer to security by {interaction.user}")
+            await self._safe_add_roles(member, security, reason=f"Transfer to security by {interaction.user}")
+            await self._safe_remove_roles(member, subsidized, reason=f"Transfer to security by {interaction.user}")
 
             await self.log(
                 guild,
@@ -439,7 +482,10 @@ class NewMemberRoles(commands.Cog):
                 f"from **{SUBSIDIZED_ROLE}** → **{SECURITY_ROLE}**."
             )
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
+                f"✅ Transferred {member.mention} to **{SECURITY_ROLE}** (removed **{SUBSIDIZED_ROLE}**).",
+                ephemeral=True
+            ) if interaction.response.is_done() else await interaction.response.send_message(
                 f"✅ Transferred {member.mention} to **{SECURITY_ROLE}** (removed **{SUBSIDIZED_ROLE}**).",
                 ephemeral=True
             )
@@ -448,9 +494,9 @@ class NewMemberRoles(commands.Cog):
                 "❌ I don't have permission (check role hierarchy / Manage Roles).",
                 ephemeral=True
             )
-        except discord.HTTPException as e:
+        except Exception as e:
             await interaction.response.send_message(
-                f"❌ Discord API error: {e}",
+                f"❌ Discord API/network error: {type(e).__name__}",
                 ephemeral=True
             )
 
@@ -459,17 +505,13 @@ class NewMemberRoles(commands.Cog):
         description="Remove Scheduling role from a member"
     )
     @genesis_only()
-    async def remove_scheduling(
-        self,
-        interaction: discord.Interaction,
-        member: discord.Member
-    ):
+    async def remove_scheduling(self, interaction: discord.Interaction, member: discord.Member):
         role = self.get_role(interaction.guild, SCHEDULING_ROLE)
         if role and role in member.roles:
-            await member.remove_roles(
-                role,
-                reason=f"Removed by {interaction.user}"
-            )
+            try:
+                await self._safe_remove_roles(role, reason=f"Removed by {interaction.user}")  # type: ignore
+            except Exception:
+                pass
             await interaction.response.send_message(
                 f"Scheduling role removed from {member.mention}.",
                 ephemeral=True
@@ -485,17 +527,13 @@ class NewMemberRoles(commands.Cog):
         description="Remove Onboarding role from a member"
     )
     @genesis_only()
-    async def remove_onboarding(
-        self,
-        interaction: discord.Interaction,
-        member: discord.Member
-    ):
+    async def remove_onboarding(self, interaction: discord.Interaction, member: discord.Member):
         role = self.get_role(interaction.guild, ONBOARDING_ROLE)
         if role and role in member.roles:
-            await member.remove_roles(
-                role,
-                reason=f"Removed by {interaction.user}"
-            )
+            try:
+                await self._safe_remove_roles(role, reason=f"Removed by {interaction.user}")  # type: ignore
+            except Exception:
+                pass
             await interaction.response.send_message(
                 f"Onboarding role removed from {member.mention}.",
                 ephemeral=True
@@ -533,7 +571,6 @@ class NewMemberRoles(commands.Cog):
         removed = 0
         failed = 0
 
-        # Fetch all members (more reliable than guild.members cache)
         try:
             async for member in guild.fetch_members(limit=None):
                 if security not in member.roles:
@@ -542,13 +579,14 @@ class NewMemberRoles(commands.Cog):
                     continue
 
                 try:
-                    await member.remove_roles(
-                        subsidized,
+                    await self._safe_remove_roles(
+                        member, subsidized,
                         reason="Rollback: Subsidized was mistakenly granted to Security members"
                     )
                     removed += 1
-                    await asyncio.sleep(0.35)  # throttle to reduce rate-limit risk
-                except (discord.Forbidden, discord.HTTPException):
+                except (discord.Forbidden, discord.NotFound):
+                    failed += 1
+                except Exception:
                     failed += 1
 
         except discord.Forbidden:
