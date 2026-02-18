@@ -1,6 +1,6 @@
 # cogs/ap_tracking.py
 #
-# Railway-volume persistent AP system + hierarchy-aware bonus redistribution
+# Railway-volume persistent AP system + leadership bonus redistribution
 # - Persists to /data by default (Railway volume). Override with env var PERSIST_ROOT.
 # - Keeps ALL commands/reports from your posted script:
 #     /apclaim, /give_ap, /remove_ap, /transfer_ap, /ap_info, /export_ap, /point
@@ -10,9 +10,11 @@
 #     Hierarchy log channel
 #     Voice + chat AP loops with bonuses
 #
-# NOTE:
-#   This cog expects arc_hierarchy.py to write hierarchy data to the SAME volume:
-#   /data/arc_hierarchy.json (or PERSIST_ROOT/arc_hierarchy.json).
+# BONUS POLICY (UPDATED):
+#   - CEO(s): each gets +10% of base (NOT divided)
+#   - Directors: total pool = 10% of base, split evenly among Directors (excluding CEOs to prevent double-dip)
+#   - Leadership bonus triggers only when earner has SECURITY_ROLE
+#   - Unit tier bonuses are disabled in this version
 #
 import os
 import discord
@@ -37,7 +39,7 @@ DATA_FILE = PERSIST_ROOT / "ap_data.json"
 EXPORT_DIR = PERSIST_ROOT / "ap_exports"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Hierarchy data (owned by arc_hierarchy.py)
+# Hierarchy data (owned by arc_hierarchy.py) - still present for compatibility
 HIERARCHY_FILE = PERSIST_ROOT / "arc_hierarchy.json"
 HIERARCHY_LOG_CH = "arc-hierarchy-log"
 
@@ -62,8 +64,9 @@ META_KEY = "_meta"
 AP_CHECK_MESSAGE_ID_KEY = "ap_check_message_id"
 LAST_WIPE_KEY = "last_wipe_utc"
 
-# ARC roles (used for CEO bonus eligibility and permissions)
+# ARC roles (bonus eligibility + admin permissions)
 CEO_ROLE = "ARC Security Corporation Leader"
+DIRECTORS_ROLE = "ARC Security Administration Council"
 SECURITY_ROLE = "ARC Security"
 
 # Join bonus
@@ -83,7 +86,7 @@ GAME_WOW = "World of Warcraft"
 EVE_ISK_PER_AP = 100_000
 WOW_GOLD_PER_AP = 10
 
-# ARC ranks (read from hierarchy file)
+# ARC ranks (kept for compatibility; not used for bonuses in this version)
 RANK_SECURITY = "security"
 RANK_OFFICER = "officer"
 RANK_COMMANDER = "commander"
@@ -164,6 +167,7 @@ def safe_float_ap(value) -> float:
         return 0.0
 
 def load_hierarchy() -> Dict[str, Any]:
+    # Not used for bonuses in this version; kept so the file dependency doesn't break anything.
     if not HIERARCHY_FILE.exists():
         return {"members": {}, "units": {}}
     try:
@@ -274,49 +278,19 @@ async def log_ap_distribution_embed(
         pass
 
 # -------------------------
-# Bonus Logic
+# Bonus Logic (UPDATED)
 # -------------------------
-def member_hierarchy_record(h: Dict[str, Any], member_id: int) -> Dict[str, Any]:
-    return h.get("members", {}).get(str(member_id), {}) if isinstance(h, dict) else {}
-
-def member_rank_and_unit(h: Dict[str, Any], member_id: int) -> Tuple[str, Optional[int]]:
-    rec = member_hierarchy_record(h, member_id)
-    rank = rec.get("rank", RANK_SECURITY)
-    unit_director_id = rec.get("director_id")
-    if not isinstance(unit_director_id, int):
-        unit_director_id = None
-    if rank not in RANK_INDEX:
-        rank = RANK_SECURITY
-    return rank, unit_director_id
-
-def members_in_unit_by_rank(guild: discord.Guild, h: Dict[str, Any], unit_director_id: int) -> Dict[str, List[int]]:
-    out: Dict[str, List[int]] = {r: [] for r in RANK_ORDER}
-    members_map = h.get("members", {}) if isinstance(h, dict) else {}
-    for uid_str, rec in members_map.items():
-        if not isinstance(rec, dict):
-            continue
-        if rec.get("director_id") != unit_director_id:
-            continue
-        try:
-            uid = int(uid_str)
-        except Exception:
-            continue
-        if not guild.get_member(uid):
-            continue
-        r = rec.get("rank", RANK_SECURITY)
-        if r not in out:
-            r = RANK_SECURITY
-        out[r].append(uid)
-    return out
-
-def higher_tiers_than(rank: str) -> List[str]:
-    i = RANK_INDEX.get(rank, 0)
-    return [r for r in RANK_ORDER if RANK_INDEX[r] > i]
-
 def ceo_ids(guild: discord.Guild) -> List[int]:
     ids: List[int] = []
     for m in guild.members:
         if isinstance(m, discord.Member) and has_role_name(m, CEO_ROLE):
+            ids.append(m.id)
+    return ids
+
+def director_ids(guild: discord.Guild) -> List[int]:
+    ids: List[int] = []
+    for m in guild.members:
+        if isinstance(m, discord.Member) and has_role_name(m, DIRECTORS_ROLE):
             ids.append(m.id)
     return ids
 
@@ -339,44 +313,45 @@ async def award_ap_with_bonuses(
     if base_amount <= 0:
         return
 
-    h = load_hierarchy()
-    earner_rank, unit_director_id = member_rank_and_unit(h, earner.id)
+    _ = load_hierarchy()  # kept for compatibility / future use
 
     data = await load()
 
     # 1) Base AP
     await add_ap_raw(data, earner.id, base_amount)
 
-    distributions: List[str] = []
-    mention_ids: List[int] = []
+    mention_ids: List[int] = [earner.id]
 
-    # 2) Unit bonuses (only if unit is known)
-    if unit_director_id is not None:
-        mention_ids.append(unit_director_id)
-
-        by_rank = members_in_unit_by_rank(guild, h, unit_director_id)
-        for tier in higher_tiers_than(earner_rank):
-            targets = by_rank.get(tier, [])
-            if not targets:
-                continue
-            pool = base_amount * 0.10
-            each = pool / float(len(targets))
-            for uid in targets:
-                await add_ap_raw(data, uid, each)
-            distributions.append(f"- {tier}: +{pool:.2f} total across {len(targets)} member(s) (+{each:.2f} each)")
-            if tier == RANK_DIRECTOR:
-                mention_ids.extend(targets)
-
-    # 3) CEO bonus (NOT divided)
-    ceo_bonus = 0.0
+    # 2) Leadership bonuses
+    ceo_bonus_each = 0.0
     ceo_targets: List[int] = []
+
+    directors_pool = 0.0
+    directors_each = 0.0
+    directors_targets: List[int] = []
+
     if has_role_name(earner, SECURITY_ROLE):
         ceo_targets = ceo_ids(guild)
+        all_directors = director_ids(guild)
+
+        # Prevent double-dipping: exclude CEOs from Directors split
+        ceo_set = set(ceo_targets)
+        directors_targets = [uid for uid in all_directors if uid not in ceo_set]
+
+        # CEO: 10% EACH, not divided
         if ceo_targets:
-            ceo_bonus = base_amount * 0.10
+            ceo_bonus_each = base_amount * 0.10
             for uid in ceo_targets:
-                await add_ap_raw(data, uid, ceo_bonus)
+                await add_ap_raw(data, uid, ceo_bonus_each)
             mention_ids.extend(ceo_targets)
+
+        # Directors: TOTAL pool 10% split between them
+        if directors_targets:
+            directors_pool = base_amount * 0.10
+            directors_each = directors_pool / float(len(directors_targets))
+            for uid in directors_targets:
+                await add_ap_raw(data, uid, directors_each)
+            mention_ids.extend(directors_targets)
 
     await save(data)
 
@@ -400,18 +375,23 @@ async def award_ap_with_bonuses(
         if reason:
             lines.append(f"Reason: {reason}")
 
-        if unit_director_id is None:
-            lines.append("Unit bonus: skipped (member has no unit / director_id in arc_hierarchy.json).")
-        elif distributions:
-            lines.append("Unit bonuses (each higher tier gets 10% of base; split within tier):")
-            lines.extend(distributions)
-        else:
-            lines.append("Unit bonuses: none (no higher-tier members in unit).")
+        lines.append("Unit bonuses: disabled (leadership-only bonus mode).")
 
-        if ceo_targets and ceo_bonus > 0:
-            lines.append(f"CEO bonus: each CEO received **+{ceo_bonus:.2f} AP** (10% of base; not divided).")
+        if not has_role_name(earner, SECURITY_ROLE):
+            lines.append(f"Leadership bonus: none (earner missing required role `{SECURITY_ROLE}`).")
         else:
-            lines.append("CEO bonus: none (no CEO found).")
+            if ceo_targets and ceo_bonus_each > 0:
+                lines.append(f"CEO bonus: each CEO received **+{ceo_bonus_each:.2f} AP** (10% of base; not divided).")
+            else:
+                lines.append("CEO bonus: none (no CEO found).")
+
+            if directors_targets and directors_pool > 0:
+                lines.append(
+                    f"Directors bonus: pool **+{directors_pool:.2f} AP** (10% of base) split across "
+                    f"{len(directors_targets)} Director(s) (**+{directors_each:.2f} each**)."
+                )
+            else:
+                lines.append("Directors bonus: none (no eligible Directors found).")
 
         await log_hierarchy_ap(guild, "\n".join(lines), mention_ids)
 
@@ -501,7 +481,7 @@ def render_grouped_csv(groups: Dict[str, List[List[str]]]) -> bytes:
             writer.writerows(rows)
         else:
             writer.writerow(["(none)"])
-        writer.writerow([])  # blank line separator
+        writer.writerow([])
 
     write_section(GAME_WOW, groups.get(GAME_WOW, []))
     write_section(GAME_EVE, groups.get(GAME_EVE, []))
@@ -587,7 +567,6 @@ class APClaimGameView(discord.ui.View):
         self.owner_id = owner_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Only the user who ran /apclaim can use these buttons
         if interaction.user and interaction.user.id == self.owner_id:
             return True
         await interaction.response.send_message("This claim menu isn't for you.", ephemeral=True)
@@ -627,7 +606,7 @@ class APTracking(commands.Cog):
             )
         }
 
-        me = guild.me or guild.get_member(self.bot.user.id) if self.bot.user else None
+        me = guild.me or (guild.get_member(self.bot.user.id) if self.bot.user else None)
         if me:
             overwrites[me] = discord.PermissionOverwrite(
                 view_channel=True,
@@ -668,7 +647,6 @@ class APTracking(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # Persistent AP check view
         self.bot.add_view(APCheckView())
 
         for g in self.bot.guilds:
