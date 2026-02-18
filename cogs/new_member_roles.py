@@ -91,11 +91,10 @@ async def _retry_discord_http(action_coro_factory,
             last_exc = e
             if 400 <= getattr(e, "status", 0) < 500 and getattr(e, "status", 0) != 429:
                 raise
-        # discord.Forbidden / discord.NotFound should not be retried typically
         except (discord.Forbidden, discord.NotFound):
             raise
 
-        # exponential backoff with tiny jitter
+        # exponential backoff with small jitter
         delay = min(max_delay, base_delay * (2 ** i))
         delay = delay * (0.85 + 0.3 * ((asyncio.get_running_loop().time() % 1.0)))
         await asyncio.sleep(delay)
@@ -133,8 +132,7 @@ class NewMemberRoles(commands.Cog):
             try:
                 await _retry_discord_http(lambda: channel.send(message), attempts=3, base_delay=1.0, max_delay=10.0)
             except Exception:
-                # Never let logging kill the cog
-                pass
+                pass  # never let logging kill the cog
 
     async def _safe_add_roles(self, member: discord.Member, *roles: discord.Role, reason: str):
         if not roles:
@@ -167,11 +165,9 @@ class NewMemberRoles(commands.Cog):
             return
 
         try:
-            # Add subsidized first
             if subsidized not in member.roles:
                 await self._safe_add_roles(member, subsidized, reason=reason)
 
-            # Remove security
             if security in member.roles:
                 await self._safe_remove_roles(member, security, reason=reason)
 
@@ -186,7 +182,6 @@ class NewMemberRoles(commands.Cog):
                 f"⚠️ **Subsidy swap failed** for {member.mention}: missing permissions or role hierarchy issue."
             )
         except discord.NotFound:
-            # Member left
             pass
         except Exception as e:
             await self.log(guild, f"⚠️ **Subsidy swap error** for {member.mention}: {type(e).__name__}")
@@ -239,11 +234,9 @@ class NewMemberRoles(commands.Cog):
         if not subsidized:
             return
 
-        # ✅ Only apply to NEW players
         if not await self.is_new_player(member):
             return
 
-        # Step 1: ensure subsidized
         try:
             if subsidized not in member.roles:
                 await self._safe_add_roles(member, subsidized, reason=reason)
@@ -254,7 +247,6 @@ class NewMemberRoles(commands.Cog):
             await self.log(guild, f"⚠️ Could not add **{SUBSIDIZED_ROLE}** to {member.mention} (transient error).")
             return
 
-        # Step 2: if they had Security or Subsidized -> add Scheduling + Onboarding
         has_security = (security in member.roles) if security else False
         has_subsidized = subsidized in member.roles
 
@@ -273,7 +265,6 @@ class NewMemberRoles(commands.Cog):
             except Exception:
                 await self.log(guild, f"⚠️ Could not add Scheduling/Onboarding to {member.mention} (transient error).")
 
-        # Step 3: run swap again (if Onboarding present and Security present -> remove Security)
         await self.enforce_subsidy_swap(member, reason=f"{reason} (post-onboarding swap)")
 
         await self.log(
@@ -353,7 +344,6 @@ class NewMemberRoles(commands.Cog):
 
                 await self.enforce_subsidy_swap(member, reason="Timer task subsidy swap")
 
-            # Remove pending regardless (prevents infinite retries)
             del data["pending"][user_id]
             changed = True
 
@@ -368,14 +358,11 @@ class NewMemberRoles(commands.Cog):
         before_roles = {r.name for r in before.roles}
         after_roles = {r.name for r in after.roles}
 
-        # Always enforce the swap rule on any update
         await self.enforce_subsidy_swap(after, reason="Role update subsidy swap")
 
-        # detect EVE role being added and only then apply to NEW players
         if (EVE_ROLE in after_roles) and (EVE_ROLE not in before_roles):
             await self.handle_eve_role_added(after, reason="EVE role added")
 
-        # Existing: New Member removed logic
         if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
             actor = "Unknown"
             try:
@@ -409,7 +396,6 @@ class NewMemberRoles(commands.Cog):
                 except discord.Forbidden:
                     return
                 except Exception:
-                    # transient failure; don't mark rewarded
                     return
 
             await self.enforce_subsidy_swap(after, reason="Post-reward subsidy swap")
@@ -482,13 +468,16 @@ class NewMemberRoles(commands.Cog):
                 f"from **{SUBSIDIZED_ROLE}** → **{SECURITY_ROLE}**."
             )
 
-            await interaction.followup.send(
-                f"✅ Transferred {member.mention} to **{SECURITY_ROLE}** (removed **{SUBSIDIZED_ROLE}**).",
-                ephemeral=True
-            ) if interaction.response.is_done() else await interaction.response.send_message(
-                f"✅ Transferred {member.mention} to **{SECURITY_ROLE}** (removed **{SUBSIDIZED_ROLE}**).",
-                ephemeral=True
-            )
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"✅ Transferred {member.mention} to **{SECURITY_ROLE}** (removed **{SUBSIDIZED_ROLE}**).",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    f"✅ Transferred {member.mention} to **{SECURITY_ROLE}** (removed **{SUBSIDIZED_ROLE}**).",
+                    ephemeral=True
+                )
         except discord.Forbidden:
             await interaction.response.send_message(
                 "❌ I don't have permission (check role hierarchy / Manage Roles).",
@@ -509,7 +498,7 @@ class NewMemberRoles(commands.Cog):
         role = self.get_role(interaction.guild, SCHEDULING_ROLE)
         if role and role in member.roles:
             try:
-                await self._safe_remove_roles(role, reason=f"Removed by {interaction.user}")  # type: ignore
+                await self._safe_remove_roles(member, role, reason=f"Removed by {interaction.user}")
             except Exception:
                 pass
             await interaction.response.send_message(
@@ -531,7 +520,7 @@ class NewMemberRoles(commands.Cog):
         role = self.get_role(interaction.guild, ONBOARDING_ROLE)
         if role and role in member.roles:
             try:
-                await self._safe_remove_roles(role, reason=f"Removed by {interaction.user}")  # type: ignore
+                await self._safe_remove_roles(member, role, reason=f"Removed by {interaction.user}")
             except Exception:
                 pass
             await interaction.response.send_message(
@@ -544,7 +533,6 @@ class NewMemberRoles(commands.Cog):
                 ephemeral=True
             )
 
-    # ✅ ROLLBACK COMMAND (short name <= 32 chars)
     @app_commands.command(
         name="rollback_subsidy_security",
         description="Rollback: remove ARC Subsidized from anyone who has ARC Security."
