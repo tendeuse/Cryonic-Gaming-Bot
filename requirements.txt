@@ -3,3 +3,5 @@ aiohttp
 isodate
 google-api-python-client
 google-auth
+fastapi
+uvicorn
