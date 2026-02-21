@@ -12,6 +12,7 @@ from discord.ext import commands
 from discord import app_commands
 
 from fastapi import FastAPI, HTTPException, Request
+from starlette.responses import PlainTextResponse, JSONResponse
 import uvicorn
 
 DB_PATH = "/data/mission_overlay.db"
@@ -124,6 +125,7 @@ class MissionOverlayCog(commands.Cog):
         self.app.middleware("http")(self.auth)
 
         # Endpoints
+        self.app.get("/health")(self.health)  # ✅ health endpoint for Railway
         self.app.get("/overlay/api/v1/packs")(self.get_packs)
         self.app.get("/overlay/api/v1/missions/{mission_id}")(self.get_mission)
         self.app.post("/overlay/api/v1/pair/exchange")(self.pair_exchange)
@@ -131,10 +133,21 @@ class MissionOverlayCog(commands.Cog):
         asyncio.create_task(self.run_api())
 
     # -------------------------
+    # HEALTH
+    # -------------------------
+    async def health(self):
+        # Keep it dead simple for Railway health checks
+        return PlainTextResponse("ok", status_code=200)
+
+    # -------------------------
     # AUTH MIDDLEWARE
     # -------------------------
     async def auth(self, req: Request, call_next):
         path = req.url.path
+
+        # ✅ Allow Railway health checks without auth
+        if path == "/health":
+            return await call_next(req)
 
         # Pair exchange: do auth inside handler (code is the proof).
         if path == "/overlay/api/v1/pair/exchange":
@@ -148,7 +161,8 @@ class MissionOverlayCog(commands.Cog):
         if token and await self._token_is_valid(token):
             return await call_next(req)
 
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        # ✅ Return a proper response instead of raising (avoids TaskGroup exception bubbling to 500)
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     async def _token_is_valid(self, token: str) -> bool:
         with sqlite3.connect(DB_PATH) as con:
