@@ -4,6 +4,9 @@
 # 1) If "EVE online" role is added for a NEW player -> add "ARC Subsidized" and ensure "ARC Security" is NOT present.
 # 2) On join -> start 1-hour timer -> add "New Member".
 # 3) When "New Member" is removed -> add "Onboarding" + "Scheduling".
+# + NEW: /fix_roles (Genesis only)
+#     - For members who currently HAVE "New Member":
+#         remove "Onboarding" and "Scheduling" if present
 #
 # Keeps the same slash commands + the same role restrictions.
 
@@ -210,7 +213,7 @@ class NewMemberRoles(commands.Cog):
                 await self._safe_add_roles(member, subsidized, reason=f"{reason} (ensure subsidized)")
                 changed_bits.append(f"added **{SUBSIDIZED_ROLE}**")
 
-            # "make sure ARC Security is not given at that time"
+            # ensure ARC Security is not present at that time
             if security and security in member.roles:
                 await self._safe_remove_roles(member, security, reason=f"{reason} (ensure no security)")
                 changed_bits.append(f"removed **{SECURITY_ROLE}**")
@@ -267,7 +270,6 @@ class NewMemberRoles(commands.Cog):
             data["pending"][str(member.id)] = int(time.time()) + DELAY_SECONDS
             save_data(data)
 
-        # optional log
         await self.log(member.guild, f"⏳ {member.mention} joined. Timer started: **{DELAY_SECONDS // 60} min** → add **{NEW_MEMBER_ROLE}**.")
 
     # ---------- Timer Task: add New Member after 1 hour (Rule 2) ----------
@@ -484,7 +486,7 @@ class NewMemberRoles(commands.Cog):
             except Exception:
                 pass
             await interaction.response.send_message(
-                f"Onboarding role removed from {member.mention}.",
+                f"Onboarding role removed from a member.",
                 ephemeral=True
             )
         else:
@@ -552,6 +554,90 @@ class NewMemberRoles(commands.Cog):
 
         await interaction.followup.send(
             f"✅ Rollback done.\nRemoved: {removed}\nFailed: {failed}\n"
+            f"Details posted in **#{LOG_CHANNEL_NAME}** (if it exists).",
+            ephemeral=True
+        )
+
+    # ---------- NEW: /fix_roles (Genesis only) ----------
+
+    @app_commands.command(
+        name="fix_roles",
+        description="Fix: remove Onboarding/Scheduling from anyone who still has New Member."
+    )
+    @genesis_only()
+    async def fix_roles(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        nm = self.get_role(guild, NEW_MEMBER_ROLE)
+        sched = self.get_role(guild, SCHEDULING_ROLE)
+        onboard = self.get_role(guild, ONBOARDING_ROLE)
+
+        if not nm:
+            await interaction.followup.send(
+                f"Missing role: **{NEW_MEMBER_ROLE}** does not exist.",
+                ephemeral=True
+            )
+            return
+
+        if not sched and not onboard:
+            await interaction.followup.send(
+                "Nothing to do: Scheduling/Onboarding roles are missing.",
+                ephemeral=True
+            )
+            return
+
+        updated = 0
+        removed_roles_total = 0
+        failed = 0
+
+        try:
+            async for member in guild.fetch_members(limit=None):
+                if nm not in member.roles:
+                    continue
+
+                to_remove = []
+                if sched and sched in member.roles:
+                    to_remove.append(sched)
+                if onboard and onboard in member.roles:
+                    to_remove.append(onboard)
+
+                if not to_remove:
+                    continue
+
+                try:
+                    await self._safe_remove_roles(
+                        member, *to_remove,
+                        reason="Fix roles: New Member should not have Onboarding/Scheduling"
+                    )
+                    updated += 1
+                    removed_roles_total += len(to_remove)
+                except (discord.Forbidden, discord.NotFound):
+                    failed += 1
+                except Exception:
+                    failed += 1
+
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ I can't fetch members. Enable **Server Members Intent** and make sure I have permission.",
+                ephemeral=True
+            )
+            return
+
+        await self.log(
+            guild,
+            f"🛠️ **/fix_roles complete**: updated {updated} members (removed {removed_roles_total} roles total). Failed: {failed}."
+        )
+
+        await interaction.followup.send(
+            f"✅ Fix complete.\n"
+            f"Members updated: {updated}\n"
+            f"Roles removed (total): {removed_roles_total}\n"
+            f"Failed: {failed}\n"
             f"Details posted in **#{LOG_CHANNEL_NAME}** (if it exists).",
             ephemeral=True
         )
