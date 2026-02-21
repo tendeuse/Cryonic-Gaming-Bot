@@ -4,6 +4,9 @@ import json
 import sqlite3
 import asyncio
 import secrets
+import threading
+import signal
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -14,6 +17,9 @@ from discord import app_commands
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import PlainTextResponse, JSONResponse
 import uvicorn
+
+log = logging.getLogger("mission_overlay")
+logging.basicConfig(level=logging.INFO)
 
 DB_PATH = "/data/mission_overlay.db"
 MASTER_API_KEY = os.getenv("OVERLAY_API_KEY")  # master key (server secret)
@@ -127,23 +133,63 @@ class MissionOverlayCog(commands.Cog):
         self.app = FastAPI()
         self.app.middleware("http")(self.auth)
 
-        self._uvicorn_server: Optional[uvicorn.Server] = None
-        self._uvicorn_task: Optional[asyncio.Task] = None
+        # Endpoints (make Railway happy)
+        self.app.get("/")(self.root)
+        self.app.get("/health")(self.health)
 
-        # Endpoints
-        self.app.get("/")(self.root)          # ✅ IMPORTANT: Railway often probes "/"
-        self.app.get("/health")(self.health)  # ✅ explicit health endpoint
         self.app.get("/overlay/api/v1/packs")(self.get_packs)
         self.app.get("/overlay/api/v1/missions/{mission_id}")(self.get_mission)
         self.app.post("/overlay/api/v1/pair/exchange")(self.pair_exchange)
 
-        self._uvicorn_task = asyncio.create_task(self.run_api())
+        # Uvicorn server (threaded)
+        self._server: Optional[uvicorn.Server] = None
+        self._server_thread: Optional[threading.Thread] = None
+
+        self._install_signal_logging()
+
+        self._start_uvicorn_thread()
+
+    # -------------------------
+    # SIGNAL LOGGING (so we KNOW why it stops)
+    # -------------------------
+    def _install_signal_logging(self):
+        def _handler(signum, frame):
+            log.warning("Received signal %s - process is being terminated by platform.", signum)
+
+        try:
+            signal.signal(signal.SIGTERM, _handler)
+        except Exception:
+            pass
+
+    # -------------------------
+    # Uvicorn thread
+    # -------------------------
+    def _start_uvicorn_thread(self):
+        def _run():
+            config = uvicorn.Config(
+                self.app,
+                host="0.0.0.0",
+                port=API_PORT,
+                log_level="info",
+                access_log=True,
+                lifespan="on",
+            )
+            server = uvicorn.Server(config)
+            # When embedding, do NOT let uvicorn install signal handlers in this thread
+            server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+            self._server = server
+            log.info("Starting Uvicorn on 0.0.0.0:%s", API_PORT)
+            server.run()
+            log.info("Uvicorn thread exited.")
+
+        t = threading.Thread(target=_run, name="uvicorn-thread", daemon=True)
+        self._server_thread = t
+        t.start()
 
     def cog_unload(self):
-        if self._uvicorn_server is not None:
-            self._uvicorn_server.should_exit = True
-        if self._uvicorn_task is not None and not self._uvicorn_task.done():
-            self._uvicorn_task.cancel()
+        # Request server shutdown
+        if self._server is not None:
+            self._server.should_exit = True
 
     # -------------------------
     # ROOT / HEALTH
@@ -160,7 +206,7 @@ class MissionOverlayCog(commands.Cog):
     async def auth(self, req: Request, call_next):
         path = req.url.path
 
-        # ✅ Allow Railway probes without auth
+        # Allow probes without auth
         if path in ("/", "/health"):
             return await call_next(req)
 
@@ -193,26 +239,6 @@ class MissionOverlayCog(commands.Cog):
         if _is_expired(expires_at):
             return False
         return True
-
-    # -------------------------
-    # FASTAPI SERVER
-    # -------------------------
-    async def run_api(self):
-        config = uvicorn.Config(
-            self.app,
-            host="0.0.0.0",
-            port=API_PORT,
-            loop="asyncio",
-            log_level="info",
-            lifespan="on",
-        )
-        server = uvicorn.Server(config)
-
-        # ✅ Critical when embedding uvicorn inside another app
-        server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
-
-        self._uvicorn_server = server
-        await server.serve()
 
     # -------------------------
     # API ENDPOINTS
@@ -268,6 +294,7 @@ class MissionOverlayCog(commands.Cog):
                 con.commit()
                 raise HTTPException(status_code=410, detail="Code expired")
 
+            # one-time use
             cur.execute("DELETE FROM overlay_pair_codes WHERE code=?", (code,))
 
             token = secrets.token_urlsafe(PAIR_TOKEN_BYTES)
@@ -327,18 +354,6 @@ class MissionOverlayCog(commands.Cog):
         a = secrets.token_hex(3).upper()
         b = secrets.token_hex(3).upper()
         return f"{a}-{b}"
-
-    @app_commands.command(name="mission_list")
-    async def mission_list(self, interaction: discord.Interaction):
-        with sqlite3.connect(DB_PATH) as con:
-            cur = con.cursor()
-            cur.execute("SELECT mission_id FROM missions")
-            rows = cur.fetchall()
-
-        await interaction.response.send_message(
-            "\n".join(r[0] for r in rows) or "No missions yet.",
-            ephemeral=True
-        )
 
 
 async def setup(bot: commands.Bot):
