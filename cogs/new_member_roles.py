@@ -1,3 +1,12 @@
+# cogs/new_member_roles.py
+#
+# New order (per your rules):
+# 1) If "EVE online" role is added for a NEW player -> add "ARC Subsidized" and ensure "ARC Security" is NOT present.
+# 2) On join -> start 1-hour timer -> add "New Member".
+# 3) When "New Member" is removed -> add "Onboarding" + "Scheduling".
+#
+# Keeps the same slash commands + the same role restrictions.
+
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -29,7 +38,7 @@ LOG_CHANNEL_NAME = "roles-log"
 
 DELAY_SECONDS = 3600  # 1 hour
 
-# ✅ Only treat members as "new" for this many days after joining
+# Only treat members as "new" for this many days after joining
 NEW_PLAYER_WINDOW_DAYS = 14
 
 # Throttle between role operations to reduce bursts/timeouts
@@ -83,18 +92,15 @@ async def _retry_discord_http(action_coro_factory,
                 aiohttp.ServerTimeoutError,
                 aiohttp.ClientOSError,
                 asyncio.TimeoutError) as e:
-            # Pure connectivity/timeout issues -> retry
             last_exc = e
         except discord.HTTPException as e:
-            # 5xx or sporadic transport issues can be retried.
-            # 4xx (except 429) are usually permanent (missing perms, missing role/member).
             last_exc = e
+            # retry 5xx, and 429; but treat most 4xx as permanent
             if 400 <= getattr(e, "status", 0) < 500 and getattr(e, "status", 0) != 429:
                 raise
         except (discord.Forbidden, discord.NotFound):
             raise
 
-        # exponential backoff with small jitter
         delay = min(max_delay, base_delay * (2 ** i))
         delay = delay * (0.85 + 0.3 * ((asyncio.get_running_loop().time() % 1.0)))
         await asyncio.sleep(delay)
@@ -135,58 +141,20 @@ class NewMemberRoles(commands.Cog):
                 pass  # never let logging kill the cog
 
     async def _safe_add_roles(self, member: discord.Member, *roles: discord.Role, reason: str):
+        roles = [r for r in roles if r is not None]
         if not roles:
             return
         await _retry_discord_http(lambda: member.add_roles(*roles, reason=reason))
         await asyncio.sleep(ROLE_OP_THROTTLE_SECONDS)
 
     async def _safe_remove_roles(self, member: discord.Member, *roles: discord.Role, reason: str):
+        roles = [r for r in roles if r is not None]
         if not roles:
             return
         await _retry_discord_http(lambda: member.remove_roles(*roles, reason=reason))
         await asyncio.sleep(ROLE_OP_THROTTLE_SECONDS)
 
-    # ---------- Core Rule: Subsidy Swap ----------
-
-    async def enforce_subsidy_swap(self, member: discord.Member, reason: str = "Auto subsidy swap"):
-        """
-        If member has Onboarding + ARC Security, replace ARC Security with ARC Subsidized.
-        Safe to call repeatedly; it only acts when needed.
-        """
-        guild = member.guild
-        onboarding = self.get_role(guild, ONBOARDING_ROLE)
-        security = self.get_role(guild, SECURITY_ROLE)
-        subsidized = self.get_role(guild, SUBSIDIZED_ROLE)
-
-        if not onboarding or not security or not subsidized:
-            return
-
-        if onboarding not in member.roles or security not in member.roles:
-            return
-
-        try:
-            if subsidized not in member.roles:
-                await self._safe_add_roles(member, subsidized, reason=reason)
-
-            if security in member.roles:
-                await self._safe_remove_roles(member, security, reason=reason)
-
-            await self.log(
-                guild,
-                f"🟣 **Subsidy swap**: {member.mention} had **{ONBOARDING_ROLE}** + **{SECURITY_ROLE}** → "
-                f"removed **{SECURITY_ROLE}**, added **{SUBSIDIZED_ROLE}**."
-            )
-        except discord.Forbidden:
-            await self.log(
-                guild,
-                f"⚠️ **Subsidy swap failed** for {member.mention}: missing permissions or role hierarchy issue."
-            )
-        except discord.NotFound:
-            pass
-        except Exception as e:
-            await self.log(guild, f"⚠️ **Subsidy swap error** for {member.mention}: {type(e).__name__}")
-
-    # ---------- ✅ New Player Detection ----------
+    # ---------- New Player Detection ----------
 
     async def is_new_player(self, member: discord.Member) -> bool:
         """
@@ -213,72 +181,61 @@ class NewMemberRoles(commands.Cog):
 
         return False
 
-    # ---------- ✅ EVE Role Flow (NEW PLAYERS ONLY) ----------
+    # ---------- Rule 1: EVE role added (new player) -> Subsidized ON, Security OFF ----------
 
     async def handle_eve_role_added(self, member: discord.Member, reason: str = "EVE role trigger"):
         """
         When NEW player gets EVE online:
-          1) Add ARC Subsidized
-          2) If they have Security OR Subsidized -> add Scheduling + Onboarding
-          3) Run subsidy swap again (Security removed if Onboarding now present)
+          - Add ARC Subsidized (if missing)
+          - Ensure ARC Security is removed (if present)
         """
         guild = member.guild
         eve = self.get_role(guild, EVE_ROLE)
         subsidized = self.get_role(guild, SUBSIDIZED_ROLE)
         security = self.get_role(guild, SECURITY_ROLE)
-        sched = self.get_role(guild, SCHEDULING_ROLE)
-        onboard = self.get_role(guild, ONBOARDING_ROLE)
 
         if not eve or eve not in member.roles:
             return
         if not subsidized:
+            await self.log(guild, f"⚠️ Missing role **{SUBSIDIZED_ROLE}**; cannot apply EVE trigger for {member.mention}.")
             return
 
         if not await self.is_new_player(member):
             return
 
         try:
+            changed_bits = []
+
             if subsidized not in member.roles:
-                await self._safe_add_roles(member, subsidized, reason=reason)
+                await self._safe_add_roles(member, subsidized, reason=f"{reason} (ensure subsidized)")
+                changed_bits.append(f"added **{SUBSIDIZED_ROLE}**")
+
+            # "make sure ARC Security is not given at that time"
+            if security and security in member.roles:
+                await self._safe_remove_roles(member, security, reason=f"{reason} (ensure no security)")
+                changed_bits.append(f"removed **{SECURITY_ROLE}**")
+
+            if changed_bits:
+                await self.log(
+                    guild,
+                    f"🟦 **EVE trigger (new player)**: {member.mention} received **{EVE_ROLE}** → "
+                    + ", ".join(changed_bits) + "."
+                )
+
         except discord.Forbidden:
-            await self.log(guild, f"⚠️ Could not add **{SUBSIDIZED_ROLE}** to {member.mention} (permissions/hierarchy).")
-            return
-        except Exception:
-            await self.log(guild, f"⚠️ Could not add **{SUBSIDIZED_ROLE}** to {member.mention} (transient error).")
-            return
-
-        has_security = (security in member.roles) if security else False
-        has_subsidized = subsidized in member.roles
-
-        roles_to_add = []
-        if has_security or has_subsidized:
-            if sched and sched not in member.roles:
-                roles_to_add.append(sched)
-            if onboard and onboard not in member.roles:
-                roles_to_add.append(onboard)
-
-        if roles_to_add:
-            try:
-                await self._safe_add_roles(member, *roles_to_add, reason=f"{reason} (add Scheduling + Onboarding)")
-            except discord.Forbidden:
-                await self.log(guild, f"⚠️ Could not add Scheduling/Onboarding to {member.mention} (permissions/hierarchy).")
-            except Exception:
-                await self.log(guild, f"⚠️ Could not add Scheduling/Onboarding to {member.mention} (transient error).")
-
-        await self.enforce_subsidy_swap(member, reason=f"{reason} (post-onboarding swap)")
-
-        await self.log(
-            guild,
-            f"🟦 **EVE trigger (new player)**: {member.mention} received **{EVE_ROLE}** → ensured **{SUBSIDIZED_ROLE}**"
-            f"{' + Scheduling + Onboarding' if roles_to_add else ''}."
-        )
+            await self.log(guild, f"⚠️ EVE trigger failed for {member.mention}: missing permissions / role hierarchy.")
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            await self.log(guild, f"⚠️ EVE trigger error for {member.mention}: {type(e).__name__}")
 
     # ---------- Bootstrap Existing Members ----------
 
     async def bootstrap_existing_members(self):
         """
-        Ensure existing members are safely marked to avoid retroactive triggers AND enforce subsidy swap.
-        ✅ Does NOT retro-apply the EVE role rule anymore.
+        Safe boot behavior:
+          - Marks members who already have New Member as rewarded (so removal logic won't re-run unexpectedly).
+          - Does NOT retro-apply EVE trigger (by design).
         """
         await self.bot.wait_until_ready()
 
@@ -297,14 +254,11 @@ class NewMemberRoles(commands.Cog):
                             data["rewarded"].append(uid)
                             changed = True
 
-            for member in guild.members:
-                await self.enforce_subsidy_swap(member, reason="Bootstrap subsidy swap")
-
         if changed:
             async with self._data_lock:
                 save_data(data)
 
-    # ---------- Member Join Handling ----------
+    # ---------- Member Join Handling (Rule 2) ----------
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
@@ -312,6 +266,11 @@ class NewMemberRoles(commands.Cog):
             data = load_data()
             data["pending"][str(member.id)] = int(time.time()) + DELAY_SECONDS
             save_data(data)
+
+        # optional log
+        await self.log(member.guild, f"⏳ {member.mention} joined. Timer started: **{DELAY_SECONDS // 60} min** → add **{NEW_MEMBER_ROLE}**.")
+
+    # ---------- Timer Task: add New Member after 1 hour (Rule 2) ----------
 
     @tasks.loop(seconds=60)
     async def timer_task(self):
@@ -335,14 +294,12 @@ class NewMemberRoles(commands.Cog):
                 role = self.get_role(member.guild, NEW_MEMBER_ROLE)
                 if role and role not in member.roles:
                     try:
-                        await self._safe_add_roles(member, role, reason="Auto New Member role")
-                        await self.log(member.guild, f"🟢 **New Member added** to {member.mention} (auto)")
+                        await self._safe_add_roles(member, role, reason="Auto New Member role (1 hour after join)")
+                        await self.log(member.guild, f"🟢 **New Member added** to {member.mention} (auto after 1 hour).")
                     except discord.Forbidden:
                         await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (permissions/hierarchy).")
                     except Exception:
                         await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (transient error).")
-
-                await self.enforce_subsidy_swap(member, reason="Timer task subsidy swap")
 
             del data["pending"][user_id]
             changed = True
@@ -351,18 +308,18 @@ class NewMemberRoles(commands.Cog):
             async with self._data_lock:
                 save_data(data)
 
-    # ---------- Role Update Handling + Subsidy Swap Hook ----------
+    # ---------- Role Update Handling ----------
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         before_roles = {r.name for r in before.roles}
         after_roles = {r.name for r in after.roles}
 
-        await self.enforce_subsidy_swap(after, reason="Role update subsidy swap")
-
+        # Rule 1: if EVE online is newly added -> Subsidized on, Security off (new players only)
         if (EVE_ROLE in after_roles) and (EVE_ROLE not in before_roles):
             await self.handle_eve_role_added(after, reason="EVE role added")
 
+        # Rule 3: when New Member is removed -> add Scheduling + Onboarding (one-time)
         if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
             actor = "Unknown"
             try:
@@ -377,35 +334,46 @@ class NewMemberRoles(commands.Cog):
 
             await self.log(after.guild, f"🔴 **New Member removed** from {after.mention} by {actor}")
 
-            if SECURITY_ROLE not in before_roles:
-                return
+            uid = str(after.id)
 
             async with self._data_lock:
                 data = load_data()
-                uid = str(after.id)
-                if uid in data["rewarded"]:
-                    return
+                if uid in data.get("rewarded", []):
+                    return  # already processed
 
             sched = self.get_role(after.guild, SCHEDULING_ROLE)
             onboard = self.get_role(after.guild, ONBOARDING_ROLE)
-            roles_to_add = [r for r in (sched, onboard) if r]
+
+            roles_to_add = []
+            if sched and sched not in after.roles:
+                roles_to_add.append(sched)
+            if onboard and onboard not in after.roles:
+                roles_to_add.append(onboard)
 
             if roles_to_add:
                 try:
-                    await self._safe_add_roles(after, *roles_to_add, reason="Security onboarding reward")
+                    await self._safe_add_roles(after, *roles_to_add, reason="New Member removed -> grant Scheduling + Onboarding")
+                    await self.log(
+                        after.guild,
+                        f"🟣 **Post-New Member**: {after.mention} granted "
+                        + " + ".join(f"**{r.name}**" for r in roles_to_add)
+                        + "."
+                    )
                 except discord.Forbidden:
+                    await self.log(after.guild, f"⚠️ Could not add Scheduling/Onboarding to {after.mention} (permissions/hierarchy).")
                     return
                 except Exception:
+                    await self.log(after.guild, f"⚠️ Could not add Scheduling/Onboarding to {after.mention} (transient error).")
                     return
-
-            await self.enforce_subsidy_swap(after, reason="Post-reward subsidy swap")
 
             async with self._data_lock:
                 data = load_data()
-                data["rewarded"].append(uid)
-                save_data(data)
+                data.setdefault("rewarded", [])
+                if uid not in data["rewarded"]:
+                    data["rewarded"].append(uid)
+                    save_data(data)
 
-    # ---------- Permission Check ----------
+    # ---------- Permission Check (UNCHANGED) ----------
 
     def leadership_only():
         allowed = {GENESIS_ROLE, DIRECTOR_ROLE, CEO_ROLE}
@@ -420,7 +388,7 @@ class NewMemberRoles(commands.Cog):
             return any(r.name == GENESIS_ROLE for r in interaction.user.roles)
         return app_commands.check(predicate)
 
-    # ---------- Slash Commands ----------
+    # ---------- Slash Commands (kept + same restrictions) ----------
 
     @app_commands.command(
         name="transfer_to_security",
@@ -449,14 +417,6 @@ class NewMemberRoles(commands.Cog):
                 ephemeral=True
             )
             return
-
-        onboarding = self.get_role(guild, ONBOARDING_ROLE)
-        if onboarding and onboarding in member.roles:
-            await interaction.response.send_message(
-                f"⚠️ {member.mention} still has **{ONBOARDING_ROLE}**. "
-                f"Your auto-rule will re-swap them back to **{SUBSIDIZED_ROLE}** unless you remove **{ONBOARDING_ROLE}** first.",
-                ephemeral=True
-            )
 
         try:
             await self._safe_add_roles(member, security, reason=f"Transfer to security by {interaction.user}")
