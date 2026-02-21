@@ -1,14 +1,12 @@
 # cogs/new_member_roles.py
 #
-# New order (per your rules):
+# Order:
 # 1) If "EVE online" role is added for a NEW player -> add "ARC Subsidized" and ensure "ARC Security" is NOT present.
 # 2) On join -> start 1-hour timer -> add "New Member".
 # 3) When "New Member" is removed -> add "Onboarding" + "Scheduling".
-# + NEW: /fix_roles (Genesis only)
-#     - For members who currently HAVE "New Member":
-#         remove "Onboarding" and "Scheduling" if present
+# + /fix_roles (LEADERSHIP) -> remove Onboarding/Scheduling from anyone who still has New Member.
 #
-# Keeps the same slash commands + the same role restrictions.
+# Keeps the existing slash commands + restrictions; /fix_roles is set to leadership-only.
 
 import discord
 from discord.ext import commands, tasks
@@ -29,10 +27,8 @@ SUBSIDIZED_ROLE = "ARC Subsidized"
 SCHEDULING_ROLE = "Scheduling"
 ONBOARDING_ROLE = "Onboarding"
 
-# Trigger role (selected by new players)
 EVE_ROLE = "EVE online"
 
-# Permission roles
 GENESIS_ROLE = "ARC Genesis"
 DIRECTOR_ROLE = "ARC Security Administration Council"
 CEO_ROLE = "ARC Security Corporation Leader"
@@ -40,11 +36,7 @@ CEO_ROLE = "ARC Security Corporation Leader"
 LOG_CHANNEL_NAME = "roles-log"
 
 DELAY_SECONDS = 3600  # 1 hour
-
-# Only treat members as "new" for this many days after joining
 NEW_PLAYER_WINDOW_DAYS = 14
-
-# Throttle between role operations to reduce bursts/timeouts
 ROLE_OP_THROTTLE_SECONDS = 0.35
 
 
@@ -62,7 +54,6 @@ def load_data():
     with open(DATA_FILE, "r") as f:
         data = json.load(f)
 
-    # backfill keys safely
     if "pending" not in data or not isinstance(data["pending"], dict):
         data["pending"] = {}
     if "rewarded" not in data or not isinstance(data["rewarded"], list):
@@ -82,10 +73,6 @@ async def _retry_discord_http(action_coro_factory,
                              attempts: int = 5,
                              base_delay: float = 2.0,
                              max_delay: float = 45.0):
-    """
-    Retries a Discord HTTP action that can fail due to transient network issues.
-    action_coro_factory: a zero-arg callable that returns an awaitable.
-    """
     last_exc = None
     for i in range(attempts):
         try:
@@ -98,7 +85,6 @@ async def _retry_discord_http(action_coro_factory,
             last_exc = e
         except discord.HTTPException as e:
             last_exc = e
-            # retry 5xx, and 429; but treat most 4xx as permanent
             if 400 <= getattr(e, "status", 0) < 500 and getattr(e, "status", 0) != 429:
                 raise
         except (discord.Forbidden, discord.NotFound):
@@ -141,7 +127,7 @@ class NewMemberRoles(commands.Cog):
             try:
                 await _retry_discord_http(lambda: channel.send(message), attempts=3, base_delay=1.0, max_delay=10.0)
             except Exception:
-                pass  # never let logging kill the cog
+                pass
 
     async def _safe_add_roles(self, member: discord.Member, *roles: discord.Role, reason: str):
         roles = [r for r in roles if r is not None]
@@ -160,12 +146,6 @@ class NewMemberRoles(commands.Cog):
     # ---------- New Player Detection ----------
 
     async def is_new_player(self, member: discord.Member) -> bool:
-        """
-        Treat as new if:
-          - has New Member role, OR
-          - is still in pending (joined within the first hour flow), OR
-          - joined within NEW_PLAYER_WINDOW_DAYS
-        """
         guild = member.guild
         nm_role = self.get_role(guild, NEW_MEMBER_ROLE)
 
@@ -187,11 +167,6 @@ class NewMemberRoles(commands.Cog):
     # ---------- Rule 1: EVE role added (new player) -> Subsidized ON, Security OFF ----------
 
     async def handle_eve_role_added(self, member: discord.Member, reason: str = "EVE role trigger"):
-        """
-        When NEW player gets EVE online:
-          - Add ARC Subsidized (if missing)
-          - Ensure ARC Security is removed (if present)
-        """
         guild = member.guild
         eve = self.get_role(guild, EVE_ROLE)
         subsidized = self.get_role(guild, SUBSIDIZED_ROLE)
@@ -213,7 +188,6 @@ class NewMemberRoles(commands.Cog):
                 await self._safe_add_roles(member, subsidized, reason=f"{reason} (ensure subsidized)")
                 changed_bits.append(f"added **{SUBSIDIZED_ROLE}**")
 
-            # ensure ARC Security is not present at that time
             if security and security in member.roles:
                 await self._safe_remove_roles(member, security, reason=f"{reason} (ensure no security)")
                 changed_bits.append(f"removed **{SECURITY_ROLE}**")
@@ -235,11 +209,6 @@ class NewMemberRoles(commands.Cog):
     # ---------- Bootstrap Existing Members ----------
 
     async def bootstrap_existing_members(self):
-        """
-        Safe boot behavior:
-          - Marks members who already have New Member as rewarded (so removal logic won't re-run unexpectedly).
-          - Does NOT retro-apply EVE trigger (by design).
-        """
         await self.bot.wait_until_ready()
 
         async with self._data_lock:
@@ -317,11 +286,9 @@ class NewMemberRoles(commands.Cog):
         before_roles = {r.name for r in before.roles}
         after_roles = {r.name for r in after.roles}
 
-        # Rule 1: if EVE online is newly added -> Subsidized on, Security off (new players only)
         if (EVE_ROLE in after_roles) and (EVE_ROLE not in before_roles):
             await self.handle_eve_role_added(after, reason="EVE role added")
 
-        # Rule 3: when New Member is removed -> add Scheduling + Onboarding (one-time)
         if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
             actor = "Unknown"
             try:
@@ -337,11 +304,10 @@ class NewMemberRoles(commands.Cog):
             await self.log(after.guild, f"🔴 **New Member removed** from {after.mention} by {actor}")
 
             uid = str(after.id)
-
             async with self._data_lock:
                 data = load_data()
                 if uid in data.get("rewarded", []):
-                    return  # already processed
+                    return
 
             sched = self.get_role(after.guild, SCHEDULING_ROLE)
             onboard = self.get_role(after.guild, ONBOARDING_ROLE)
@@ -375,22 +341,38 @@ class NewMemberRoles(commands.Cog):
                     data["rewarded"].append(uid)
                     save_data(data)
 
-    # ---------- Permission Check (UNCHANGED) ----------
+    # ---------- Permission Check (robust) ----------
 
     def leadership_only():
         allowed = {GENESIS_ROLE, DIRECTOR_ROLE, CEO_ROLE}
         async def predicate(interaction: discord.Interaction):
-            if not interaction.user or not isinstance(interaction.user, discord.Member):
+            member = interaction.user
+            if not isinstance(member, discord.Member):
                 return False
-            return any(r.name in allowed for r in interaction.user.roles)
+            return any(r.name in allowed for r in member.roles)
         return app_commands.check(predicate)
 
     def genesis_only():
         async def predicate(interaction: discord.Interaction):
-            return any(r.name == GENESIS_ROLE for r in interaction.user.roles)
+            member = interaction.user
+            if not isinstance(member, discord.Member):
+                return False
+            return any(r.name == GENESIS_ROLE for r in member.roles)
         return app_commands.check(predicate)
 
-    # ---------- Slash Commands (kept + same restrictions) ----------
+    # Optional: nicer error when a check fails
+    @commands.Cog.listener()
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CheckFailure):
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            except Exception:
+                pass
+
+    # ---------- Slash Commands ----------
 
     @app_commands.command(
         name="transfer_to_security",
@@ -486,7 +468,7 @@ class NewMemberRoles(commands.Cog):
             except Exception:
                 pass
             await interaction.response.send_message(
-                f"Onboarding role removed from a member.",
+                f"Onboarding role removed from {member.mention}.",
                 ephemeral=True
             )
         else:
@@ -558,13 +540,11 @@ class NewMemberRoles(commands.Cog):
             ephemeral=True
         )
 
-    # ---------- NEW: /fix_roles (Genesis only) ----------
-
     @app_commands.command(
         name="fix_roles",
         description="Fix: remove Onboarding/Scheduling from anyone who still has New Member."
     )
-    @genesis_only()
+    @leadership_only()
     async def fix_roles(self, interaction: discord.Interaction):
         guild = interaction.guild
         if not guild:
