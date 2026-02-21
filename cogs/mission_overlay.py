@@ -22,6 +22,10 @@ PAIR_CODE_TTL_MINUTES = int(os.getenv("OVERLAY_PAIR_TTL_MINUTES", "10"))
 PAIR_TOKEN_TTL_DAYS = int(os.getenv("OVERLAY_PAIR_TOKEN_TTL_DAYS", "365"))
 PAIR_TOKEN_BYTES = int(os.getenv("OVERLAY_PAIR_TOKEN_BYTES", "32"))
 
+# IMPORTANT for Railway web services:
+# Railway usually provides PORT; default to 8000 for local.
+API_PORT = int(os.getenv("PORT", os.getenv("OVERLAY_API_PORT", "8000")))
+
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat()
@@ -124,19 +128,33 @@ class MissionOverlayCog(commands.Cog):
         self.app = FastAPI()
         self.app.middleware("http")(self.auth)
 
+        # Keep a server reference so it doesn't die immediately / get GC'd,
+        # and so we can request shutdown cleanly.
+        self._uvicorn_server: Optional[uvicorn.Server] = None
+        self._uvicorn_task: Optional[asyncio.Task] = None
+
         # Endpoints
-        self.app.get("/health")(self.health)  # ✅ health endpoint for Railway
+        self.app.get("/health")(self.health)  # Railway health endpoint
         self.app.get("/overlay/api/v1/packs")(self.get_packs)
         self.app.get("/overlay/api/v1/missions/{mission_id}")(self.get_mission)
         self.app.post("/overlay/api/v1/pair/exchange")(self.pair_exchange)
 
-        asyncio.create_task(self.run_api())
+        # Start server
+        self._uvicorn_task = asyncio.create_task(self.run_api())
+
+    def cog_unload(self):
+        # Request uvicorn shutdown
+        if self._uvicorn_server is not None:
+            self._uvicorn_server.should_exit = True
+
+        # Cancel background task if still running
+        if self._uvicorn_task is not None and not self._uvicorn_task.done():
+            self._uvicorn_task.cancel()
 
     # -------------------------
     # HEALTH
     # -------------------------
     async def health(self):
-        # Keep it dead simple for Railway health checks
         return PlainTextResponse("ok", status_code=200)
 
     # -------------------------
@@ -145,7 +163,7 @@ class MissionOverlayCog(commands.Cog):
     async def auth(self, req: Request, call_next):
         path = req.url.path
 
-        # ✅ Allow Railway health checks without auth
+        # Allow Railway health checks without auth
         if path == "/health":
             return await call_next(req)
 
@@ -161,7 +179,7 @@ class MissionOverlayCog(commands.Cog):
         if token and await self._token_is_valid(token):
             return await call_next(req)
 
-        # ✅ Return a proper response instead of raising (avoids TaskGroup exception bubbling to 500)
+        # Return a proper response (avoid raising inside middleware)
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     async def _token_is_valid(self, token: str) -> bool:
@@ -169,8 +187,10 @@ class MissionOverlayCog(commands.Cog):
             cur = con.cursor()
             cur.execute("SELECT expires_at, revoked FROM overlay_tokens WHERE token=?", (token,))
             row = cur.fetchone()
+
         if not row:
             return False
+
         expires_at, revoked = row[0], row[1]
         if revoked:
             return False
@@ -182,8 +202,24 @@ class MissionOverlayCog(commands.Cog):
     # FASTAPI SERVER
     # -------------------------
     async def run_api(self):
-        config = uvicorn.Config(self.app, host="0.0.0.0", port=8000, loop="asyncio", log_level="info")
-        await uvicorn.Server(config).serve()
+        # Important: when embedding uvicorn, disable its signal handlers.
+        config = uvicorn.Config(
+            self.app,
+            host="0.0.0.0",
+            port=API_PORT,
+            loop="asyncio",
+            log_level="info",
+            # lifespan can sometimes cause odd behavior in embedded servers;
+            # keeping default is fine, but "on" is okay.
+            lifespan="on",
+        )
+        server = uvicorn.Server(config)
+
+        # Disable signal handler installation (critical when running inside another app)
+        server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
+
+        self._uvicorn_server = server
+        await server.serve()
 
     # -------------------------
     # API ENDPOINTS
@@ -300,7 +336,6 @@ class MissionOverlayCog(commands.Cog):
         b = secrets.token_hex(3).upper()
         return f"{a}-{b}"
 
-    # Existing example command you had
     @app_commands.command(name="mission_list")
     async def mission_list(self, interaction: discord.Interaction):
         with sqlite3.connect(DB_PATH) as con:
