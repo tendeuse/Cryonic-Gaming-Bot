@@ -22,8 +22,7 @@ PAIR_CODE_TTL_MINUTES = int(os.getenv("OVERLAY_PAIR_TTL_MINUTES", "10"))
 PAIR_TOKEN_TTL_DAYS = int(os.getenv("OVERLAY_PAIR_TOKEN_TTL_DAYS", "365"))
 PAIR_TOKEN_BYTES = int(os.getenv("OVERLAY_PAIR_TOKEN_BYTES", "32"))
 
-# IMPORTANT for Railway web services:
-# Railway usually provides PORT; default to 8000 for local.
+# Railway injects PORT for web services
 API_PORT = int(os.getenv("PORT", os.getenv("OVERLAY_API_PORT", "8000")))
 
 
@@ -128,32 +127,30 @@ class MissionOverlayCog(commands.Cog):
         self.app = FastAPI()
         self.app.middleware("http")(self.auth)
 
-        # Keep a server reference so it doesn't die immediately / get GC'd,
-        # and so we can request shutdown cleanly.
         self._uvicorn_server: Optional[uvicorn.Server] = None
         self._uvicorn_task: Optional[asyncio.Task] = None
 
         # Endpoints
-        self.app.get("/health")(self.health)  # Railway health endpoint
+        self.app.get("/")(self.root)          # ✅ IMPORTANT: Railway often probes "/"
+        self.app.get("/health")(self.health)  # ✅ explicit health endpoint
         self.app.get("/overlay/api/v1/packs")(self.get_packs)
         self.app.get("/overlay/api/v1/missions/{mission_id}")(self.get_mission)
         self.app.post("/overlay/api/v1/pair/exchange")(self.pair_exchange)
 
-        # Start server
         self._uvicorn_task = asyncio.create_task(self.run_api())
 
     def cog_unload(self):
-        # Request uvicorn shutdown
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
-
-        # Cancel background task if still running
         if self._uvicorn_task is not None and not self._uvicorn_task.done():
             self._uvicorn_task.cancel()
 
     # -------------------------
-    # HEALTH
+    # ROOT / HEALTH
     # -------------------------
+    async def root(self):
+        return PlainTextResponse("overlay api up", status_code=200)
+
     async def health(self):
         return PlainTextResponse("ok", status_code=200)
 
@@ -163,8 +160,8 @@ class MissionOverlayCog(commands.Cog):
     async def auth(self, req: Request, call_next):
         path = req.url.path
 
-        # Allow Railway health checks without auth
-        if path == "/health":
+        # ✅ Allow Railway probes without auth
+        if path in ("/", "/health"):
             return await call_next(req)
 
         # Pair exchange: do auth inside handler (code is the proof).
@@ -179,7 +176,6 @@ class MissionOverlayCog(commands.Cog):
         if token and await self._token_is_valid(token):
             return await call_next(req)
 
-        # Return a proper response (avoid raising inside middleware)
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     async def _token_is_valid(self, token: str) -> bool:
@@ -202,20 +198,17 @@ class MissionOverlayCog(commands.Cog):
     # FASTAPI SERVER
     # -------------------------
     async def run_api(self):
-        # Important: when embedding uvicorn, disable its signal handlers.
         config = uvicorn.Config(
             self.app,
             host="0.0.0.0",
             port=API_PORT,
             loop="asyncio",
             log_level="info",
-            # lifespan can sometimes cause odd behavior in embedded servers;
-            # keeping default is fine, but "on" is okay.
             lifespan="on",
         )
         server = uvicorn.Server(config)
 
-        # Disable signal handler installation (critical when running inside another app)
+        # ✅ Critical when embedding uvicorn inside another app
         server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
 
         self._uvicorn_server = server
@@ -275,7 +268,6 @@ class MissionOverlayCog(commands.Cog):
                 con.commit()
                 raise HTTPException(status_code=410, detail="Code expired")
 
-            # one-time use
             cur.execute("DELETE FROM overlay_pair_codes WHERE code=?", (code,))
 
             token = secrets.token_urlsafe(PAIR_TOKEN_BYTES)
@@ -291,7 +283,7 @@ class MissionOverlayCog(commands.Cog):
         return {"token": token, "expires_at": token_expires_at}
 
     # -------------------------
-    # DISCORD: /overlay group (NO manual add_command)
+    # DISCORD: /overlay group
     # -------------------------
     overlay_group = app_commands.Group(name="overlay", description="Overlay pairing and management")
 
