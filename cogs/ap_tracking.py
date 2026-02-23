@@ -16,6 +16,11 @@
 #   - Leadership bonus triggers only when earner has SECURITY_ROLE
 #   - Unit tier bonuses are disabled in this version
 #
+# PERM POLICY (UPDATED PER YOUR REQUEST):
+#   - This cog WILL create required channels if missing
+#   - It WILL NOT change @everyone permissions on an existing channel (ap-check)
+#   - It WILL ensure the bot has the permissions it needs on ap-check (without touching @everyone)
+#
 import os
 import discord
 import json
@@ -591,33 +596,74 @@ class APTracking(commands.Cog):
         if not self.chat_loop.is_running():
             self.chat_loop.start()
 
-    async def ensure_ap_check_message(self, guild: discord.Guild):
-        channel = discord.utils.get(guild.text_channels, name=AP_CHECK_CHANNEL)
-        if not channel:
-            try:
-                channel = await guild.create_text_channel(AP_CHECK_CHANNEL)
-            except discord.Forbidden:
-                return
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=False
-            )
-        }
-
-        me = guild.me or (guild.get_member(self.bot.user.id) if self.bot.user else None)
-        if me:
-            overwrites[me] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                manage_messages=True
-            )
-
+    async def _patch_channel_overwrites_preserve_everyone(
+        self,
+        channel: discord.TextChannel,
+        guild: discord.Guild,
+        *,
+        bot_overwrite: discord.PermissionOverwrite,
+    ) -> None:
+        """
+        Updates overwrites WITHOUT touching @everyone's overwrite entry.
+        - Preserves current @everyone overwrite exactly as-is (including if absent).
+        - Ensures the bot has required overwrite.
+        """
         try:
-            await channel.edit(overwrites=overwrites)
+            current = dict(channel.overwrites)
+            everyone = guild.default_role
+            everyone_entry = current.get(everyone, None)
+
+            me = guild.me or (guild.get_member(self.bot.user.id) if self.bot.user else None)
+            if me:
+                current[me] = bot_overwrite
+
+            # Restore @everyone exactly
+            if everyone_entry is not None:
+                current[everyone] = everyone_entry
+            else:
+                current.pop(everyone, None)
+
+            await channel.edit(overwrites=current)
         except discord.Forbidden:
             pass
+        except Exception:
+            pass
+
+    async def ensure_ap_check_message(self, guild: discord.Guild):
+        channel = discord.utils.get(guild.text_channels, name=AP_CHECK_CHANNEL)
+
+        bot_overwrite = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_messages=True,
+            read_message_history=True,
+        )
+
+        # Create channel if missing (we apply template on creation only)
+        if not channel:
+            try:
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=False
+                    )
+                }
+                me = guild.me or (guild.get_member(self.bot.user.id) if self.bot.user else None)
+                if me:
+                    overwrites[me] = bot_overwrite
+
+                channel = await guild.create_text_channel(AP_CHECK_CHANNEL, overwrites=overwrites)
+            except discord.Forbidden:
+                return
+            except Exception:
+                return
+        else:
+            # Existing channel: DO NOT touch @everyone perms; just ensure bot perms
+            await self._patch_channel_overwrites_preserve_everyone(
+                channel,
+                guild,
+                bot_overwrite=bot_overwrite,
+            )
 
         data = await load()
         meta = data.setdefault(META_KEY, {})
