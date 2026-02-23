@@ -6,6 +6,10 @@
 # 3) When "New Member" is removed -> add "Onboarding" + "Scheduling".
 # + /fix_roles (LEADERSHIP) -> remove Onboarding/Scheduling from anyone who still has New Member.
 #
+# CHANGE (YOUR REQUEST):
+# - Track/log whenever the "ARC Security" role is GIVEN to a member (any source),
+#   and post it in #roles-log with best-effort actor detection (audit logs).
+#
 # Keeps the existing slash commands + restrictions; /fix_roles is set to leadership-only.
 
 import discord
@@ -105,6 +109,9 @@ class NewMemberRoles(commands.Cog):
         ensure_data()
         self._data_lock = asyncio.Lock()
 
+        # prevents spamming multiple security logs in rapid succession for same user
+        self._security_log_guard: dict[int, float] = {}
+
         self.timer_task.start()
         self._boot_task = bot.loop.create_task(self.bootstrap_existing_members())
 
@@ -142,6 +149,63 @@ class NewMemberRoles(commands.Cog):
             return
         await _retry_discord_http(lambda: member.remove_roles(*roles, reason=reason))
         await asyncio.sleep(ROLE_OP_THROTTLE_SECONDS)
+
+    # ---------- Audit helper for Security role logs ----------
+
+    async def _find_role_update_actor(self, guild: discord.Guild, target_id: int) -> str:
+        """
+        Best-effort actor resolution:
+        - tries audit logs
+        - returns mention or a short fallback string
+        """
+        actor = "Unknown"
+        try:
+            async for entry in guild.audit_logs(limit=8, action=discord.AuditLogAction.member_role_update):
+                if entry.target and getattr(entry.target, "id", None) == target_id:
+                    # Optional: could check entry.created_at recency here; keep it simple/robust.
+                    if entry.user:
+                        actor = entry.user.mention
+                    break
+        except discord.Forbidden:
+            actor = "Audit log unavailable"
+        except Exception:
+            actor = "Audit log error"
+        return actor
+
+    async def _log_security_role_granted(self, before: discord.Member, after: discord.Member):
+        """
+        Logs when ARC Security is newly added.
+        Includes actor if we can infer via audit logs.
+        Includes a small dedupe guard to avoid duplicate logs in a few seconds window.
+        """
+        try:
+            if before.guild.id != after.guild.id:
+                return
+            if before.id != after.id:
+                return
+
+            before_roles = {r.name for r in before.roles}
+            after_roles = {r.name for r in after.roles}
+
+            if SECURITY_ROLE not in after_roles or SECURITY_ROLE in before_roles:
+                return  # not newly granted
+
+            now = time.time()
+            last = self._security_log_guard.get(after.id, 0.0)
+            if (now - last) < 5.0:
+                return
+            self._security_log_guard[after.id] = now
+
+            actor = await self._find_role_update_actor(after.guild, after.id)
+
+            await self.log(
+                after.guild,
+                f"🛡️ **{SECURITY_ROLE} granted**: {after.mention} received **{SECURITY_ROLE}**"
+                + (f" (by {actor})." if actor else ".")
+            )
+        except Exception:
+            # never break other role flows
+            return
 
     # ---------- New Player Detection ----------
 
@@ -285,6 +349,10 @@ class NewMemberRoles(commands.Cog):
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         before_roles = {r.name for r in before.roles}
         after_roles = {r.name for r in after.roles}
+
+        # NEW: log when ARC Security is granted
+        if (SECURITY_ROLE in after_roles) and (SECURITY_ROLE not in before_roles):
+            await self._log_security_role_granted(before, after)
 
         if (EVE_ROLE in after_roles) and (EVE_ROLE not in before_roles):
             await self.handle_eve_role_added(after, reason="EVE role added")
