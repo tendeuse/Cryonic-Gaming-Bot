@@ -1,19 +1,14 @@
 # cogs/shop.py
 #
-# MULTI-SHOP VERSION (Main + HS)
-# - Keeps your original goals (no purge, persistent views, atomic JSON, minimal edits)
-# - Adds a SECOND, SEPARATE shop:
-#     Shop display:     ap-eve-shop-hs
-#     Shop controls:    ap-shop-access-hs
-#
-# IMPORTANT:
-# - This is a truly separate inventory (separate shop_hs.json)
-# - Custom IDs are namespaced per shop (main vs hs) to avoid collisions.
+# MULTI-SHOP VERSION (Main + HS) — PERM-SAFE FOR @everyone
+# - Ensures required channels exist
+# - DOES NOT modify @everyone overwrites on existing channels
+# - Still ensures the bot + allowed staff roles can access/manage where needed
+# - Adds separate HS orders channel: ap-shop-orders-hs (same behavior as main orders channel)
 #
 # Channels:
-#   MAIN: ap-eve-shop            (display)  | ap-shop-access            (controls)
-#   HS:   ap-eve-shop-hs         (display)  | ap-shop-access-hs         (controls)
-# Orders (unchanged): ap-shop-orders
+#   MAIN: ap-eve-shop            (display)  | ap-shop-access            (controls) | ap-shop-orders
+#   HS:   ap-eve-shop-hs         (display)  | ap-shop-access-hs         (controls) | ap-shop-orders-hs
 
 import os
 import discord
@@ -52,7 +47,10 @@ for p in list(SHOP_FILES.values()) + [AP_FILE, ORDERS_FILE] + list(INDEX_FILES.v
 # ----------------------------
 # Channel config
 # ----------------------------
-ORDER_LOG_CHANNEL = "ap-shop-orders"
+ORDER_LOG_CHANNELS = {
+    "main": "ap-shop-orders",
+    "hs": "ap-shop-orders-hs",
+}
 
 SHOPS = {
     "main": {
@@ -188,6 +186,10 @@ def is_manager(member: discord.abc.User | discord.Member) -> bool:
     return any(r.name in ALLOWED_ROLES for r in member.roles)
 
 
+def get_order_channel_name(shop_key: str) -> str:
+    return ORDER_LOG_CHANNELS.get(shop_key, ORDER_LOG_CHANNELS["main"])
+
+
 # ----------------------------
 # Embed builders
 # ----------------------------
@@ -259,7 +261,6 @@ async def rebuild_index_from_channels(guild: discord.Guild, shop_key: str) -> No
                     continue
                 e = msg.embeds[0]
                 footer_text = (e.footer.text or "") if e.footer else ""
-                # Footer contains Cryonic Gaming Shop(shop_key) | id:xxxx
                 if f"Cryonic Gaming Shop({shop_key})" not in footer_text or "id:" not in footer_text:
                     continue
                 item_id = footer_text.split("id:", 1)[1].strip()
@@ -508,12 +509,13 @@ class BuyItemModal(discord.ui.Modal):
 
             # Create order record
             order_id = uuid.uuid4().hex[:10]
+            channel_name = get_order_channel_name(self.shop_key)
             order = {
                 "order_id": order_id,
                 "status": "PENDING",
                 "created_at": utc_iso(),
                 "guild_id": str(interaction.guild.id) if interaction.guild else None,
-                "channel_name": ORDER_LOG_CHANNEL,
+                "channel_name": channel_name,
                 "message_id": None,
                 "buyer_id": str(interaction.user.id),
                 "buyer_tag": str(interaction.user),
@@ -534,9 +536,9 @@ class BuyItemModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Guild context missing.", ephemeral=True)
             return
 
-        order_ch = discord.utils.get(interaction.guild.text_channels, name=ORDER_LOG_CHANNEL)
+        order_ch = discord.utils.get(interaction.guild.text_channels, name=channel_name)
         if not order_ch:
-            await safe_reply(interaction, "❌ Order channel not found. Contact staff.", ephemeral=True)
+            await safe_reply(interaction, f"❌ Order channel `{channel_name}` not found. Contact staff.", ephemeral=True)
             return
 
         # Ensure persistent order view exists for this order
@@ -793,7 +795,7 @@ class ShopCog(commands.Cog):
         Edits ONLY if needed:
         - content differs (when provided)
         - embed differs (when provided)
-        View edits are skipped by default because persistent views are registered on startup.
+        View edits are included here because we attach Buy/Manage views per message.
         Also includes a GLOBAL spacing between edits when an edit is necessary.
         """
         try:
@@ -830,11 +832,10 @@ class ShopCog(commands.Cog):
         await asyncio.sleep(1.0)
 
         # Register persistent views
-        # - management views (one per shop)
         for shop_key in SHOPS.keys():
             self.bot.add_view(ShopManagementView(self, shop_key))
 
-        # - order views
+        # Order views
         self.restore_order_views()
 
         for guild in self.bot.guilds:
@@ -844,7 +845,6 @@ class ShopCog(commands.Cog):
 
             await self.ensure_channels(guild)
 
-            # recover indexes + sync both shops
             for shop_key in SHOPS.keys():
                 try:
                     idx = load_index(shop_key)
@@ -871,10 +871,6 @@ class ShopCog(commands.Cog):
                 return
 
             parts = custom_id.split(":")
-            # Expected:
-            # shop:buy:<shop_key>:<item_id>
-            # shop:add_new:<shop_key>
-            # shop:stock_add:<shop_key>:<item_id> etc
             if len(parts) < 3:
                 return
 
@@ -966,74 +962,156 @@ class ShopCog(commands.Cog):
         self._registered_order_views.add(order_id)
 
     # ----------------------------
-    # Channel setup
+    # Channel setup (PERM-SAFE FOR @everyone)
     # ----------------------------
+    async def _patch_channel_overwrites_preserve_everyone(
+        self,
+        channel: discord.TextChannel,
+        guild: discord.Guild,
+        *,
+        bot_overwrite: discord.PermissionOverwrite | None,
+        role_overwrites: dict[discord.Role, discord.PermissionOverwrite] | None = None,
+    ) -> None:
+        """
+        Updates overwrites WITHOUT touching @everyone's overwrite entry.
+        - Preserves the current @everyone overwrite exactly as-is (including if absent).
+        - Adds/updates the bot overwrite (if bot_overwrite is provided).
+        - Adds/updates overwrites for roles in role_overwrites (if provided).
+        """
+        try:
+            current = dict(channel.overwrites)  # Role/Member -> PermissionOverwrite
+            everyone = guild.default_role
+
+            # Preserve @everyone entry if present
+            everyone_entry = current.get(everyone, None)
+
+            if bot_overwrite is not None:
+                me = guild.me  # type: ignore
+                if me:
+                    current[me] = bot_overwrite
+
+            if role_overwrites:
+                for role, ow in role_overwrites.items():
+                    current[role] = ow
+
+            # Re-apply preserved @everyone exactly (even if we didn't touch it)
+            if everyone_entry is not None:
+                current[everyone] = everyone_entry
+            else:
+                current.pop(everyone, None)
+
+            await channel.edit(overwrites=current)
+        except discord.Forbidden:
+            pass
+        except Exception:
+            pass
+
     async def ensure_channels(self, guild: discord.Guild):
         everyone = guild.default_role
         me = guild.me  # type: ignore
 
-        # Orders channel (unchanged)
-        orders_overwrites = {
-            everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
-        }
+        bot_manage = None
         if me:
-            orders_overwrites[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
+            bot_manage = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_messages=True,
+                read_message_history=True
             )
 
-        # Create/update orders channel
-        orders_ch = discord.utils.get(guild.text_channels, name=ORDER_LOG_CHANNEL)
-        if not orders_ch:
-            try:
-                await guild.create_text_channel(ORDER_LOG_CHANNEL, overwrites=orders_overwrites)
-            except discord.Forbidden:
-                pass
-        else:
-            try:
-                await orders_ch.edit(overwrites=orders_overwrites)
-            except discord.Forbidden:
-                pass
+        # ---- Orders channels (main + hs) ----
+        for order_name in set(ORDER_LOG_CHANNELS.values()):
+            orders_ch = discord.utils.get(guild.text_channels, name=order_name)
+            if not orders_ch:
+                # On creation we apply the "same options" template (read-only for everyone),
+                # but after that we never modify @everyone again.
+                overwrites = {
+                    everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
+                }
+                if me:
+                    overwrites[me] = bot_manage  # type: ignore
+                try:
+                    await guild.create_text_channel(order_name, overwrites=overwrites)
+                except discord.Forbidden:
+                    pass
+                except Exception:
+                    pass
+            else:
+                # Existing channel: preserve @everyone; ensure bot can operate
+                if bot_manage:
+                    await self._patch_channel_overwrites_preserve_everyone(
+                        orders_ch,
+                        guild,
+                        bot_overwrite=bot_manage,
+                        role_overwrites=None
+                    )
 
-        # Per-shop channels
+        # ---- Per-shop channels (display + access) ----
         for shop_key, cfg in SHOPS.items():
             shop_name = cfg["shop_channel"]
             access_name = cfg["access_channel"]
 
-            shop_overwrites = {
-                everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
-            }
-            if me:
-                shop_overwrites[me] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
-                )
+            # Display channel template on create only (read-only for everyone)
+            shop_ch = discord.utils.get(guild.text_channels, name=shop_name)
+            if not shop_ch:
+                overwrites = {
+                    everyone: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
+                }
+                if me:
+                    overwrites[me] = bot_manage  # type: ignore
+                try:
+                    await guild.create_text_channel(shop_name, overwrites=overwrites)
+                except discord.Forbidden:
+                    pass
+                except Exception:
+                    pass
+            else:
+                # Existing: preserve @everyone; ensure bot can post/edit
+                if bot_manage:
+                    await self._patch_channel_overwrites_preserve_everyone(
+                        shop_ch,
+                        guild,
+                        bot_overwrite=bot_manage,
+                        role_overwrites=None
+                    )
 
-            access_overwrites = {
-                everyone: discord.PermissionOverwrite(view_channel=False),
-            }
-            if me:
-                access_overwrites[me] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, manage_messages=True, read_message_history=True
-                )
-            for role_name in ALLOWED_ROLES:
-                role = discord.utils.get(guild.roles, name=role_name)
-                if role:
-                    access_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-            for name, overwrites in (
-                (shop_name, shop_overwrites),
-                (access_name, access_overwrites),
-            ):
-                ch = discord.utils.get(guild.text_channels, name=name)
-                if not ch:
-                    try:
-                        await guild.create_text_channel(name, overwrites=overwrites)
-                    except discord.Forbidden:
-                        pass
-                else:
-                    try:
-                        await ch.edit(overwrites=overwrites)
-                    except discord.Forbidden:
-                        pass
+            # Access channel template on create only (hidden from everyone)
+            access_ch = discord.utils.get(guild.text_channels, name=access_name)
+            if not access_ch:
+                overwrites = {
+                    everyone: discord.PermissionOverwrite(view_channel=False),
+                }
+                if me:
+                    overwrites[me] = bot_manage  # type: ignore
+                # allow staff roles
+                for role_name in ALLOWED_ROLES:
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    if role:
+                        overwrites[role] = discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True, read_message_history=True
+                        )
+                try:
+                    await guild.create_text_channel(access_name, overwrites=overwrites)
+                except discord.Forbidden:
+                    pass
+                except Exception:
+                    pass
+            else:
+                # Existing: preserve @everyone; ensure bot + staff roles can access
+                role_ows: dict[discord.Role, discord.PermissionOverwrite] = {}
+                for role_name in ALLOWED_ROLES:
+                    role = discord.utils.get(guild.roles, name=role_name)
+                    if role:
+                        role_ows[role] = discord.PermissionOverwrite(
+                            view_channel=True, send_messages=True, read_message_history=True
+                        )
+                if bot_manage:
+                    await self._patch_channel_overwrites_preserve_everyone(
+                        access_ch,
+                        guild,
+                        bot_overwrite=bot_manage,
+                        role_overwrites=role_ows
+                    )
 
     # ----------------------------
     # Shop message sync (NO PURGE) + NO EDIT unless needed
@@ -1182,13 +1260,14 @@ class ShopCog(commands.Cog):
             return
 
     async def refresh_order_message(self, guild: discord.Guild, order_id: str):
-        orders_ch = discord.utils.get(guild.text_channels, name=ORDER_LOG_CHANNEL)
-        if not orders_ch:
-            return
-
         data = load_orders()
         o = (data.get("orders") or {}).get(order_id)
         if not o or not o.get("message_id"):
+            return
+
+        ch_name = str(o.get("channel_name") or get_order_channel_name(str(o.get("shop_key") or "main")))
+        orders_ch = discord.utils.get(guild.text_channels, name=ch_name)
+        if not orders_ch:
             return
 
         try:
@@ -1212,6 +1291,7 @@ class ShopCog(commands.Cog):
         if not interaction.guild:
             await safe_reply(interaction, "❌ Must be used in a server.", ephemeral=True)
             return
+
         await self.ensure_channels(interaction.guild)
 
         for shop_key in SHOPS.keys():
