@@ -21,6 +21,12 @@
 #   - It WILL NOT change @everyone permissions on an existing channel (ap-check)
 #   - It WILL ensure the bot has the permissions it needs on ap-check (without touching @everyone)
 #
+# EVENT PRESENCE BOOSTS (NEW):
+#   - Reads /data/ap_boosts.json (via BOOSTS_FILE)
+#   - When a participant earns AP, any active boost entries grant an additional % of base_amount
+#     to a beneficiary (event creator) for the next 24 hours.
+#   - Boosts DO NOT stack: duplicate beneficiaries are deduped; only one award per beneficiary applies.
+
 import os
 import discord
 import json
@@ -47,6 +53,9 @@ EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 # Hierarchy data (owned by arc_hierarchy.py) - still present for compatibility
 HIERARCHY_FILE = PERSIST_ROOT / "arc_hierarchy.json"
 HIERARCHY_LOG_CH = "arc-hierarchy-log"
+
+# Event Presence Boost File (used by event_creator.py)
+BOOSTS_FILE = PERSIST_ROOT / "ap_boosts.json"
 
 # =====================
 # CONFIG
@@ -283,6 +292,127 @@ async def log_ap_distribution_embed(
         pass
 
 # -------------------------
+# Event Presence Boost Logic (NEW)
+# -------------------------
+
+def _load_boosts_file() -> Dict[str, Any]:
+    """
+    File schema:
+    {
+      "participants": {
+        "<participant_id>": [
+          {"beneficiary": <creator_id>, "percent": 0.10, "expires": <unix>, "event_id": "..."}
+        ]
+      }
+    }
+    """
+    if not BOOSTS_FILE.exists():
+        return {"participants": {}}
+    try:
+        txt = BOOSTS_FILE.read_text(encoding="utf-8").strip()
+        if not txt:
+            return {"participants": {}}
+        data = json.loads(txt)
+        if not isinstance(data, dict):
+            return {"participants": {}}
+        data.setdefault("participants", {})
+        if not isinstance(data["participants"], dict):
+            data["participants"] = {}
+        return data
+    except Exception:
+        return {"participants": {}}
+
+def _save_boosts_file(data: Dict[str, Any]) -> None:
+    try:
+        BOOSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BOOSTS_FILE.with_suffix(BOOSTS_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        tmp.replace(BOOSTS_FILE)
+    except Exception:
+        pass
+
+def _apply_participant_boosts(
+    boosts_data: Dict[str, Any],
+    *,
+    participant_id: int,
+    base_amount: float,
+) -> Tuple[List[Tuple[int, float, str]], bool]:
+    """
+    Returns:
+      awards: [(beneficiary_id, bonus_amount, event_id), ...]
+      changed: whether boosts_data should be saved (expired/invalid pruned, deduped)
+    Defensive no-stacking:
+      - If multiple active entries exist for same beneficiary, only one award is applied.
+    """
+    changed = False
+    now = int(datetime.datetime.utcnow().timestamp())
+
+    participants = boosts_data.get("participants", {})
+    if not isinstance(participants, dict):
+        return ([], False)
+
+    key = str(participant_id)
+    entries = participants.get(key, [])
+    if not isinstance(entries, list) or not entries:
+        return ([], False)
+
+    kept: List[Dict[str, Any]] = []
+    best_by_beneficiary: Dict[int, Dict[str, Any]] = {}
+
+    # prune + dedupe
+    for entry in entries:
+        if not isinstance(entry, dict):
+            changed = True
+            continue
+
+        expires = int(entry.get("expires", 0) or 0)
+        if expires <= now:
+            changed = True
+            continue
+
+        beneficiary = entry.get("beneficiary")
+        percent = float(entry.get("percent", 0) or 0)
+        event_id = str(entry.get("event_id", "") or "")
+
+        if not isinstance(beneficiary, int) or percent <= 0:
+            changed = True
+            continue
+
+        # dedupe per beneficiary (keep the one with latest expiry)
+        prev = best_by_beneficiary.get(beneficiary)
+        if prev is None or int(prev.get("expires", 0) or 0) < expires:
+            best_by_beneficiary[beneficiary] = {
+                "beneficiary": beneficiary,
+                "percent": percent,
+                "expires": expires,
+                "event_id": event_id,
+            }
+        else:
+            changed = True  # dropped a duplicate
+
+    kept = list(best_by_beneficiary.values())
+
+    # if we modified list shape, mark changed
+    if len(kept) != len(entries):
+        changed = True
+
+    # Write back deduped kept list
+    participants[key] = kept
+    boosts_data["participants"] = participants
+
+    awards: List[Tuple[int, float, str]] = []
+    if base_amount > 0:
+        for entry in kept:
+            beneficiary = int(entry["beneficiary"])
+            percent = float(entry.get("percent", 0) or 0)
+            event_id = str(entry.get("event_id", "") or "")
+            bonus = float(base_amount) * percent
+            if bonus > 0:
+                awards.append((beneficiary, bonus, event_id))
+
+    return (awards, changed)
+
+# -------------------------
 # Bonus Logic (UPDATED)
 # -------------------------
 def ceo_ids(guild: discord.Guild) -> List[int]:
@@ -358,6 +488,22 @@ async def award_ap_with_bonuses(
                 await add_ap_raw(data, uid, directors_each)
             mention_ids.extend(directors_targets)
 
+    # 3) Event presence boosts (participant -> creator % for 24h)
+    boosts = _load_boosts_file()
+    boost_awards, boosts_changed = _apply_participant_boosts(
+        boosts,
+        participant_id=earner.id,
+        base_amount=float(base_amount),
+    )
+
+    if boost_awards:
+        for beneficiary_id, bonus_amount, _event_id in boost_awards:
+            await add_ap_raw(data, beneficiary_id, float(bonus_amount))
+            mention_ids.append(beneficiary_id)
+
+    if boosts_changed:
+        _save_boosts_file(boosts)
+
     await save(data)
 
     # Distribution embed (base award)
@@ -397,6 +543,16 @@ async def award_ap_with_bonuses(
                 )
             else:
                 lines.append("Directors bonus: none (no eligible Directors found).")
+
+        # Event boost logging
+        if boost_awards:
+            for beneficiary_id, bonus_amount, event_id in boost_awards:
+                bmem = guild.get_member(beneficiary_id)
+                who = bmem.mention if bmem else f"`{beneficiary_id}`"
+                lines.append(
+                    f"Event boost: {who} received **+{bonus_amount:.2f} AP** "
+                    f"(from participant presence confirmation; event `{event_id}`; non-stacking; time-extended only)."
+                )
 
         await log_hierarchy_ap(guild, "\n".join(lines), mention_ids)
 
