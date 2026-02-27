@@ -57,6 +57,15 @@ TYPE_CACHE_TTL = 24 * 3600
 PRICE_CACHE_TTL = 15 * 60
 CHAR_NAME_CACHE_TTL = 24 * 3600
 
+# HTTP timeouts (client-side)
+HTTP_TIMEOUT_TOTAL = int(os.getenv("BUYBACK_HTTP_TIMEOUT_TOTAL", "60"))
+HTTP_TIMEOUT_CONNECT = int(os.getenv("BUYBACK_HTTP_TIMEOUT_CONNECT", "15"))
+HTTP_TIMEOUT_SOCK_READ = int(os.getenv("BUYBACK_HTTP_TIMEOUT_SOCK_READ", "60"))
+
+# Retry config for transient ESI errors
+ESI_MAX_ATTEMPTS = int(os.getenv("BUYBACK_ESI_MAX_ATTEMPTS", "5"))
+ESI_BACKOFF_CAP_SECONDS = int(os.getenv("BUYBACK_ESI_BACKOFF_CAP", "10"))
+
 # =========================
 # ORE -> COMPRESSED (name-based)
 # =========================
@@ -213,13 +222,41 @@ class EveOAuth:
 # ESI CLIENT
 # =========================
 class EsiClient:
-    async def _get(self, session: aiohttp.ClientSession, url: str, token: str, params: Optional[dict] = None):
+    async def _get(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        token: str,
+        params: Optional[dict] = None,
+        *,
+        max_attempts: int = ESI_MAX_ATTEMPTS,
+    ):
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ESI_UA}
-        async with session.get(url, headers=headers, params=params) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"ESI GET failed {resp.status} {url} :: {text}")
-            return await resp.json(), resp.headers
+        transient_statuses = {502, 503, 504, 520, 521, 522}
+
+        last_err: Optional[str] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with session.get(url, headers=headers, params=params) as resp:
+                    text = await resp.text()
+
+                    if resp.status == 200:
+                        return await resp.json(), resp.headers
+
+                    if resp.status in transient_statuses:
+                        last_err = f"{resp.status} {text}"
+                    else:
+                        raise RuntimeError(f"ESI GET failed {resp.status} {url} :: {text}")
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_err = repr(e)
+
+            if attempt < max_attempts:
+                delay = min(2 ** (attempt - 1), ESI_BACKOFF_CAP_SECONDS)  # 1,2,4,8,cap...
+                await asyncio.sleep(delay)
+
+        raise RuntimeError(f"ESI GET failed after {max_attempts} attempts {url} :: {last_err}")
 
     async def get_all_character_contracts(self, session: aiohttp.ClientSession, token: str) -> List[dict]:
         all_rows: List[dict] = []
@@ -300,7 +337,12 @@ class EsiClient:
         best = 0.0
         page = 1
         while True:
-            data, headers = await self._get(session, url, token, params={"order_type": "buy", "type_id": type_id, "page": page})
+            data, headers = await self._get(
+                session,
+                url,
+                token,
+                params={"order_type": "buy", "type_id": type_id, "page": page},
+            )
             if not data:
                 break
 
@@ -381,7 +423,6 @@ class PaidButton(discord.ui.DynamicItem[discord.ui.Button], template=r"buyback:p
             f"At: `{_utc_iso(paid['paid_at'])}`"
         )
 
-        # Rebuild embed + replace/add Status field (discord.py has no discord.EmbedField)
         updated = False
         new_emb = discord.Embed(
             title=emb.title,
@@ -441,6 +482,13 @@ class BuybackContracts(commands.Cog):
         # Register dynamic item for persistence after restarts
         bot.add_dynamic_items(PaidButton)
 
+    def _make_session_timeout(self) -> aiohttp.ClientTimeout:
+        return aiohttp.ClientTimeout(
+            total=HTTP_TIMEOUT_TOTAL,
+            connect=HTTP_TIMEOUT_CONNECT,
+            sock_read=HTTP_TIMEOUT_SOCK_READ,
+        )
+
     async def _get_target_channel(self) -> Optional[discord.TextChannel]:
         for g in self.bot.guilds:
             ch = discord.utils.get(g.text_channels, name=BUYBACK_CHANNEL_NAME)
@@ -495,6 +543,10 @@ class BuybackContracts(commands.Cog):
             raw_items = await self.esi.get_character_contract_items(session, token, contract_id)
             included = [i for i in raw_items if bool(i.get("is_included", True))]
 
+            # per-appraisal in-memory caches to reduce repeated lookups
+            name_mem: Dict[int, str] = {}
+            price_mem: Dict[int, float] = {}
+
             lines = []
             total = 0.0
 
@@ -502,13 +554,19 @@ class BuybackContracts(commands.Cog):
                 type_id = int(it["type_id"])
                 qty = int(it.get("quantity", 0))
 
-                name = await self.esi.get_type_name(session, token, conn, type_id)
+                if type_id in name_mem:
+                    name = name_mem[type_id]
+                else:
+                    name = await self.esi.get_type_name(session, token, conn, type_id)
+                    name_mem[type_id] = name
+
                 priced_name = self._compress_if_ore_name(name)
 
                 price_type_id = type_id
                 if priced_name != name:
                     ids_url = f"{ESI_BASE}/universe/ids/"
                     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ESI_UA}
+                    # NOTE: this POST can also fail transiently; keep it simple (rare) and allow bubble-up
                     async with session.post(ids_url, headers=headers, json=[priced_name]) as resp:
                         txt = await resp.text()
                         if resp.status != 200:
@@ -518,7 +576,12 @@ class BuybackContracts(commands.Cog):
                         if inv_types:
                             price_type_id = int(inv_types[0]["id"])
 
-                jita_buy = await self.esi.get_jita_buy_price(session, token, conn, price_type_id)
+                if price_type_id in price_mem:
+                    jita_buy = price_mem[price_type_id]
+                else:
+                    jita_buy = await self.esi.get_jita_buy_price(session, token, conn, price_type_id)
+                    price_mem[price_type_id] = jita_buy
+
                 unit_payout = jita_buy * PAYOUT_MULTIPLIER
                 line_total = unit_payout * qty
 
@@ -637,7 +700,8 @@ class BuybackContracts(commands.Cog):
                 return
 
             try:
-                async with aiohttp.ClientSession() as session:
+                timeout = self._make_session_timeout()
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     token = await self.oauth.get_access_token(session)
                     all_contracts = await self.esi.get_all_character_contracts(session, token)
                     matches = [c for c in all_contracts if self._contract_matches(c)]
@@ -715,7 +779,8 @@ class BuybackContracts(commands.Cog):
                 return
 
             try:
-                async with aiohttp.ClientSession() as session:
+                timeout = self._make_session_timeout()
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     token = await self.oauth.get_access_token(session)
 
                     # Find contract row (for issuer/status/type). If not found, we can still try items.
