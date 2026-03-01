@@ -13,21 +13,18 @@
 #
 # Leadership is shared across both corps (CEO + Directors + ranks).
 #
-# Flowchart format (as you requested):
-#   ARC Corporate Flowchart (Compact)
-#   Total Members: N
-#   LEADERSHIP (All Corps)
-#   - CEO(s): list of names + [SEC]/[SUB]/[—]
-#   - Directors Council: list
-#   - Generals: list
-#   - Commanders: list
-#   - Officers: list
-#   CORP (Summary): totals only
+# RANKS (UPDATED):
+#   - ARC General
+#   - ARC Commander
+#   - ARC Lieutenant        (was "ARC Officer" role)
+#   - ARC Petty Officer     (NEW: below Lieutenant, above line members)
+#   - Line members are "security" rank (no rank-role; corp role covers membership)
 #
-# NOTE:
-# - Lowest rank (Security) has NO rank role; corp role covers membership.
-# - Rank roles: ARC Officer / ARC Commander / ARC General
-# - Directors/CEO are determined by their roles (protected).
+# IMPORTANT (UPDATED BEHAVIOR):
+#   - On promotion: bot ADDS the new rank role but DOES NOT remove lower rank roles.
+#   - On demotion: bot removes ONLY roles ABOVE the target rank (so no higher perms linger),
+#                  but keeps lower rank roles unless manually removed.
+#   - Legacy role "ARC Officer" is renamed to "ARC Lieutenant" if possible; otherwise removed if found.
 #
 # Commands:
 #   /arc flowchart_refresh
@@ -69,7 +66,13 @@ DIRECTOR_ROLE = "ARC Security Administration Council"   # PROTECTED: NEVER REMOV
 
 GENERAL_ROLE = "ARC General"
 COMMANDER_ROLE = "ARC Commander"
-OFFICER_ROLE = "ARC Officer"
+
+# UPDATED ROLE NAMES
+LIEUTENANT_ROLE = "ARC Lieutenant"          # renamed from "ARC Officer"
+PETTY_OFFICER_ROLE = "ARC Petty Officer"    # NEW
+
+# Legacy role name (we will try to rename it, and also strip it if found)
+LEGACY_OFFICER_ROLE = "ARC Officer"
 
 # =====================
 # ROLES (CORPORATIONS)
@@ -85,10 +88,11 @@ FLOWCHART_CH = "corp-flowchart"
 DIRECTIVES_CH = "arc-directives"
 
 # =====================
-# RANKS
+# RANKS (UPDATED)
 # =====================
 RANK_SECURITY = "security"
-RANK_OFFICER = "officer"
+RANK_PETTY_OFFICER = "petty_officer"
+RANK_LIEUTENANT = "lieutenant"
 RANK_COMMANDER = "commander"
 RANK_GENERAL = "general"
 RANK_DIRECTOR = "director"
@@ -97,7 +101,8 @@ RANK_CEO = "ceo"
 # Security rank has NO rank-role (corp role handles membership)
 ROLE_BY_RANK = {
     RANK_SECURITY: None,
-    RANK_OFFICER: OFFICER_ROLE,
+    RANK_PETTY_OFFICER: PETTY_OFFICER_ROLE,
+    RANK_LIEUTENANT: LIEUTENANT_ROLE,
     RANK_COMMANDER: COMMANDER_ROLE,
     RANK_GENERAL: GENERAL_ROLE,
     RANK_DIRECTOR: DIRECTOR_ROLE,
@@ -105,16 +110,18 @@ ROLE_BY_RANK = {
 }
 
 PROMOTE_TO = {
-    RANK_SECURITY: RANK_OFFICER,
-    RANK_OFFICER: RANK_COMMANDER,
+    RANK_SECURITY: RANK_PETTY_OFFICER,
+    RANK_PETTY_OFFICER: RANK_LIEUTENANT,
+    RANK_LIEUTENANT: RANK_COMMANDER,
     RANK_COMMANDER: RANK_GENERAL,
     RANK_GENERAL: None,
 }
 
 DEMOTE_TO = {
     RANK_GENERAL: RANK_COMMANDER,
-    RANK_COMMANDER: RANK_OFFICER,
-    RANK_OFFICER: RANK_SECURITY,
+    RANK_COMMANDER: RANK_LIEUTENANT,
+    RANK_LIEUTENANT: RANK_PETTY_OFFICER,
+    RANK_PETTY_OFFICER: RANK_SECURITY,
 }
 
 # =====================
@@ -172,6 +179,13 @@ def _migrate_legacy_units_to_corps(data: Dict[str, Any]) -> Dict[str, Any]:
                 rec["rank"] = RANK_SECURITY
             if not isinstance(rec.get("corp_key"), str):
                 rec["corp_key"] = CORP_UNASSIGNED_KEY
+
+        # --- Rank migration ---
+        # Old script stored "officer". New rank key is "lieutenant".
+        if isinstance(members[uid_str], dict):
+            r = members[uid_str].get("rank")
+            if r == "officer":
+                members[uid_str]["rank"] = RANK_LIEUTENANT
 
     data["members"] = members
     return data
@@ -247,21 +261,21 @@ def ensure_member_record(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
 
     rec.setdefault("rank", RANK_SECURITY)
     rec.setdefault("corp_key", CORP_UNASSIGNED_KEY)
+
     if not isinstance(rec["rank"], str):
         rec["rank"] = RANK_SECURITY
     if not isinstance(rec["corp_key"], str):
         rec["corp_key"] = CORP_UNASSIGNED_KEY
-    return rec
 
-def rank_roles_to_strip(guild: discord.Guild) -> List[discord.Role]:
-    # Strip only non-protected rank roles
-    candidates = [OFFICER_ROLE, COMMANDER_ROLE, GENERAL_ROLE]
-    out: List[discord.Role] = []
-    for name in candidates:
-        r = get_role(guild, name)
-        if r:
-            out.append(r)
-    return out
+    # Migrate legacy "officer" to lieutenant at runtime too (extra safety)
+    if rec["rank"] == "officer":
+        rec["rank"] = RANK_LIEUTENANT
+
+    # Guard against unknown values
+    if rec["rank"] not in (RANK_SECURITY, RANK_PETTY_OFFICER, RANK_LIEUTENANT, RANK_COMMANDER, RANK_GENERAL):
+        rec["rank"] = RANK_SECURITY
+
+    return rec
 
 async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
     ch = discord.utils.get(guild.text_channels, name=LOG_CH)
@@ -355,6 +369,9 @@ def corp_tag(corp_key: str) -> str:
         CORP_UNASSIGNED_KEY: "[—]",
     }.get(corp_key, "[—]")
 
+# =====================
+# BOOTSTRAP ROLES
+# =====================
 async def bootstrap_fixed_corps(guild: discord.Guild) -> None:
     # Ensure corp roles exist (best effort)
     security_role = get_role(guild, CORP_ROLE_SECURITY)
@@ -389,6 +406,39 @@ async def bootstrap_fixed_corps(guild: discord.Guild) -> None:
 
         save_data(data)
 
+async def bootstrap_rank_roles(guild: discord.Guild) -> None:
+    """
+    Ensures rank roles exist:
+      - ARC Petty Officer (new)
+      - ARC Lieutenant (renamed from ARC Officer if present)
+      - ARC Commander
+      - ARC General
+
+    Best-effort:
+      - If "ARC Officer" exists and "ARC Lieutenant" does NOT, rename the role.
+      - Otherwise, create missing roles.
+    """
+    # 1) Rename legacy role if appropriate
+    legacy = get_role(guild, LEGACY_OFFICER_ROLE)
+    lieutenant = get_role(guild, LIEUTENANT_ROLE)
+    if legacy is not None and lieutenant is None:
+        try:
+            await legacy.edit(name=LIEUTENANT_ROLE, reason="ARC rank rename: ARC Officer -> ARC Lieutenant")
+        except (discord.Forbidden, discord.HTTPException):
+            # if rename fails, we'll try creating lieutenant instead
+            pass
+
+    # refresh after possible rename
+    lieutenant = get_role(guild, LIEUTENANT_ROLE)
+
+    # 2) Create missing rank roles
+    for role_name in (PETTY_OFFICER_ROLE, LIEUTENANT_ROLE, COMMANDER_ROLE, GENERAL_ROLE):
+        if get_role(guild, role_name) is None:
+            try:
+                await guild.create_role(name=role_name, reason="ARC rank bootstrap")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
 async def sync_member_corp_from_roles(member: discord.Member, *, reason: str) -> Tuple[str, str]:
     async with file_lock:
         data = load_data()
@@ -400,7 +450,57 @@ async def sync_member_corp_from_roles(member: discord.Member, *, reason: str) ->
             save_data(data)
         return old_key, new_key
 
+# =====================
+# RANK ROLE RETENTION LOGIC (NEW)
+# =====================
+def _rank_order() -> List[str]:
+    # Lowest -> Highest (security has no role)
+    return [RANK_SECURITY, RANK_PETTY_OFFICER, RANK_LIEUTENANT, RANK_COMMANDER, RANK_GENERAL]
+
+def _roles_above_rank(guild: discord.Guild, rank: str) -> List[discord.Role]:
+    """
+    Returns discord.Role objects for ranks strictly ABOVE the given rank.
+    Keeps lower/equal rank roles intact.
+    Also includes legacy "ARC Officer" for removal if found.
+    """
+    order = _rank_order()
+    try:
+        idx = order.index(rank)
+    except ValueError:
+        idx = 0  # treat unknown as security
+
+    above = set(order[idx + 1:])
+
+    roles: List[discord.Role] = []
+
+    # Always remove legacy Officer role if it exists (post-migration cleanup)
+    legacy = get_role(guild, LEGACY_OFFICER_ROLE)
+    if legacy is not None:
+        roles.append(legacy)
+
+    rank_to_role_name = {
+        RANK_PETTY_OFFICER: PETTY_OFFICER_ROLE,
+        RANK_LIEUTENANT: LIEUTENANT_ROLE,
+        RANK_COMMANDER: COMMANDER_ROLE,
+        RANK_GENERAL: GENERAL_ROLE,
+    }
+
+    for r in above:
+        role_name = rank_to_role_name.get(r)
+        if role_name:
+            role_obj = get_role(guild, role_name)
+            if role_obj is not None:
+                roles.append(role_obj)
+
+    return roles
+
 async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str, str]:
+    """
+    UPDATED BEHAVIOR:
+      - Promotion: ADDS the new rank role, DOES NOT remove lower rank roles.
+      - Demotion: removes ONLY roles ABOVE the new rank (and legacy 'ARC Officer').
+      - Keeps lower-rank roles forever unless manually removed.
+    """
     guild = member.guild
     async with file_lock:
         data = load_data()
@@ -409,24 +509,25 @@ async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str,
         old_rank = rec.get("rank", RANK_SECURITY)
         rec["rank"] = new_rank
 
-        # remove old rank roles (Officer/Commander/General)
+        # Remove only roles ABOVE the target new_rank (and legacy Officer)
         to_remove: List[discord.Role] = []
-        for role in rank_roles_to_strip(guild):
+        for role in _roles_above_rank(guild, new_rank):
             if role in member.roles:
                 to_remove.append(role)
+
         if to_remove:
             try:
-                await member.remove_roles(*to_remove, reason="ARC rank change: removing prior rank roles")
+                await member.remove_roles(*to_remove, reason="ARC rank change: removing ranks above target rank")
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-        # add rank role (if any)
+        # Add rank role for new_rank (if any) WITHOUT removing lower roles
         role_name = ROLE_BY_RANK.get(new_rank)
         if role_name:
             role_obj = get_role(guild, role_name)
             if role_obj and role_obj not in member.roles:
                 try:
-                    await member.add_roles(role_obj, reason=f"ARC rank change: set to {new_rank}")
+                    await member.add_roles(role_obj, reason=f"ARC rank change: add role for {new_rank}")
                 except (discord.Forbidden, discord.HTTPException):
                     pass
 
@@ -434,7 +535,7 @@ async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str,
         return old_rank, new_rank
 
 # =====================
-# FLOWCHART (Compact Officer+ names)
+# FLOWCHART (Compact)
 # =====================
 def _format_rank_block(title: str, members: List[discord.Member]) -> List[str]:
     lines: List[str] = [f"{title}:"]
@@ -450,48 +551,51 @@ def _format_rank_block(title: str, members: List[discord.Member]) -> List[str]:
 def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
     members_map = data.get("members", {})
 
-    # Collect leadership buckets
     ceos: List[discord.Member] = []
     directors: List[discord.Member] = []
     generals: List[discord.Member] = []
     commanders: List[discord.Member] = []
-    officers: List[discord.Member] = []
+    lieutenants: List[discord.Member] = []
+    petty_officers: List[discord.Member] = []
 
-    # Corp summary counts
     corp_counts = {
-        CORP_SUBSIDIZED_KEY: {"total": 0, "security": 0, "officer_plus": 0},
-        CORP_SECURITY_KEY: {"total": 0, "security": 0, "officer_plus": 0},
-        CORP_UNASSIGNED_KEY: {"total": 0, "security": 0, "officer_plus": 0},
+        CORP_SUBSIDIZED_KEY: {"total": 0, "security": 0, "ranked": 0},
+        CORP_SECURITY_KEY: {"total": 0, "security": 0, "ranked": 0},
+        CORP_UNASSIGNED_KEY: {"total": 0, "security": 0, "ranked": 0},
     }
 
     for m in guild.members:
         corp_key = detect_corp_key_from_member(m)
         corp_counts[corp_key]["total"] += 1
 
-        # CEO/Director buckets are role-based
         if is_ceo(m):
             ceos.append(m)
-            corp_counts[corp_key]["officer_plus"] += 1
+            corp_counts[corp_key]["ranked"] += 1
             continue
         if is_director(m):
             directors.append(m)
-            corp_counts[corp_key]["officer_plus"] += 1
+            corp_counts[corp_key]["ranked"] += 1
             continue
 
         rec = members_map.get(str(m.id))
         rank = rec.get("rank", RANK_SECURITY) if isinstance(rec, dict) else RANK_SECURITY
         if not isinstance(rank, str):
             rank = RANK_SECURITY
+        if rank == "officer":
+            rank = RANK_LIEUTENANT
 
         if rank == RANK_GENERAL:
             generals.append(m)
-            corp_counts[corp_key]["officer_plus"] += 1
+            corp_counts[corp_key]["ranked"] += 1
         elif rank == RANK_COMMANDER:
             commanders.append(m)
-            corp_counts[corp_key]["officer_plus"] += 1
-        elif rank == RANK_OFFICER:
-            officers.append(m)
-            corp_counts[corp_key]["officer_plus"] += 1
+            corp_counts[corp_key]["ranked"] += 1
+        elif rank == RANK_LIEUTENANT:
+            lieutenants.append(m)
+            corp_counts[corp_key]["ranked"] += 1
+        elif rank == RANK_PETTY_OFFICER:
+            petty_officers.append(m)
+            corp_counts[corp_key]["ranked"] += 1
         else:
             corp_counts[corp_key]["security"] += 1
 
@@ -513,17 +617,18 @@ def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
     lines.append("")
     lines.extend(_format_rank_block("Commanders", commanders))
     lines.append("")
-    lines.extend(_format_rank_block("Officers", officers))
+    lines.extend(_format_rank_block("Lieutenants", lieutenants))
+    lines.append("")
+    lines.extend(_format_rank_block("Petty Officers", petty_officers))
     lines.append("")
     lines.append("CORPORATIONS (Summary)")
     lines.append("---------------------")
 
-    # Order to match your example
     for ck in (CORP_SUBSIDIZED_KEY, CORP_SECURITY_KEY, CORP_UNASSIGNED_KEY):
         c = corp_counts[ck]
         lines.append(
             f"- {corp_display_name_by_key(ck)}: "
-            f"Total {c['total']} | Officer+ {c['officer_plus']} | Security {c['security']}"
+            f"Total {c['total']} | Ranked {c['ranked']} | Security {c['security']}"
         )
 
     lines.append("")
@@ -609,6 +714,7 @@ class ARCHierarchyCog(commands.Cog):
             return
 
         await bootstrap_fixed_corps(interaction.guild)
+        await bootstrap_rank_roles(interaction.guild)
         await self.sync_all_members(interaction.guild, actor_id=actor.id, log=False)
         await update_flowchart(interaction.guild)
         await interaction.followup.send("✅ Flowchart refreshed.", ephemeral=True)
@@ -632,7 +738,6 @@ class ARCHierarchyCog(commands.Cog):
             await interaction.followup.send("Invalid corporation. Use: `subsidized`, `security`, or `unassigned`.", ephemeral=True)
             return
 
-        # align stored state before reporting
         await self.sync_all_members(interaction.guild, actor_id=interaction.user.id, log=False)
 
         async with file_lock:
@@ -643,7 +748,6 @@ class ARCHierarchyCog(commands.Cog):
         members: List[Tuple[discord.Member, Dict[str, Any]]] = []
         for m in interaction.guild.members:
             rec = data.get("members", {}).get(str(m.id))
-            # if record missing, treat as security+unassigned until next sync; but roster should reflect stored corp_key
             if isinstance(rec, dict) and rec.get("corp_key") == corp_key:
                 members.append((m, rec))
 
@@ -652,7 +756,8 @@ class ARCHierarchyCog(commands.Cog):
             RANK_DIRECTOR: [],
             RANK_GENERAL: [],
             RANK_COMMANDER: [],
-            RANK_OFFICER: [],
+            RANK_LIEUTENANT: [],
+            RANK_PETTY_OFFICER: [],
             RANK_SECURITY: [],
         }
 
@@ -665,6 +770,8 @@ class ARCHierarchyCog(commands.Cog):
                 continue
 
             r = rec.get("rank", RANK_SECURITY)
+            if r == "officer":
+                r = RANK_LIEUTENANT
             if r not in groups:
                 r = RANK_SECURITY
             groups[r].append(m)
@@ -692,7 +799,9 @@ class ARCHierarchyCog(commands.Cog):
         lines.append("")
         lines.extend(fmt_group(RANK_COMMANDER, "Commanders"))
         lines.append("")
-        lines.extend(fmt_group(RANK_OFFICER, "Officers"))
+        lines.extend(fmt_group(RANK_LIEUTENANT, "Lieutenants"))
+        lines.append("")
+        lines.extend(fmt_group(RANK_PETTY_OFFICER, "Petty Officers"))
         lines.append("")
         lines.extend(fmt_group(RANK_SECURITY, "Security"))
 
@@ -723,6 +832,7 @@ class ARCHierarchyCog(commands.Cog):
             await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
             return
 
+        await bootstrap_rank_roles(interaction.guild)
         await sync_member_corp_from_roles(member, reason="promote: pre-sync")
 
         async with file_lock:
@@ -767,6 +877,7 @@ class ARCHierarchyCog(commands.Cog):
             await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
             return
 
+        await bootstrap_rank_roles(interaction.guild)
         await sync_member_corp_from_roles(member, reason="demote: pre-sync")
 
         async with file_lock:
@@ -963,6 +1074,7 @@ class ARCHierarchyCog(commands.Cog):
                 await ensure_log_channel(g)
                 await ensure_directives_channel(g)
                 await bootstrap_fixed_corps(g)
+                await bootstrap_rank_roles(g)
                 await self.sync_all_members(guild=g, actor_id=None, log=False)
                 await update_flowchart(g)
             except Exception:
