@@ -26,6 +26,11 @@
 #                  but keeps lower rank roles unless manually removed.
 #   - Legacy role "ARC Officer" is renamed to "ARC Lieutenant" if possible; otherwise removed if found.
 #
+# PERMISSIONS (UPDATED):
+#   - CEO + Directors: can promote/demote any rank (existing behavior).
+#   - ARC Genesis: can use /arc promote ONLY for Security -> Petty Officer promotions.
+#                  (No other promotions; no demotions; no flowchart refresh; no directives.)
+#
 # Commands:
 #   /arc flowchart_refresh
 #   /arc roster_corp (subsidized|security|unassigned)
@@ -63,6 +68,9 @@ file_lock = asyncio.Lock()
 # =====================
 CEO_ROLE = "ARC Security Corporation Leader"            # PROTECTED: NEVER REMOVED BY BOT
 DIRECTOR_ROLE = "ARC Security Administration Council"   # PROTECTED: NEVER REMOVED BY BOT
+
+# LIMITED PROMOTER ROLE
+GENESIS_ROLE = "ARC Genesis"  # can promote ONLY Security -> Petty Officer
 
 GENERAL_ROLE = "ARC General"
 COMMANDER_ROLE = "ARC Commander"
@@ -248,7 +256,12 @@ def is_ceo(member: discord.Member) -> bool:
     return has_role(member, CEO_ROLE)
 
 def can_manage(member: discord.Member) -> bool:
+    # Full management: CEO + Directors
     return is_ceo(member) or is_director(member)
+
+def can_promote_petty_officer_only(member: discord.Member) -> bool:
+    # Limited management: ARC Genesis
+    return has_role(member, GENESIS_ROLE)
 
 def ensure_member_record(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     rec = data.setdefault("members", {}).setdefault(str(user_id), {
@@ -418,20 +431,14 @@ async def bootstrap_rank_roles(guild: discord.Guild) -> None:
       - If "ARC Officer" exists and "ARC Lieutenant" does NOT, rename the role.
       - Otherwise, create missing roles.
     """
-    # 1) Rename legacy role if appropriate
     legacy = get_role(guild, LEGACY_OFFICER_ROLE)
     lieutenant = get_role(guild, LIEUTENANT_ROLE)
     if legacy is not None and lieutenant is None:
         try:
             await legacy.edit(name=LIEUTENANT_ROLE, reason="ARC rank rename: ARC Officer -> ARC Lieutenant")
         except (discord.Forbidden, discord.HTTPException):
-            # if rename fails, we'll try creating lieutenant instead
             pass
 
-    # refresh after possible rename
-    lieutenant = get_role(guild, LIEUTENANT_ROLE)
-
-    # 2) Create missing rank roles
     for role_name in (PETTY_OFFICER_ROLE, LIEUTENANT_ROLE, COMMANDER_ROLE, GENERAL_ROLE):
         if get_role(guild, role_name) is None:
             try:
@@ -451,7 +458,7 @@ async def sync_member_corp_from_roles(member: discord.Member, *, reason: str) ->
         return old_key, new_key
 
 # =====================
-# RANK ROLE RETENTION LOGIC (NEW)
+# RANK ROLE RETENTION LOGIC
 # =====================
 def _rank_order() -> List[str]:
     # Lowest -> Highest (security has no role)
@@ -467,13 +474,11 @@ def _roles_above_rank(guild: discord.Guild, rank: str) -> List[discord.Role]:
     try:
         idx = order.index(rank)
     except ValueError:
-        idx = 0  # treat unknown as security
+        idx = 0
 
     above = set(order[idx + 1:])
-
     roles: List[discord.Role] = []
 
-    # Always remove legacy Officer role if it exists (post-migration cleanup)
     legacy = get_role(guild, LEGACY_OFFICER_ROLE)
     if legacy is not None:
         roles.append(legacy)
@@ -822,14 +827,24 @@ class ARCHierarchyCog(commands.Cog):
     # -----------------
     # PROMOTE / DEMOTE
     # -----------------
-    @arc.command(name="promote", description="Promote a member (Directors/CEO)")
+    @arc.command(name="promote", description="Promote a member (CEO/Directors; ARC Genesis can promote to Petty Officer only)")
     @app_commands.describe(member="Member to promote")
     async def promote(self, interaction: discord.Interaction, member: discord.Member):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         actor = interaction.user
-        if not isinstance(actor, discord.Member) or not can_manage(actor):
-            await interaction.followup.send("Only the CEO and Directors may use this command.", ephemeral=True)
+        if not isinstance(actor, discord.Member):
+            await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+            return
+
+        # Permissions:
+        # - CEO/Directors: full promote
+        # - ARC Genesis: ONLY Security -> Petty Officer
+        full = can_manage(actor)
+        limited = can_promote_petty_officer_only(actor)
+
+        if not full and not limited:
+            await interaction.followup.send("Only the CEO/Directors may promote (ARC Genesis can promote to Petty Officer only).", ephemeral=True)
             return
 
         await bootstrap_rank_roles(interaction.guild)
@@ -839,7 +854,19 @@ class ARCHierarchyCog(commands.Cog):
             data = load_data()
             rec = ensure_member_record(data, member.id)
             old_rank = rec.get("rank", RANK_SECURITY)
+
+            # Determine next rank
             nxt = PROMOTE_TO.get(old_rank)
+
+            # Limited promoter can ONLY do Security -> Petty Officer
+            if limited and not full:
+                if old_rank != RANK_SECURITY or nxt != RANK_PETTY_OFFICER:
+                    await interaction.followup.send(
+                        "ARC Genesis may only promote **Security → Petty Officer**.",
+                        ephemeral=True
+                    )
+                    return
+
             if not nxt:
                 await interaction.followup.send(
                     f"{member.display_name} cannot be promoted further from **{old_rank}**.",
