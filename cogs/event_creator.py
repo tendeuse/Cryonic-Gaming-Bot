@@ -39,7 +39,8 @@ SECURITY_PING_ROLE = "ARC Security"
 HIERARCHY_LOG_CH = "arc-hierarchy-log"
 
 CREATOR_ROLES = {
-    "ARC Officer",
+    "ARC Petty Officer",
+    "ARC Lieutenant",
     "ARC Commander",
     "ARC General",
     "ARC Security Administration Council",
