@@ -2,6 +2,8 @@
 cogs/missions.py  —  Cryonic Gaming Bot
 Mission management cog using SQLite stored on Railway /data volume.
 
+Drop this file into your /cogs folder — bot.py will auto-load it.
+
 Railway setup:
   - Add a Volume mounted at /data in your Railway service settings.
   - DB path defaults to /data/missions.db
@@ -565,9 +567,6 @@ class MissionCog(commands.Cog, name="Missions"):
 # ---------------------------------------------------------------------------
 
 async def setup(bot: commands.Bot):
-    from pathlib import Path
-    db_path = str(Path(os.getenv("MISSION_DB_PATH", "/data/missions.db")))
     await bot.add_cog(MissionCog(bot))
-    await bot.add_cog(OverlayApiCog(bot, db_path))
     print("[MissionCog] Cog registered.")
-    print("[OverlayApiCog] Cog registered.")
+    # NOTE: OverlayApiCog is loaded separately via cogs/overlay_api.py

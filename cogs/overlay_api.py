@@ -458,14 +458,11 @@ class OverlayApiCog(commands.Cog, name="OverlayAPI"):
 
 
 # ---------------------------------------------------------------------------
-# setup() — called by bot.py auto-loader
-# Add this block to the BOTTOM of missions.py, merging with existing setup()
+# Required by discord.py cog loader — bot.py auto-loads this file
 # ---------------------------------------------------------------------------
 
-# async def setup(bot: commands.Bot):
-#     from pathlib import Path
-#     db_path = str(Path(os.getenv("MISSION_DB_PATH", "/data/missions.db")))
-#     await bot.add_cog(MissionCog(bot))
-#     await bot.add_cog(OverlayApiCog(bot, db_path))
-#     print("[MissionCog] Cog registered.")
-#     print("[OverlayApiCog] Cog registered.")
+async def setup(bot: commands.Bot):
+    from pathlib import Path
+    db_path = str(Path(os.getenv("MISSION_DB_PATH", "/data/missions.db")))
+    await bot.add_cog(OverlayApiCog(bot, db_path))
+    print("[OverlayApiCog] Cog registered.")
