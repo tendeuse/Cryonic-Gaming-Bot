@@ -65,7 +65,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 JWT_SECRET   = os.getenv("OVERLAY_JWT_SECRET", secrets.token_hex(32))
-API_PORT     = int(os.getenv("OVERLAY_API_PORT", "8080"))
+API_PORT     = int(os.getenv("PORT", os.getenv("OVERLAY_API_PORT", "8080")))  # Railway injecte $PORT
 TOKEN_TTL_H  = int(os.getenv("OVERLAY_TOKEN_TTL_H", "720"))   # 30 days
 ALGORITHM    = "HS256"
 

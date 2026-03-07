@@ -19,15 +19,25 @@
 # Boost stacking rules:
 #   - Boosts do NOT stack.
 #   - If an active boost already exists for (participant -> creator), it EXTENDS expiry only.
+#
+# FIXES INCLUDED:
+#   - Stable custom_id values for persistent buttons
+#   - Safer event posting with permission checks + surfaced errors
+#   - Re-register persistent event views on startup
+#   - More defensive message/channel fetches
+#   - Prevent duplicate RSVP entries
+#   - Better logging / diagnostics
+
+import asyncio
+import json
+import os
+import uuid
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, List, Optional, Set
 
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-from datetime import datetime, timezone, timedelta
-import json
-import os
-import uuid
-from typing import Dict, Any, List, Optional
 
 DATA_PATH = "/data/events.json"
 BOOSTS_PATH = "/data/ap_boosts.json"  # consumed by ap_tracking.py
@@ -44,7 +54,7 @@ CREATOR_ROLES = {
     "ARC Commander",
     "ARC General",
     "ARC Security Administration Council",
-    "ARC Security Corporation Leader"
+    "ARC Security Corporation Leader",
 }
 
 # If creator has ANY of these roles, they do NOT receive the presence-confirm bonuses
@@ -56,15 +66,14 @@ PRESENCE_BONUS_EXCLUDED_ROLES = {
 RSVP_TYPES = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
 ROLE_ASSIGN_TYPES = {"accept", "damage", "logi", "salvager"}
 
+_lock: Optional[asyncio.Lock] = None
+
+
 # -------------------- Persistence (atomic-ish) --------------------
 
-_lock = None
-
-
-def _ensure_lock():
+def _ensure_lock() -> asyncio.Lock:
     global _lock
     if _lock is None:
-        import asyncio
         _lock = asyncio.Lock()
     return _lock
 
@@ -81,14 +90,16 @@ async def _load_json(path: str, default_obj: Any):
     async with lock:
         _ensure_file(path, default_obj)
         try:
-            txt = open(path, "r", encoding="utf-8").read().strip()
+            with open(path, "r", encoding="utf-8") as f:
+                txt = f.read().strip()
             if not txt:
                 return default_obj
             data = json.loads(txt)
             return data if isinstance(data, type(default_obj)) else default_obj
         except json.JSONDecodeError:
             try:
-                os.replace(path, path + ".bak")
+                if os.path.exists(path):
+                    os.replace(path, path + ".bak")
             except Exception:
                 pass
             _ensure_file(path, default_obj)
@@ -136,8 +147,14 @@ def has_role(member: discord.Member, role_name: str) -> bool:
     return any(r.name == role_name for r in member.roles)
 
 
-def has_any_role(member: discord.Member, role_names: set[str]) -> bool:
+def has_any_role(member: discord.Member, role_names: Set[str]) -> bool:
     return any(r.name in role_names for r in member.roles)
+
+
+def get_bot_member(guild: discord.Guild, bot_user_id: Optional[int]) -> Optional[discord.Member]:
+    if not bot_user_id:
+        return None
+    return guild.get_member(bot_user_id)
 
 
 async def ensure_hierarchy_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -154,7 +171,8 @@ def compute_participants(event: Dict[str, Any]) -> List[int]:
     roles_map = event.get("roles", {})
     if not isinstance(roles_map, dict):
         return []
-    participants: set[int] = set()
+
+    participants: Set[int] = set()
     for role_name, ids in roles_map.items():
         if str(role_name).strip().lower() == "decline":
             continue
@@ -163,6 +181,7 @@ def compute_participants(event: Dict[str, Any]) -> List[int]:
         for uid in ids:
             if isinstance(uid, int):
                 participants.add(uid)
+
     return sorted(participants)
 
 
@@ -170,6 +189,7 @@ def current_confirmed_ids(event: Dict[str, Any]) -> List[int]:
     presence = event.get("presence", {})
     if not isinstance(presence, dict):
         return []
+
     out = []
     for k, v in presence.items():
         if v is True:
@@ -178,6 +198,19 @@ def current_confirmed_ids(event: Dict[str, Any]) -> List[int]:
             except Exception:
                 pass
     return sorted(set(out))
+
+
+def build_signup_field_value(event: Dict[str, Any]) -> str:
+    roles = event.get("roles", {})
+    if not isinstance(roles, dict):
+        return "_No signups yet._"
+
+    lines = []
+    for role_name, ids in roles.items():
+        count = len(ids) if isinstance(ids, list) else 0
+        lines.append(f"{role_name}: {count}")
+
+    return "\n".join(lines) if lines else "_No signups yet._"
 
 
 async def log_confirmed_participants(
@@ -227,7 +260,30 @@ class PresenceConfirmView(discord.ui.View):
         self.event_id = event_id
         self.participant_id = participant_id
 
-    async def _award_creator_5ap(self, guild: discord.Guild, creator: discord.Member, participant: discord.Member, event_title: str) -> bool:
+        yes_btn = discord.ui.Button(
+            label="Yes",
+            style=discord.ButtonStyle.success,
+            custom_id=f"presence_yes:{event_id}:{participant_id}",
+        )
+        no_btn = discord.ui.Button(
+            label="No",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"presence_no:{event_id}:{participant_id}",
+        )
+
+        yes_btn.callback = self.yes_callback
+        no_btn.callback = self.no_callback
+
+        self.add_item(yes_btn)
+        self.add_item(no_btn)
+
+    async def _award_creator_5ap(
+        self,
+        guild: discord.Guild,
+        creator: discord.Member,
+        participant: discord.Member,
+        event_title: str
+    ) -> bool:
         try:
             from cogs.ap_tracking import award_ap_with_bonuses  # type: ignore
         except Exception:
@@ -271,14 +327,12 @@ class PresenceConfirmView(discord.ui.View):
             now = int(datetime.now(timezone.utc).timestamp())
             new_expires = now + int(timedelta(hours=24).total_seconds())
 
-            # look for existing active entry for this beneficiary
             found = False
             for entry in lst:
                 if not isinstance(entry, dict):
                     continue
                 if entry.get("beneficiary") != creator_id:
                     continue
-                # Only one percent supported (0.10)
                 entry["percent"] = 0.10
                 old_expires = int(entry.get("expires", 0) or 0)
                 entry["expires"] = max(old_expires, new_expires)
@@ -322,7 +376,6 @@ class PresenceConfirmView(discord.ui.View):
             await interaction.response.send_message("Guild not found.", ephemeral=True)
             return
 
-        # Double-confirm prevention: if already confirmed for this participant, do nothing
         presence = event.setdefault("presence", {})
         if not isinstance(presence, dict):
             presence = {}
@@ -330,7 +383,6 @@ class PresenceConfirmView(discord.ui.View):
 
         key = str(self.participant_id)
         if key in presence:
-            # already answered previously
             for child in self.children:
                 if isinstance(child, discord.ui.Button):
                     child.disabled = True
@@ -340,14 +392,15 @@ class PresenceConfirmView(discord.ui.View):
                     view=self
                 )
             except Exception:
-                pass
+                await interaction.response.send_message(
+                    "Already recorded for this participant (no changes applied).",
+                    ephemeral=True
+                )
             return
 
-        # Record presence
         presence[key] = bool(present)
         event["presence_updated_utc"] = datetime.now(timezone.utc).isoformat()
 
-        # Track asked list (avoid re-sending)
         asked = event.setdefault("presence_dm_sent_to", [])
         if not isinstance(asked, list):
             asked = []
@@ -363,17 +416,20 @@ class PresenceConfirmView(discord.ui.View):
 
         if present and creator_member and participant_member:
             if not has_any_role(creator_member, PRESENCE_BONUS_EXCLUDED_ROLES):
-                bonus_ap = await self._award_creator_5ap(guild, creator_member, participant_member, str(event.get("title") or "Event"))
+                bonus_ap = await self._award_creator_5ap(
+                    guild,
+                    creator_member,
+                    participant_member,
+                    str(event.get("title") or "Event")
+                )
                 boost_ok = await self._register_or_extend_boost(
                     creator_id=creator_member.id,
                     participant_id=participant_member.id,
                     event_id=self.event_id
                 )
 
-        # Save event
         await save_events(events)
 
-        # Log confirmed list
         try:
             await log_confirmed_participants(
                 guild,
@@ -384,7 +440,6 @@ class PresenceConfirmView(discord.ui.View):
         except Exception:
             pass
 
-        # Disable buttons and respond
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
@@ -405,12 +460,10 @@ class PresenceConfirmView(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
-    async def yes(self, interaction: discord.Interaction, _button: discord.ui.Button):
+    async def yes_callback(self, interaction: discord.Interaction):
         await self._handle(interaction, True)
 
-    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
-    async def no(self, interaction: discord.Interaction, _button: discord.ui.Button):
+    async def no_callback(self, interaction: discord.Interaction):
         await self._handle(interaction, False)
 
 
@@ -474,7 +527,8 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         embed = discord.Embed(
             title=self.name.value,
             description=self.description.value,
-            color=discord.Color.blue()
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
         )
 
         embed.add_field(
@@ -485,54 +539,90 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
 
         embed.add_field(
             name="📊 Fleet Signup",
-            value="\n".join(f"{b.title()}: 0" for b in selected_buttons),
+            value="\n".join(f"{b.title()}: 0" for b in sorted(selected_buttons)),
             inline=False
         )
 
-        channel = discord.utils.get(
-            interaction.guild.text_channels,
-            name=ANNOUNCEMENT_CHANNEL
-        )
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
 
+        channel = discord.utils.get(guild.text_channels, name=ANNOUNCEMENT_CHANNEL)
         if not channel:
             await interaction.response.send_message(
-                "Announcement channel not found.",
+                f"Announcement channel `#{ANNOUNCEMENT_CHANNEL}` not found.",
                 ephemeral=True
             )
             return
 
-        # 🔔 ARC Security Ping (ONCE)
-        security_role = discord.utils.get(
-            interaction.guild.roles,
-            name=SECURITY_PING_ROLE
-        )
-        if security_role:
-            await channel.send(security_role.mention)
+        bot_member = get_bot_member(guild, interaction.client.user.id if interaction.client.user else None)
+        if not bot_member:
+            await interaction.response.send_message("Could not resolve bot member in this guild.", ephemeral=True)
+            return
+
+        perms = channel.permissions_for(bot_member)
+        if not perms.view_channel:
+            await interaction.response.send_message(
+                f"I do not have permission to view {channel.mention}.",
+                ephemeral=True
+            )
+            return
+
+        if not perms.send_messages:
+            await interaction.response.send_message(
+                f"I do not have permission to send messages in {channel.mention}.",
+                ephemeral=True
+            )
+            return
+
+        if not perms.embed_links:
+            await interaction.response.send_message(
+                f"I do not have permission to embed links in {channel.mention}.",
+                ephemeral=True
+            )
+            return
 
         view = EventView(event_id, selected_buttons, self.redirect_url.value.strip())
-        msg = await channel.send(embed=embed, view=view)
+
+        try:
+            security_role = discord.utils.get(guild.roles, name=SECURITY_PING_ROLE)
+            content = security_role.mention if security_role else None
+
+            msg = await channel.send(
+                content=content,
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(roles=True)
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"Failed to post event message in {channel.mention}: `{type(e).__name__}: {e}`",
+                ephemeral=True
+            )
+            return
 
         data = await load_events()
         data[event_id] = {
             "title": self.name.value,
             "creator": self.creator_id,
             "timestamp": timestamp,
-            "guild_id": interaction.guild.id,
+            "guild_id": guild.id,
             "channel": channel.id,
             "message": msg.id,
-            "roles": {b.title(): [] for b in selected_buttons},
+            "roles": {b.title(): [] for b in sorted(selected_buttons)},
             "redirect_url": self.redirect_url.value.strip(),
             "active": True,
-            # presence fields
-            "presence": {},                  # str(user_id) -> bool
-            "presence_dm_sent_to": [],        # [user_id]
+            "presence": {},
+            "presence_dm_sent_to": [],
             "presence_started": False,
             "presence_started_utc": None,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
         }
         await save_events(data)
 
         await interaction.response.send_message(
-            "Event created successfully and ARC Security has been notified.",
+            f"Event created successfully in {channel.mention}.",
             ephemeral=True
         )
 
@@ -569,45 +659,78 @@ class EditEventModal(discord.ui.Modal, title="Edit Event"):
             ).replace(tzinfo=timezone.utc)
         except ValueError:
             await interaction.response.send_message(
-                "Invalid date format.",
+                "Invalid date format. Use YYYY-MM-DD HH:MM (UTC).",
                 ephemeral=True
             )
             return
 
         event["timestamp"] = int(event_dt.timestamp())
 
-        channel = interaction.guild.get_channel(event["channel"])
-        if not channel:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild not found.", ephemeral=True)
+            return
+
+        channel = guild.get_channel(event.get("channel"))
+        if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("Event channel missing.", ephemeral=True)
             await save_events(data)
             return
 
-        msg = await channel.fetch_message(event["message"])
-        embed = msg.embeds[0]
+        try:
+            msg = await channel.fetch_message(event["message"])
+        except Exception as e:
+            await interaction.response.send_message(
+                f"Could not fetch event message: `{type(e).__name__}: {e}`",
+                ephemeral=True
+            )
+            await save_events(data)
+            return
 
+        if not msg.embeds:
+            await interaction.response.send_message("Event message has no embed to edit.", ephemeral=True)
+            return
+
+        old_embed = msg.embeds[0]
+        embed = discord.Embed.from_dict(old_embed.to_dict())
         embed.description = self.description.value
-        embed.set_field_at(
-            0,
-            name="🕒 Time",
-            value=f"<t:{event['timestamp']}:F>\n<t:{event['timestamp']}:R>",
-            inline=False
-        )
 
-        await msg.edit(embed=embed)
+        if len(embed.fields) >= 1:
+            embed.set_field_at(
+                0,
+                name="🕒 Time",
+                value=f"<t:{event['timestamp']}:F>\n<t:{event['timestamp']}:R>",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="🕒 Time",
+                value=f"<t:{event['timestamp']}:F>\n<t:{event['timestamp']}:R>",
+                inline=False
+            )
+
+        try:
+            await msg.edit(embed=embed)
+        except Exception as e:
+            await interaction.response.send_message(
+                f"Failed to edit event message: `{type(e).__name__}: {e}`",
+                ephemeral=True
+            )
+            return
+
         await save_events(data)
-
         await interaction.response.send_message("Event updated.", ephemeral=True)
 
 
 # -------------------- EVENT VIEW --------------------
 
 class EventView(discord.ui.View):
-    def __init__(self, event_id: str, buttons: set[str], redirect_url: str):
+    def __init__(self, event_id: str, buttons: Set[str], redirect_url: str):
         super().__init__(timeout=None)
         self.event_id = event_id
 
-        for b in buttons:
-            self.add_item(RSVPButton(b.title()))
+        for b in sorted(buttons):
+            self.add_item(RSVPButton(event_id, b.title()))
 
         if redirect_url:
             self.add_item(
@@ -618,44 +741,90 @@ class EventView(discord.ui.View):
                 )
             )
 
-        self.add_item(ManageEventButton())
+        self.add_item(ManageEventButton(event_id))
 
 
 class RSVPButton(discord.ui.Button):
-    def __init__(self, rsvp_type: str):
-        super().__init__(label=rsvp_type, style=discord.ButtonStyle.primary)
+    def __init__(self, event_id: str, rsvp_type: str):
+        super().__init__(
+            label=rsvp_type,
+            style=discord.ButtonStyle.primary,
+            custom_id=f"event_rsvp:{event_id}:{rsvp_type.lower()}",
+        )
         self.rsvp_type = rsvp_type.lower()
 
     async def callback(self, interaction: discord.Interaction):
+        if not self.view or not isinstance(self.view, EventView):
+            await interaction.response.send_message("Invalid event view.", ephemeral=True)
+            return
+
         data = await load_events()
         event = data.get(self.view.event_id)
         if not isinstance(event, dict):
             await interaction.response.send_message("Event not found.", ephemeral=True)
             return
 
-        uid = interaction.user.id
         guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild not found.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Member not found.", ephemeral=True)
+            return
+
+        uid = member.id
         temp_role = discord.utils.get(guild.roles, name=TEMP_ROLE_NAME)
 
-        # Remove from all
-        for users in event.get("roles", {}).values():
-            if isinstance(users, list) and uid in users:
-                users.remove(uid)
+        roles_map = event.setdefault("roles", {})
+        if not isinstance(roles_map, dict):
+            roles_map = {}
+            event["roles"] = roles_map
 
-        # Add to target
-        event["roles"].setdefault(self.rsvp_type.title(), [])
-        event["roles"][self.rsvp_type.title()].append(uid)
+        for users in roles_map.values():
+            if isinstance(users, list):
+                while uid in users:
+                    users.remove(uid)
 
-        # Temp role assignment
+        roles_map.setdefault(self.rsvp_type.title(), [])
+        if uid not in roles_map[self.rsvp_type.title()]:
+            roles_map[self.rsvp_type.title()].append(uid)
+
         try:
-            if self.rsvp_type in ROLE_ASSIGN_TYPES and temp_role:
-                await interaction.user.add_roles(temp_role)
-            elif temp_role:
-                await interaction.user.remove_roles(temp_role)
+            if temp_role:
+                if self.rsvp_type in ROLE_ASSIGN_TYPES:
+                    await member.add_roles(temp_role, reason="Event RSVP role assignment")
+                else:
+                    await member.remove_roles(temp_role, reason="Event RSVP role removal")
         except Exception:
             pass
 
         await save_events(data)
+
+        channel = guild.get_channel(event.get("channel"))
+        if isinstance(channel, discord.TextChannel):
+            try:
+                msg = await channel.fetch_message(event["message"])
+                if msg.embeds:
+                    embed = discord.Embed.from_dict(msg.embeds[0].to_dict())
+                    if len(embed.fields) >= 2:
+                        embed.set_field_at(
+                            1,
+                            name="📊 Fleet Signup",
+                            value=build_signup_field_value(event),
+                            inline=False
+                        )
+                    else:
+                        embed.add_field(
+                            name="📊 Fleet Signup",
+                            value=build_signup_field_value(event),
+                            inline=False
+                        )
+                    await msg.edit(embed=embed, view=self.view)
+            except Exception:
+                pass
+
         await interaction.response.send_message(
             f"Registered as **{self.rsvp_type.title()}**.",
             ephemeral=True
@@ -663,10 +832,18 @@ class RSVPButton(discord.ui.Button):
 
 
 class ManageEventButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="⚙ Manage Event", style=discord.ButtonStyle.secondary)
+    def __init__(self, event_id: str):
+        super().__init__(
+            label="⚙ Manage Event",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"event_manage:{event_id}",
+        )
 
     async def callback(self, interaction: discord.Interaction):
+        if not self.view or not isinstance(self.view, EventView):
+            await interaction.response.send_message("Invalid event view.", ephemeral=True)
+            return
+
         data = await load_events()
         event = data.get(self.view.event_id)
         if not isinstance(event, dict):
@@ -691,14 +868,52 @@ class ManageEventButton(discord.ui.Button):
 class EventCreator(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._views_registered = False
         if not self.presence_loop.is_running():
             self.presence_loop.start()
+
+    def cog_unload(self):
+        if self.presence_loop.is_running():
+            self.presence_loop.cancel()
 
     def can_create(self, member: discord.Member) -> bool:
         return any(role.name in CREATOR_ROLES for role in member.roles)
 
+    async def register_persistent_views(self):
+        if self._views_registered:
+            return
+
+        data = await load_events()
+        for event_id, event in data.items():
+            if not isinstance(event, dict):
+                continue
+            if not event.get("active", True):
+                continue
+
+            roles_map = event.get("roles", {})
+            buttons = {
+                str(k).strip().lower()
+                for k in roles_map.keys()
+                if str(k).strip().lower() in RSVP_TYPES
+            }
+            if not buttons:
+                buttons = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
+
+            redirect_url = str(event.get("redirect_url") or "")
+            try:
+                self.bot.add_view(EventView(event_id, buttons, redirect_url))
+            except Exception as e:
+                print(f"[event_creator] Failed to add persistent view for {event_id}: {type(e).__name__}: {e}")
+
+        self._views_registered = True
+        print(f"[event_creator] Registered persistent views for {len(data)} event(s).")
+
     @app_commands.command(name="create_event", description="Create a new event")
     async def create_event(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+
         if not self.can_create(interaction.user):
             await interaction.response.send_message(
                 "You are not authorized to create events.",
@@ -710,7 +925,6 @@ class EventCreator(commands.Cog):
 
     @tasks.loop(seconds=60)
     async def presence_loop(self):
-        # Every minute: if event time has passed and presence not started -> DM creator per participant
         data = await load_events()
         if not data:
             return
@@ -729,7 +943,6 @@ class EventCreator(commands.Cog):
                 continue
             if now_ts < ts:
                 continue
-
             if event.get("presence_started") is True:
                 continue
 
@@ -786,9 +999,10 @@ class EventCreator(commands.Cog):
                     view = PresenceConfirmView(event_id=event_id, participant_id=pid)
                     await dm.send(embed=embed, view=view)
                 except discord.Forbidden:
-                    # creator DMs closed - stop sending
+                    print(f"[event_creator] Could not DM creator {creator_id} for event {event_id} (DMs closed).")
                     break
-                except Exception:
+                except Exception as e:
+                    print(f"[event_creator] Failed sending presence DM for event {event_id}, participant {pid}: {type(e).__name__}: {e}")
                     continue
 
         if changed:
@@ -800,6 +1014,11 @@ class EventCreator(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
+        try:
+            await self.register_persistent_views()
+        except Exception as e:
+            print(f"[event_creator] Persistent view registration failed: {type(e).__name__}: {e}")
+
         for g in self.bot.guilds:
             try:
                 await ensure_hierarchy_log_channel(g)

@@ -69,8 +69,8 @@ ALLOWED_ROLES = {"Shop Steward", "ARC Security Administration Council"}
 
 SHOP_LOCK = asyncio.Lock()
 
-# Global spacing between ANY actual edits (only applied when edit needed)
-GLOBAL_EDIT_MIN_INTERVAL_SECONDS = 1.2
+# FIX 1 — increased from 1.2 → 2.5s to stay safely under Discord's rate limit
+GLOBAL_EDIT_MIN_INTERVAL_SECONDS = 2.5
 
 # ----------------------------
 # Interaction safety helpers
@@ -827,9 +827,10 @@ class ShopCog(commands.Cog):
         except Exception:
             return False
 
+    # FIX 2 — longer initial delay + staggered shop syncs + inter-guild pause
     async def _startup(self):
         await self.bot.wait_until_ready()
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(5.0)  # was 1.0 — give Discord time to fully settle after on_ready
 
         # Register persistent views
         for shop_key in SHOPS.keys():
@@ -856,6 +857,12 @@ class ShopCog(commands.Cog):
                     pass
 
                 await self.sync_shop_messages(guild, shop_key)
+
+                # FIX 2a — pause between each shop to avoid burst editing (main then HS)
+                await asyncio.sleep(4.0)
+
+            # FIX 2b — pause between guilds if bot is ever in multiple servers
+            await asyncio.sleep(2.0)
 
     # ----------------------------
     # Persistent interaction router (shop buttons)
@@ -1196,6 +1203,9 @@ class ShopCog(commands.Cog):
 
                 items_idx[item_id] = {"shop_msg_id": int(shop_msg_id), "access_msg_id": int(access_msg_id)}
 
+                # FIX 3 — pause between each item to spread out fetch + edit API calls
+                await asyncio.sleep(0.5)
+
             # Management message (single per shop)
             mgmt_id = gidx.get("management_msg_id")
             mgmt_msg = None
@@ -1296,6 +1306,7 @@ class ShopCog(commands.Cog):
 
         for shop_key in SHOPS.keys():
             await self.sync_shop_messages(interaction.guild, shop_key)
+            await asyncio.sleep(4.0)  # same stagger as startup for manual rebuilds
 
         await safe_reply(interaction, "✅ Shops synced (main + HS), no purge.", ephemeral=True)
 
