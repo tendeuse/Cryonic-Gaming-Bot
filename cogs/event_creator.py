@@ -42,7 +42,7 @@ from discord import app_commands
 DATA_PATH = "/data/events.json"
 BOOSTS_PATH = "/data/ap_boosts.json"  # consumed by ap_tracking.py
 
-ANNOUNCEMENT_CHANNEL = "eve-announcements-as"
+ANNOUNCEMENT_CHANNEL = "eve-announcements"
 TEMP_ROLE_NAME = "Event Participant"
 SECURITY_PING_ROLE = "ARC Security"
 
