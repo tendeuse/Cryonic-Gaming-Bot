@@ -2,20 +2,19 @@
 #
 # Event creator + RSVP system
 #
+# FIX IN THIS VERSION
+# -------------------
+# Attendance display now ONLY shows the RSVP buttons that were actually configured
+# for that specific event. It will no longer display categories that were not included
+# when the event was created.
+#
 # FEATURES
 # --------
 # 1) /create_event lets authorized leadership create an event.
 # 2) Creator can choose posting target:
 #       - "wh-op-sec-events"  -> ARC Security only event
 #       - "eve-announcements" -> visible to ARC Security + ARC Subsidized
-# 3) Event embed shows FULL attendance list by button category:
-#       - Accept
-#       - Damage
-#       - Logi
-#       - Salvager
-#       - Tentative
-#       - Decline
-#    and displays the PLAYER NAMES / mentions of everyone who clicked.
+# 3) Event embed shows FULL attendance list by only the enabled RSVP categories.
 # 4) If posting to security-only channel, ARC Security role is pinged.
 # 5) If posting to public announcements channel, both ARC Security and ARC Subsidized are pinged once.
 # 6) RSVP buttons update signup counts + attendance names on the event embed.
@@ -29,13 +28,6 @@
 #           "ARC Security Corporation Leader"
 # 9) Confirmed participants are logged in #arc-hierarchy-log
 # 10) Persistent buttons survive restart.
-#
-# NOTES
-# -----
-# - security-only channel: wh-op-sec-events
-# - public channel:        eve-announcements
-# - This version is full copy/paste ready.
-# - Attendance names are stored by user ID and rendered as mentions in the embed.
 
 import asyncio
 import json
@@ -183,12 +175,23 @@ async def ensure_hierarchy_log_channel(guild: discord.Guild) -> Optional[discord
 
 def compute_participants(event: Dict[str, Any]) -> List[int]:
     roles_map = event.get("roles", {})
+    enabled_buttons = event.get("enabled_buttons", [])
+
     if not isinstance(roles_map, dict):
         return []
 
+    enabled_set = {
+        str(x).strip().title()
+        for x in enabled_buttons
+        if str(x).strip().lower() in RSVP_TYPES
+    }
+
     participants: Set[int] = set()
     for role_name, ids in roles_map.items():
-        if str(role_name).strip().lower() == "decline":
+        role_title = str(role_name).strip().title()
+        if role_title == "Decline":
+            continue
+        if enabled_set and role_title not in enabled_set:
             continue
         if not isinstance(ids, list):
             continue
@@ -265,15 +268,45 @@ def chunk_lines(lines: List[str], max_len: int = 1000) -> List[str]:
     return chunks if chunks else ["_(none)_"]
 
 
+def get_enabled_button_titles(event: Dict[str, Any]) -> List[str]:
+    enabled_buttons = event.get("enabled_buttons", [])
+
+    if isinstance(enabled_buttons, list) and enabled_buttons:
+        cleaned = []
+        seen = set()
+        for b in enabled_buttons:
+            title_b = str(b).strip().title()
+            if title_b.lower() in RSVP_TYPES and title_b not in seen:
+                seen.add(title_b)
+                cleaned.append(title_b)
+        if cleaned:
+            return sorted(cleaned, key=lambda x: DISPLAY_ORDER.index(x) if x in DISPLAY_ORDER else 999)
+
+    # Backward compatibility for older saved events
+    roles = event.get("roles", {})
+    if isinstance(roles, dict) and roles:
+        inferred = []
+        seen = set()
+        for name in roles.keys():
+            title_name = str(name).strip().title()
+            if title_name.lower() in RSVP_TYPES and title_name not in seen:
+                seen.add(title_name)
+                inferred.append(title_name)
+        if inferred:
+            return sorted(inferred, key=lambda x: DISPLAY_ORDER.index(x) if x in DISPLAY_ORDER else 999)
+
+    return ["Accept", "Damage", "Logi", "Salvager", "Tentative", "Decline"]
+
+
 def build_attendance_fields(event: Dict[str, Any]) -> List[tuple[str, str, bool]]:
     roles = event.get("roles", {})
     if not isinstance(roles, dict):
         return [("📋 Attendance", "_No signups yet._", False)]
 
+    enabled_titles = get_enabled_button_titles(event)
     fields: List[tuple[str, str, bool]] = []
-    total_count = 0
 
-    for role_name in DISPLAY_ORDER:
+    for role_name in enabled_titles:
         ids = roles.get(role_name, [])
         if not isinstance(ids, list):
             ids = []
@@ -285,7 +318,6 @@ def build_attendance_fields(event: Dict[str, Any]) -> List[tuple[str, str, bool]
                 seen.add(uid)
                 cleaned_ids.append(uid)
 
-        total_count += len(cleaned_ids)
         mention_lines = [f"- <@{uid}>" for uid in cleaned_ids]
         chunks = chunk_lines(mention_lines, max_len=1000)
 
@@ -311,6 +343,7 @@ def build_event_embed(
     description = str(event.get("description") or "")
     timestamp_int = int(event.get("timestamp") or 0)
     target = str(event.get("target") or "public")
+    enabled_titles = get_enabled_button_titles(event)
 
     embed = discord.Embed(
         title=title,
@@ -335,6 +368,12 @@ def build_event_embed(
     embed.add_field(
         name="📡 Audience",
         value=target_label(target),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎛 Enabled RSVP Buttons",
+        value=", ".join(enabled_titles) if enabled_titles else "None",
         inline=False
     )
 
@@ -370,12 +409,8 @@ async def refresh_event_message(bot: commands.Bot, event_id: str) -> bool:
     if not isinstance(channel, discord.TextChannel):
         return False
 
-    roles_map = event.get("roles", {})
-    buttons = {
-        str(k).strip().lower()
-        for k in roles_map.keys()
-        if str(k).strip().lower() in RSVP_TYPES
-    }
+    enabled_titles = get_enabled_button_titles(event)
+    buttons = {x.lower() for x in enabled_titles if x.lower() in RSVP_TYPES}
     if not buttons:
         buttons = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
 
@@ -737,6 +772,11 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         event_id = str(uuid.uuid4())
         timestamp = int(event_dt.timestamp())
 
+        enabled_titles = sorted(
+            [b.title() for b in selected_buttons],
+            key=lambda x: DISPLAY_ORDER.index(x) if x in DISPLAY_ORDER else 999
+        )
+
         event_record = {
             "title": self.name.value,
             "description": self.description.value,
@@ -747,7 +787,8 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
             "channel_name": channel.name,
             "message": None,
             "target": self.target,
-            "roles": {b.title(): [] for b in DISPLAY_ORDER if b.lower() in RSVP_TYPES},
+            "enabled_buttons": enabled_titles,
+            "roles": {title_name: [] for title_name in enabled_titles},
             "redirect_url": self.redirect_url.value.strip(),
             "active": True,
             "presence": {},
@@ -756,13 +797,6 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
             "presence_started_utc": None,
             "created_utc": datetime.now(timezone.utc).isoformat(),
         }
-
-        for selected in sorted(selected_buttons):
-            title_name = selected.title()
-            event_record["roles"].setdefault(title_name, [])
-
-        for default_name in DISPLAY_ORDER:
-            event_record["roles"].setdefault(default_name, [])
 
         embed = build_event_embed(event=event_record, guild=guild)
         view = EventView(event_id, selected_buttons, self.redirect_url.value.strip())
@@ -896,7 +930,7 @@ class EventView(discord.ui.View):
         super().__init__(timeout=None)
         self.event_id = event_id
 
-        for b in sorted(buttons):
+        for b in sorted(buttons, key=lambda x: DISPLAY_ORDER.index(x.title()) if x.title() in DISPLAY_ORDER else 999):
             self.add_item(RSVPButton(event_id, b.title()))
 
         if redirect_url:
@@ -949,18 +983,32 @@ class RSVPButton(discord.ui.Button):
             roles_map = {}
             event["roles"] = roles_map
 
-        for default_name in DISPLAY_ORDER:
-            roles_map.setdefault(default_name, [])
+        enabled_titles = get_enabled_button_titles(event)
+        target_key = self.rsvp_type.title()
 
-        for users in roles_map.values():
+        if target_key not in enabled_titles:
+            await interaction.response.send_message(
+                "This RSVP option is not enabled for this event.",
+                ephemeral=True
+            )
+            return
+
+        # Only remove user from enabled RSVP categories for this event
+        for role_name in enabled_titles:
+            users = roles_map.get(role_name, [])
             if isinstance(users, list):
                 while uid in users:
                     users.remove(uid)
 
-        target_key = self.rsvp_type.title()
         roles_map.setdefault(target_key, [])
         if uid not in roles_map[target_key]:
             roles_map[target_key].append(uid)
+
+        # Clean out any stray categories not enabled, if they contain this user
+        for role_name, users in roles_map.items():
+            if role_name not in enabled_titles and isinstance(users, list):
+                while uid in users:
+                    users.remove(uid)
 
         event["last_signup_update_utc"] = datetime.now(timezone.utc).isoformat()
 
@@ -1041,12 +1089,8 @@ class EventCreator(commands.Cog):
             if not event.get("active", True):
                 continue
 
-            roles_map = event.get("roles", {})
-            buttons = {
-                str(k).strip().lower()
-                for k in roles_map.keys()
-                if str(k).strip().lower() in RSVP_TYPES
-            }
+            enabled_titles = get_enabled_button_titles(event)
+            buttons = {x.lower() for x in enabled_titles if x.lower() in RSVP_TYPES}
             if not buttons:
                 buttons = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
 
