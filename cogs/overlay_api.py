@@ -408,14 +408,14 @@ class OverlayApiCog(commands.Cog, name="OverlayAPI"):
 
         app = build_api(self.bot, self.db_path)
         config = uvicorn.Config(app, host="0.0.0.0", port=API_PORT,
-                                log_level="warning", loop="asyncio")
+                                log_level="info", loop="none")
         self._server = uvicorn.Server(config)
 
         self._thread = threading.Thread(
             target=self._server.run, daemon=True, name="overlay-api"
         )
         self._thread.start()
-        print(f"[OverlayAPI] Server running on port {API_PORT}")
+        print(f"[OverlayAPI] Server running on port {API_PORT} (Railway $PORT={os.getenv('PORT', 'not set')})")
 
     def cog_unload(self):
         if self._server:
