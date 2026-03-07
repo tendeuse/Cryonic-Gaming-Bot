@@ -1,32 +1,32 @@
 # cogs/event_creator.py
 #
 # Event creator + RSVP system
-# + Presence confirmation DMs at event time:
-#   - At/after event time, the event creator receives 1 DM per participant:
-#       "Was this participant present?" + Yes/No buttons
-#   - For each "Yes":
-#       - Event creator gets +5 AP
-#       - Event creator gets +10% of that participant's AP earnings for the next 24h
-#         (Applied by APTracking via /data/ap_boosts.json)
-#       - NOT applicable if creator has role:
-#           "ARC Security Administration Council" OR "ARC Security Corporation Leader"
-#   - Logs confirmed participant list to #arc-hierarchy-log
 #
-# Double-confirm prevention:
-#   - If a participant already has a presence value recorded for this event,
-#     pressing buttons again will NOT award again (no changes).
+# FEATURES
+# --------
+# 1) /create_event lets authorized leadership create an event.
+# 2) Creator can choose posting target:
+#       - "wh-op-sec-events"  -> ARC Security only event
+#       - "eve-announcements" -> visible to ARC Security + ARC Subsidized
+# 3) If posting to security-only channel, ARC Security role is pinged.
+# 4) If posting to public announcements channel, both ARC Security and ARC Subsidized are pinged once.
+# 5) RSVP buttons update signup counts on the event embed.
+# 6) At/after event time, creator gets one DM per participant to confirm presence.
+# 7) For each confirmed "Yes":
+#       - Creator gets +5 AP
+#       - Creator gets +10% of that participant's AP earnings for 24h
+#         via /data/ap_boosts.json
+#       - Excluded if creator has:
+#           "ARC Security Administration Council"
+#           "ARC Security Corporation Leader"
+# 8) Confirmed participants are logged in #arc-hierarchy-log
+# 9) Persistent buttons survive restart.
 #
-# Boost stacking rules:
-#   - Boosts do NOT stack.
-#   - If an active boost already exists for (participant -> creator), it EXTENDS expiry only.
-#
-# FIXES INCLUDED:
-#   - Stable custom_id values for persistent buttons
-#   - Safer event posting with permission checks + surfaced errors
-#   - Re-register persistent event views on startup
-#   - More defensive message/channel fetches
-#   - Prevent duplicate RSVP entries
-#   - Better logging / diagnostics
+# NOTES
+# -----
+# - security-only channel: wh-op-sec-events
+# - public channel:        eve-announcements
+# - This version is full copy/paste ready.
 
 import asyncio
 import json
@@ -42,9 +42,12 @@ from discord import app_commands
 DATA_PATH = "/data/events.json"
 BOOSTS_PATH = "/data/ap_boosts.json"  # consumed by ap_tracking.py
 
-ANNOUNCEMENT_CHANNEL = "eve-announcements"
+SECURITY_ONLY_CHANNEL = "wh-op-sec-events"
+PUBLIC_CHANNEL = "eve-announcements"
+
 TEMP_ROLE_NAME = "Event Participant"
 SECURITY_PING_ROLE = "ARC Security"
+SUBSIDIZED_PING_ROLE = "ARC Subsidized"
 
 HIERARCHY_LOG_CH = "arc-hierarchy-log"
 
@@ -57,7 +60,6 @@ CREATOR_ROLES = {
     "ARC Security Corporation Leader",
 }
 
-# If creator has ANY of these roles, they do NOT receive the presence-confirm bonuses
 PRESENCE_BONUS_EXCLUDED_ROLES = {
     "ARC Security Administration Council",
     "ARC Security Corporation Leader",
@@ -66,10 +68,15 @@ PRESENCE_BONUS_EXCLUDED_ROLES = {
 RSVP_TYPES = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
 ROLE_ASSIGN_TYPES = {"accept", "damage", "logi", "salvager"}
 
+EVENT_TARGETS = {
+    "security_only": SECURITY_ONLY_CHANNEL,
+    "public": PUBLIC_CHANNEL,
+}
+
 _lock: Optional[asyncio.Lock] = None
 
 
-# -------------------- Persistence (atomic-ish) --------------------
+# -------------------- Persistence --------------------
 
 def _ensure_lock() -> asyncio.Lock:
     global _lock
@@ -143,10 +150,6 @@ async def save_boosts(data: Dict[str, Any]) -> None:
 
 # -------------------- Helpers --------------------
 
-def has_role(member: discord.Member, role_name: str) -> bool:
-    return any(r.name == role_name for r in member.roles)
-
-
 def has_any_role(member: discord.Member, role_names: Set[str]) -> bool:
     return any(r.name in role_names for r in member.roles)
 
@@ -211,6 +214,35 @@ def build_signup_field_value(event: Dict[str, Any]) -> str:
         lines.append(f"{role_name}: {count}")
 
     return "\n".join(lines) if lines else "_No signups yet._"
+
+
+def target_label(target: str) -> str:
+    return {
+        "security_only": "Security Only",
+        "public": "Security + Subsidized",
+    }.get(target, "Unknown")
+
+
+def resolve_target_channel_name(target: str) -> str:
+    return EVENT_TARGETS.get(target, PUBLIC_CHANNEL)
+
+
+def resolve_ping_mentions(guild: discord.Guild, target: str) -> str:
+    mentions: List[str] = []
+
+    security_role = discord.utils.get(guild.roles, name=SECURITY_PING_ROLE)
+    subsidized_role = discord.utils.get(guild.roles, name=SUBSIDIZED_PING_ROLE)
+
+    if target == "security_only":
+        if security_role:
+            mentions.append(security_role.mention)
+    else:
+        if security_role:
+            mentions.append(security_role.mention)
+        if subsidized_role:
+            mentions.append(subsidized_role.mention)
+
+    return " ".join(mentions)
 
 
 async def log_confirmed_participants(
@@ -282,7 +314,7 @@ class PresenceConfirmView(discord.ui.View):
         guild: discord.Guild,
         creator: discord.Member,
         participant: discord.Member,
-        event_title: str
+        event_title: str,
     ) -> bool:
         try:
             from cogs.ap_tracking import award_ap_with_bonuses  # type: ignore
@@ -306,11 +338,6 @@ class PresenceConfirmView(discord.ui.View):
             return False
 
     async def _register_or_extend_boost(self, *, creator_id: int, participant_id: int, event_id: str) -> bool:
-        """
-        Boost stacking rules:
-          - No stacking.
-          - If active boost already exists for (participant -> creator), extend expiry only.
-        """
         try:
             boosts = await load_boosts()
             participants = boosts.setdefault("participants", {})
@@ -420,7 +447,7 @@ class PresenceConfirmView(discord.ui.View):
                     guild,
                     creator_member,
                     participant_member,
-                    str(event.get("title") or "Event")
+                    str(event.get("title") or "Event"),
                 )
                 boost_ok = await self._register_or_extend_boost(
                     creator_id=creator_member.id,
@@ -467,7 +494,7 @@ class PresenceConfirmView(discord.ui.View):
         await self._handle(interaction, False)
 
 
-# -------------------- CREATE EVENT MODAL --------------------
+# -------------------- Create Event Modal --------------------
 
 class CreateEventModal(discord.ui.Modal, title="Create Event"):
     name = discord.ui.TextInput(label="Event Name", max_length=100)
@@ -495,9 +522,10 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         required=False
     )
 
-    def __init__(self, creator_id: int):
+    def __init__(self, creator_id: int, target: str):
         super().__init__()
         self.creator_id = creator_id
+        self.target = target
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -521,37 +549,16 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         if not selected_buttons:
             selected_buttons = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
 
-        event_id = str(uuid.uuid4())
-        timestamp = int(event_dt.timestamp())
-
-        embed = discord.Embed(
-            title=self.name.value,
-            description=self.description.value,
-            color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc)
-        )
-
-        embed.add_field(
-            name="🕒 Time",
-            value=f"<t:{timestamp}:F>\n<t:{timestamp}:R>",
-            inline=False
-        )
-
-        embed.add_field(
-            name="📊 Fleet Signup",
-            value="\n".join(f"{b.title()}: 0" for b in sorted(selected_buttons)),
-            inline=False
-        )
-
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
             return
 
-        channel = discord.utils.get(guild.text_channels, name=ANNOUNCEMENT_CHANNEL)
+        channel_name = resolve_target_channel_name(self.target)
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
         if not channel:
             await interaction.response.send_message(
-                f"Announcement channel `#{ANNOUNCEMENT_CHANNEL}` not found.",
+                f"Target channel `#{channel_name}` not found.",
                 ephemeral=True
             )
             return
@@ -568,14 +575,12 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
                 ephemeral=True
             )
             return
-
         if not perms.send_messages:
             await interaction.response.send_message(
                 f"I do not have permission to send messages in {channel.mention}.",
                 ephemeral=True
             )
             return
-
         if not perms.embed_links:
             await interaction.response.send_message(
                 f"I do not have permission to embed links in {channel.mention}.",
@@ -583,14 +588,37 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
             )
             return
 
+        event_id = str(uuid.uuid4())
+        timestamp = int(event_dt.timestamp())
+
+        embed = discord.Embed(
+            title=self.name.value,
+            description=self.description.value,
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="🕒 Time",
+            value=f"<t:{timestamp}:F>\n<t:{timestamp}:R>",
+            inline=False
+        )
+        embed.add_field(
+            name="📊 Fleet Signup",
+            value="\n".join(f"{b.title()}: 0" for b in sorted(selected_buttons)),
+            inline=False
+        )
+        embed.add_field(
+            name="📡 Audience",
+            value=target_label(self.target),
+            inline=False
+        )
+
         view = EventView(event_id, selected_buttons, self.redirect_url.value.strip())
 
         try:
-            security_role = discord.utils.get(guild.roles, name=SECURITY_PING_ROLE)
-            content = security_role.mention if security_role else None
-
+            ping_content = resolve_ping_mentions(guild, self.target)
             msg = await channel.send(
-                content=content,
+                content=ping_content if ping_content else None,
                 embed=embed,
                 view=view,
                 allowed_mentions=discord.AllowedMentions(roles=True)
@@ -609,7 +637,9 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
             "timestamp": timestamp,
             "guild_id": guild.id,
             "channel": channel.id,
+            "channel_name": channel.name,
             "message": msg.id,
+            "target": self.target,
             "roles": {b.title(): [] for b in sorted(selected_buttons)},
             "redirect_url": self.redirect_url.value.strip(),
             "active": True,
@@ -622,12 +652,12 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         await save_events(data)
 
         await interaction.response.send_message(
-            f"Event created successfully in {channel.mention}.",
+            f"Event created successfully in {channel.mention}.\nAudience: **{target_label(self.target)}**",
             ephemeral=True
         )
 
 
-# -------------------- EDIT EVENT MODAL --------------------
+# -------------------- Edit Event Modal --------------------
 
 class EditEventModal(discord.ui.Modal, title="Edit Event"):
     description = discord.ui.TextInput(
@@ -722,7 +752,49 @@ class EditEventModal(discord.ui.Modal, title="Edit Event"):
         await interaction.response.send_message("Event updated.", ephemeral=True)
 
 
-# -------------------- EVENT VIEW --------------------
+# -------------------- Target Selection View --------------------
+
+class TargetSelect(discord.ui.Select):
+    def __init__(self, creator_id: int):
+        options = [
+            discord.SelectOption(
+                label="Security Only",
+                value="security_only",
+                description=f"Post in #{SECURITY_ONLY_CHANNEL} for ARC Security only",
+                emoji="🛡️",
+            ),
+            discord.SelectOption(
+                label="Security + Subsidized",
+                value="public",
+                description=f"Post in #{PUBLIC_CHANNEL} for ARC Security + ARC Subsidized",
+                emoji="📢",
+            ),
+        ]
+        super().__init__(
+            placeholder="Choose where to post the event...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"event_target_select:{creator_id}",
+        )
+        self.creator_id = creator_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.creator_id:
+            await interaction.response.send_message("Only the command user can choose the event target.", ephemeral=True)
+            return
+
+        target = self.values[0]
+        await interaction.response.send_modal(CreateEventModal(self.creator_id, target))
+
+
+class TargetSelectView(discord.ui.View):
+    def __init__(self, creator_id: int):
+        super().__init__(timeout=180)
+        self.add_item(TargetSelect(creator_id))
+
+
+# -------------------- Event View --------------------
 
 class EventView(discord.ui.View):
     def __init__(self, event_id: str, buttons: Set[str], redirect_url: str):
@@ -863,7 +935,7 @@ class ManageEventButton(discord.ui.Button):
         await interaction.response.send_modal(EditEventModal(self.view.event_id))
 
 
-# -------------------- COG --------------------
+# -------------------- Cog --------------------
 
 class EventCreator(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -921,7 +993,11 @@ class EventCreator(commands.Cog):
             )
             return
 
-        await interaction.response.send_modal(CreateEventModal(interaction.user.id))
+        await interaction.response.send_message(
+            "Choose where to post this event:",
+            view=TargetSelectView(interaction.user.id),
+            ephemeral=True
+        )
 
     @tasks.loop(seconds=60)
     async def presence_loop(self):
