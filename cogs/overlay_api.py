@@ -430,32 +430,39 @@ class OverlayApiCog(commands.Cog, name="OverlayAPI"):
         description="Generate a pairing code to link the ARC Overlay desktop app to your account.",
     )
     async def overlay_pair(self, interaction: discord.Interaction):
-        code       = secrets.token_hex(4).upper()   # e.g. "A3F2B819"
-        expires_at = time.time() + 300               # 5 minutes
+        try:
+            code       = secrets.token_hex(4).upper()
+            expires_at = time.time() + 300
 
-        _pair_codes[code] = {
-            "discord_user_id": interaction.user.id,
-            "expires_at":      expires_at,
-        }
+            _pair_codes[code] = {
+                "discord_user_id": interaction.user.id,
+                "expires_at":      expires_at,
+            }
 
-        embed = discord.Embed(
-            title="🛸  ARC Overlay — Pairing Code",
-            colour=discord.Colour.from_rgb(0, 180, 212),
-        )
-        embed.add_field(name="Your Code", value=f"```{code}```", inline=False)
-        embed.add_field(
-            name="Instructions",
-            value=(
-                "1. Open the **ARC Overlay** app on your PC\n"
-                "2. On first launch, paste this code in the **Pair Code** field\n"
-                f"3. API URL: `{os.getenv('RAILWAY_PUBLIC_DOMAIN', 'https://your-bot.up.railway.app')}`\n"
-                "⏱️ This code expires in **5 minutes**."
-            ),
-            inline=False,
-        )
-        embed.set_footer(text="Code is single-use and tied to your Discord account.")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            api_url = "https://cryonic-gaming-bot-production.up.railway.app"
+            line1 = "1. Open the **ARC Overlay** app on your PC"
+            line2 = "2. On first launch, paste this code in the **Pair Code** field"
+            line3 = f"3. API URL: `{api_url}`"
+            line4 = "This code expires in **5 minutes**."
+            instructions = f"{line1}\n{line2}\n{line3}\n{line4}"
 
+            embed = discord.Embed(
+                title="ARC Overlay - Pairing Code",
+                colour=discord.Colour.from_rgb(0, 180, 212),
+            )
+            embed.add_field(name="Your Code", value=f"```{code}```", inline=False)
+            embed.add_field(name="Instructions", value=instructions, inline=False)
+            embed.set_footer(text="Code is single-use and tied to your Discord account.")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            print(f"[OverlayAPI] /overlay_pair error: {e}", flush=True)
+            try:
+                await interaction.response.send_message(
+                    f"Error generating pairing code: {e}", ephemeral=True
+                )
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # Required by discord.py cog loader — bot.py auto-loads this file
