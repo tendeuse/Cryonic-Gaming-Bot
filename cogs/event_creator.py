@@ -8,25 +8,34 @@
 # 2) Creator can choose posting target:
 #       - "wh-op-sec-events"  -> ARC Security only event
 #       - "eve-announcements" -> visible to ARC Security + ARC Subsidized
-# 3) If posting to security-only channel, ARC Security role is pinged.
-# 4) If posting to public announcements channel, both ARC Security and ARC Subsidized are pinged once.
-# 5) RSVP buttons update signup counts on the event embed.
-# 6) At/after event time, creator gets one DM per participant to confirm presence.
-# 7) For each confirmed "Yes":
+# 3) Event embed shows FULL attendance list by button category:
+#       - Accept
+#       - Damage
+#       - Logi
+#       - Salvager
+#       - Tentative
+#       - Decline
+#    and displays the PLAYER NAMES / mentions of everyone who clicked.
+# 4) If posting to security-only channel, ARC Security role is pinged.
+# 5) If posting to public announcements channel, both ARC Security and ARC Subsidized are pinged once.
+# 6) RSVP buttons update signup counts + attendance names on the event embed.
+# 7) At/after event time, creator gets one DM per participant to confirm presence.
+# 8) For each confirmed "Yes":
 #       - Creator gets +5 AP
 #       - Creator gets +10% of that participant's AP earnings for 24h
 #         via /data/ap_boosts.json
 #       - Excluded if creator has:
 #           "ARC Security Administration Council"
 #           "ARC Security Corporation Leader"
-# 8) Confirmed participants are logged in #arc-hierarchy-log
-# 9) Persistent buttons survive restart.
+# 9) Confirmed participants are logged in #arc-hierarchy-log
+# 10) Persistent buttons survive restart.
 #
 # NOTES
 # -----
 # - security-only channel: wh-op-sec-events
 # - public channel:        eve-announcements
 # - This version is full copy/paste ready.
+# - Attendance names are stored by user ID and rendered as mentions in the embed.
 
 import asyncio
 import json
@@ -72,6 +81,8 @@ EVENT_TARGETS = {
     "security_only": SECURITY_ONLY_CHANNEL,
     "public": PUBLIC_CHANNEL,
 }
+
+DISPLAY_ORDER = ["Accept", "Damage", "Logi", "Salvager", "Tentative", "Decline"]
 
 _lock: Optional[asyncio.Lock] = None
 
@@ -203,19 +214,6 @@ def current_confirmed_ids(event: Dict[str, Any]) -> List[int]:
     return sorted(set(out))
 
 
-def build_signup_field_value(event: Dict[str, Any]) -> str:
-    roles = event.get("roles", {})
-    if not isinstance(roles, dict):
-        return "_No signups yet._"
-
-    lines = []
-    for role_name, ids in roles.items():
-        count = len(ids) if isinstance(ids, list) else 0
-        lines.append(f"{role_name}: {count}")
-
-    return "\n".join(lines) if lines else "_No signups yet._"
-
-
 def target_label(target: str) -> str:
     return {
         "security_only": "Security Only",
@@ -243,6 +241,154 @@ def resolve_ping_mentions(guild: discord.Guild, target: str) -> str:
             mentions.append(subsidized_role.mention)
 
     return " ".join(mentions)
+
+
+def chunk_lines(lines: List[str], max_len: int = 1000) -> List[str]:
+    if not lines:
+        return ["_(none)_"]
+
+    chunks: List[str] = []
+    current = ""
+
+    for line in lines:
+        add = line if not current else f"{current}\n{line}"
+        if len(add) > max_len:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = add
+
+    if current:
+        chunks.append(current)
+
+    return chunks if chunks else ["_(none)_"]
+
+
+def build_attendance_fields(event: Dict[str, Any]) -> List[tuple[str, str, bool]]:
+    roles = event.get("roles", {})
+    if not isinstance(roles, dict):
+        return [("📋 Attendance", "_No signups yet._", False)]
+
+    fields: List[tuple[str, str, bool]] = []
+    total_count = 0
+
+    for role_name in DISPLAY_ORDER:
+        ids = roles.get(role_name, [])
+        if not isinstance(ids, list):
+            ids = []
+
+        cleaned_ids: List[int] = []
+        seen: Set[int] = set()
+        for uid in ids:
+            if isinstance(uid, int) and uid not in seen:
+                seen.add(uid)
+                cleaned_ids.append(uid)
+
+        total_count += len(cleaned_ids)
+        mention_lines = [f"- <@{uid}>" for uid in cleaned_ids]
+        chunks = chunk_lines(mention_lines, max_len=1000)
+
+        for idx, chunk in enumerate(chunks, start=1):
+            if len(chunks) == 1:
+                field_name = f"{role_name} ({len(cleaned_ids)})"
+            else:
+                field_name = f"{role_name} ({len(cleaned_ids)}) [{idx}/{len(chunks)}]"
+            fields.append((field_name, chunk, False))
+
+    if not fields:
+        fields.append(("📋 Attendance", "_No signups yet._", False))
+
+    return fields
+
+
+def build_event_embed(
+    *,
+    event: Dict[str, Any],
+    guild: Optional[discord.Guild] = None,
+) -> discord.Embed:
+    title = str(event.get("title") or "Event")
+    description = str(event.get("description") or "")
+    timestamp_int = int(event.get("timestamp") or 0)
+    target = str(event.get("target") or "public")
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if timestamp_int > 0:
+        embed.add_field(
+            name="🕒 Time",
+            value=f"<t:{timestamp_int}:F>\n<t:{timestamp_int}:R>",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="🕒 Time",
+            value="Unknown",
+            inline=False
+        )
+
+    embed.add_field(
+        name="📡 Audience",
+        value=target_label(target),
+        inline=False
+    )
+
+    attendance_fields = build_attendance_fields(event)
+    for name, value, inline in attendance_fields:
+        embed.add_field(name=name, value=value, inline=inline)
+
+    creator_id = event.get("creator")
+    if isinstance(creator_id, int):
+        embed.set_footer(text=f"Created by user ID {creator_id}")
+
+    return embed
+
+
+async def refresh_event_message(bot: commands.Bot, event_id: str) -> bool:
+    data = await load_events()
+    event = data.get(event_id)
+    if not isinstance(event, dict):
+        return False
+
+    guild_id = event.get("guild_id")
+    channel_id = event.get("channel")
+    message_id = event.get("message")
+
+    if not isinstance(guild_id, int) or not isinstance(channel_id, int) or not isinstance(message_id, int):
+        return False
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return False
+
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return False
+
+    roles_map = event.get("roles", {})
+    buttons = {
+        str(k).strip().lower()
+        for k in roles_map.keys()
+        if str(k).strip().lower() in RSVP_TYPES
+    }
+    if not buttons:
+        buttons = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
+
+    redirect_url = str(event.get("redirect_url") or "")
+    embed = build_event_embed(event=event, guild=guild)
+    view = EventView(event_id, buttons, redirect_url)
+
+    try:
+        msg = await channel.fetch_message(message_id)
+        await msg.edit(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        return True
+    except Exception:
+        return False
 
 
 async def log_confirmed_participants(
@@ -591,28 +737,34 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         event_id = str(uuid.uuid4())
         timestamp = int(event_dt.timestamp())
 
-        embed = discord.Embed(
-            title=self.name.value,
-            description=self.description.value,
-            color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(
-            name="🕒 Time",
-            value=f"<t:{timestamp}:F>\n<t:{timestamp}:R>",
-            inline=False
-        )
-        embed.add_field(
-            name="📊 Fleet Signup",
-            value="\n".join(f"{b.title()}: 0" for b in sorted(selected_buttons)),
-            inline=False
-        )
-        embed.add_field(
-            name="📡 Audience",
-            value=target_label(self.target),
-            inline=False
-        )
+        event_record = {
+            "title": self.name.value,
+            "description": self.description.value,
+            "creator": self.creator_id,
+            "timestamp": timestamp,
+            "guild_id": guild.id,
+            "channel": channel.id,
+            "channel_name": channel.name,
+            "message": None,
+            "target": self.target,
+            "roles": {b.title(): [] for b in DISPLAY_ORDER if b.lower() in RSVP_TYPES},
+            "redirect_url": self.redirect_url.value.strip(),
+            "active": True,
+            "presence": {},
+            "presence_dm_sent_to": [],
+            "presence_started": False,
+            "presence_started_utc": None,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+        }
 
+        for selected in sorted(selected_buttons):
+            title_name = selected.title()
+            event_record["roles"].setdefault(title_name, [])
+
+        for default_name in DISPLAY_ORDER:
+            event_record["roles"].setdefault(default_name, [])
+
+        embed = build_event_embed(event=event_record, guild=guild)
         view = EventView(event_id, selected_buttons, self.redirect_url.value.strip())
 
         try:
@@ -630,25 +782,10 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
             )
             return
 
+        event_record["message"] = msg.id
+
         data = await load_events()
-        data[event_id] = {
-            "title": self.name.value,
-            "creator": self.creator_id,
-            "timestamp": timestamp,
-            "guild_id": guild.id,
-            "channel": channel.id,
-            "channel_name": channel.name,
-            "message": msg.id,
-            "target": self.target,
-            "roles": {b.title(): [] for b in sorted(selected_buttons)},
-            "redirect_url": self.redirect_url.value.strip(),
-            "active": True,
-            "presence": {},
-            "presence_dm_sent_to": [],
-            "presence_started": False,
-            "presence_started_utc": None,
-            "created_utc": datetime.now(timezone.utc).isoformat(),
-        }
+        data[event_id] = event_record
         await save_events(data)
 
         await interaction.response.send_message(
@@ -694,61 +831,19 @@ class EditEventModal(discord.ui.Modal, title="Edit Event"):
             )
             return
 
+        event["description"] = self.description.value
         event["timestamp"] = int(event_dt.timestamp())
 
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Guild not found.", ephemeral=True)
-            return
-
-        channel = guild.get_channel(event.get("channel"))
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Event channel missing.", ephemeral=True)
-            await save_events(data)
-            return
-
-        try:
-            msg = await channel.fetch_message(event["message"])
-        except Exception as e:
-            await interaction.response.send_message(
-                f"Could not fetch event message: `{type(e).__name__}: {e}`",
-                ephemeral=True
-            )
-            await save_events(data)
-            return
-
-        if not msg.embeds:
-            await interaction.response.send_message("Event message has no embed to edit.", ephemeral=True)
-            return
-
-        old_embed = msg.embeds[0]
-        embed = discord.Embed.from_dict(old_embed.to_dict())
-        embed.description = self.description.value
-
-        if len(embed.fields) >= 1:
-            embed.set_field_at(
-                0,
-                name="🕒 Time",
-                value=f"<t:{event['timestamp']}:F>\n<t:{event['timestamp']}:R>",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name="🕒 Time",
-                value=f"<t:{event['timestamp']}:F>\n<t:{event['timestamp']}:R>",
-                inline=False
-            )
-
-        try:
-            await msg.edit(embed=embed)
-        except Exception as e:
-            await interaction.response.send_message(
-                f"Failed to edit event message: `{type(e).__name__}: {e}`",
-                ephemeral=True
-            )
-            return
-
         await save_events(data)
+
+        ok = await refresh_event_message(interaction.client, self.event_id)
+        if not ok:
+            await interaction.response.send_message(
+                "Event data saved, but I could not refresh the posted message.",
+                ephemeral=True
+            )
+            return
+
         await interaction.response.send_message("Event updated.", ephemeral=True)
 
 
@@ -854,14 +949,20 @@ class RSVPButton(discord.ui.Button):
             roles_map = {}
             event["roles"] = roles_map
 
+        for default_name in DISPLAY_ORDER:
+            roles_map.setdefault(default_name, [])
+
         for users in roles_map.values():
             if isinstance(users, list):
                 while uid in users:
                     users.remove(uid)
 
-        roles_map.setdefault(self.rsvp_type.title(), [])
-        if uid not in roles_map[self.rsvp_type.title()]:
-            roles_map[self.rsvp_type.title()].append(uid)
+        target_key = self.rsvp_type.title()
+        roles_map.setdefault(target_key, [])
+        if uid not in roles_map[target_key]:
+            roles_map[target_key].append(uid)
+
+        event["last_signup_update_utc"] = datetime.now(timezone.utc).isoformat()
 
         try:
             if temp_role:
@@ -873,29 +974,7 @@ class RSVPButton(discord.ui.Button):
             pass
 
         await save_events(data)
-
-        channel = guild.get_channel(event.get("channel"))
-        if isinstance(channel, discord.TextChannel):
-            try:
-                msg = await channel.fetch_message(event["message"])
-                if msg.embeds:
-                    embed = discord.Embed.from_dict(msg.embeds[0].to_dict())
-                    if len(embed.fields) >= 2:
-                        embed.set_field_at(
-                            1,
-                            name="📊 Fleet Signup",
-                            value=build_signup_field_value(event),
-                            inline=False
-                        )
-                    else:
-                        embed.add_field(
-                            name="📊 Fleet Signup",
-                            value=build_signup_field_value(event),
-                            inline=False
-                        )
-                    await msg.edit(embed=embed, view=self.view)
-            except Exception:
-                pass
+        await refresh_event_message(interaction.client, self.view.event_id)
 
         await interaction.response.send_message(
             f"Registered as **{self.rsvp_type.title()}**.",
