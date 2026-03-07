@@ -565,5 +565,9 @@ class MissionCog(commands.Cog, name="Missions"):
 # ---------------------------------------------------------------------------
 
 async def setup(bot: commands.Bot):
+    from pathlib import Path
+    db_path = str(Path(os.getenv("MISSION_DB_PATH", "/data/missions.db")))
     await bot.add_cog(MissionCog(bot))
+    await bot.add_cog(OverlayApiCog(bot, db_path))
     print("[MissionCog] Cog registered.")
+    print("[OverlayApiCog] Cog registered.")
