@@ -36,6 +36,7 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+import httpx
 
 import discord
 from discord import app_commands
@@ -254,6 +255,75 @@ def build_api(bot: commands.Bot, db_path: str) -> "FastAPI":
         # TODO: Fetch from ESI using stored EVE OAuth2 token for user_id
         # For now return None → overlay shows "—" gracefully
         return None
+
+    # ------------------------------------------------------------------
+    # ESI — Faction Standings
+    # Fetches standings from the EVE ESI public API.
+    # Requires the user to have linked their EVE character via ESI OAuth2.
+    # Until OAuth2 is implemented, returns an empty list so the overlay
+    # falls back to manual standing input gracefully.
+    # ------------------------------------------------------------------
+    @app.get("/overlay/api/v1/standings")
+    async def get_standings(user_id: int = Depends(get_current_user)):
+        """
+        Returns a list of faction standings for the authenticated pilot.
+        Format:
+          [
+            { "faction_id": 500001, "faction_name": "Caldari State",
+              "standing": 3.72, "modified": false },
+            ...
+          ]
+        Requires ESI OAuth2 scope: esi-characters.read_standings.v1
+        Falls back to [] until OAuth2 is wired up.
+        """
+        # ── ESI faction ID → display name map ───────────────────────
+        FACTION_NAMES = {
+            500001: "Caldari State",
+            500002: "Minmatar Republic",
+            500003: "Amarr Empire",
+            500004: "Gallente Federation",
+            500005: "Jove Empire",
+            500010: "CONCORD Assembly",
+            500011: "Ammatar Mandate",
+            500012: "Khanid Kingdom",
+            500013: "The Syndicate",
+            500014: "Guristas Pirates",
+            500015: "Angel Cartel",
+            500016: "Blood Raider Covenant",
+            500017: "The Servant Sisters of EVE",
+            500018: "The Society of Conscious Thought",
+            500019: "Mordu's Legion Command",
+            500020: "Sansha's Nation",
+            500021: "Serpentis",
+            500024: "Outer Ring Excavations",  # ORE
+            500026: "EDENCOM",
+            500027: "Triglavian Collective",
+        }
+
+        # TODO: Replace with real ESI call using stored OAuth2 token for user_id
+        # Example ESI call (once OAuth2 is implemented):
+        #
+        # async with httpx.AsyncClient() as client:
+        #     r = await client.get(
+        #         f"https://esi.evetech.net/latest/characters/{character_id}/standings/",
+        #         headers={"Authorization": f"Bearer {access_token}"}
+        #     )
+        #     data = r.json()
+        #     # data is a list of {"from_id": int, "from_type": str, "standing": float}
+        #     factions = [
+        #         {
+        #             "faction_id":   e["from_id"],
+        #             "faction_name": FACTION_NAMES.get(e["from_id"], str(e["from_id"])),
+        #             "standing":     round(e["standing"], 2),
+        #             "modified":     False,
+        #         }
+        #         for e in data if e["from_type"] == "faction"
+        #     ]
+        #     return factions
+
+        # Stub — returns empty list until ESI OAuth2 is wired up
+        # The overlay will show manual input fields in this case
+        return []
 
     # ------------------------------------------------------------------
     # Intel reports
