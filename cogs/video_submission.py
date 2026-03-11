@@ -38,7 +38,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
-print("VIDEO_SUBMISSION LOADED VERSION: 2026-02-15-FULLFIX+RECALC")
+print("VIDEO_SUBMISSION LOADED VERSION: 2026-03-10-FULLFIX+RECALC+NODOUBLEAP")
 
 # =====================
 # PERSISTENCE (Railway Volume)
@@ -580,6 +580,9 @@ class VideoSubmissionCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+        # Per-key locks — prevents double-AP when two coroutines race to approve the same video
+        self._decision_locks: dict[str, asyncio.Lock] = {}
+
         # YouTube client
         self.youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, cache_discovery=False)
 
@@ -673,6 +676,12 @@ class VideoSubmissionCog(commands.Cog):
 
             custom_id = interaction.data.get("custom_id")
             if not custom_id:
+                return
+
+            # NEW-format buttons (video:approve:<key> / video:reject:<key>) are already
+            # handled by the persistent ApprovalView callbacks. Dispatching them here too
+            # is exactly what causes the double-AP bug — skip them entirely.
+            if re.fullmatch(r"video:(approve|reject):.+", str(custom_id)):
                 return
 
             key, approve = self._parse_custom_id_for_key(str(custom_id), interaction)
@@ -1215,132 +1224,138 @@ class VideoSubmissionCog(commands.Cog):
             await safe_send(interaction, "❌ Only the CEO and Directors can approve/reject videos.", ephemeral=True)
             return
 
-        videos = await load(VIDEO_FILE)
-        ap_data = await load(AP_FILE)
-        audits = await load(AUDIT_FILE)
-
-        if not isinstance(videos, dict):
-            videos = {}
-        if not isinstance(ap_data, dict):
-            ap_data = {}
-        if not isinstance(audits, dict):
-            audits = {}
-
+        # Acquire a per-key lock so that two simultaneous button-click coroutines
+        # (or a button click racing with /video_force_decide) cannot both see
+        # approved=None and award AP twice.
         key = str(key).strip()
-        if key not in videos:
-            await safe_send(interaction, f"❌ Video not found for key `{key}`.", ephemeral=False)
-            return
+        if key not in self._decision_locks:
+            self._decision_locks[key] = asyncio.Lock()
+        async with self._decision_locks[key]:
+            videos = await load(VIDEO_FILE)
+            ap_data = await load(AP_FILE)
+            audits = await load(AUDIT_FILE)
 
-        video = videos[key]
-        if not isinstance(video, dict):
-            await safe_send(interaction, "❌ Video record is corrupted (not a dict).", ephemeral=False)
-            return
+            if not isinstance(videos, dict):
+                videos = {}
+            if not isinstance(ap_data, dict):
+                ap_data = {}
+            if not isinstance(audits, dict):
+                audits = {}
 
-        if video.get("approved") is not None:
-            await safe_send(interaction, "⚠️ Already processed.", ephemeral=False)
-            return
+            if key not in videos:
+                await safe_send(interaction, f"❌ Video not found for key `{key}`.", ephemeral=False)
+                return
 
-        submitter_id = int(video.get("submitter", 0) or 0)
-        if submitter_id <= 0:
-            await safe_send(
-                interaction,
-                "❌ This submission has no valid submitter recorded (submitter=0). "
-                f"Fix it with `/video_set_submitter key:{key} member:@User` then approve again.",
-                ephemeral=False
-            )
-            return
+            video = videos[key]
+            if not isinstance(video, dict):
+                await safe_send(interaction, "❌ Video record is corrupted (not a dict).", ephemeral=False)
+                return
 
-        # SAFETY: if legacy row never had metadata, force recalc first
-        if approve and (float(video.get("duration", 0) or 0) <= 0 or int(video.get("ap", 0) or 0) <= 0):
-            await safe_send(
-                interaction,
-                f"❌ This submission still has **0 duration/AP**. Run `/video_recalc key:{key}` first, then approve.",
-                ephemeral=False
-            )
-            return
+            if video.get("approved") is not None:
+                await safe_send(interaction, "⚠️ Already processed.", ephemeral=False)
+                return
 
-        submitter = interaction.guild.get_member(submitter_id)
-        if submitter is None:
+            submitter_id = int(video.get("submitter", 0) or 0)
+            if submitter_id <= 0:
+                await safe_send(
+                    interaction,
+                    "❌ This submission has no valid submitter recorded (submitter=0). "
+                    f"Fix it with `/video_set_submitter key:{key} member:@User` then approve again.",
+                    ephemeral=False
+                )
+                return
+
+            # SAFETY: if legacy row never had metadata, force recalc first
+            if approve and (float(video.get("duration", 0) or 0) <= 0 or int(video.get("ap", 0) or 0) <= 0):
+                await safe_send(
+                    interaction,
+                    f"❌ This submission still has **0 duration/AP**. Run `/video_recalc key:{key}` first, then approve.",
+                    ephemeral=False
+                )
+                return
+
+            submitter = interaction.guild.get_member(submitter_id)
+            if submitter is None:
+                try:
+                    submitter = await interaction.guild.fetch_member(submitter_id)
+                except Exception:
+                    submitter = None
+
+            awarded_ap = 0
+            ceo_bonus_each = 0
+            ts = now_iso()
+
+            if approve:
+                awarded_ap = int(video.get("ap", 0) or 0)
+                uid = str(submitter_id)
+
+                ap_data.setdefault(uid, {"ap": 0})
+                ap_data[uid]["ap"] = int(ap_data[uid].get("ap", 0) or 0) + awarded_ap
+
+                had_security = video.get("submitter_had_security")
+                if had_security is None and submitter:
+                    had_security = any(r.name == SECURITY_ROLE for r in submitter.roles)
+                had_security = bool(had_security)
+
+                if had_security:
+                    ceo_bonus_each = int(awarded_ap * 0.10)
+                    for leader in corp_ceos(interaction.guild):
+                        lid = str(leader.id)
+                        ap_data.setdefault(lid, {"ap": 0})
+                        ap_data[lid]["ap"] = int(ap_data[lid].get("ap", 0) or 0) + ceo_bonus_each
+
+                await save(AP_FILE, ap_data)
+
+                await post_points_distribution_confirmation(
+                    interaction.guild,
+                    submitter=submitter,
+                    submitter_id=submitter_id,
+                    title=str(video.get("title", "Untitled")),
+                    url=str(video.get("url", "")),
+                    seconds=float(video.get("duration", 0) or 0),
+                    awarded_ap=int(awarded_ap),
+                    decided_by=interaction.user,
+                    ceo_bonus_each=int(ceo_bonus_each),
+                    ts_iso=ts
+                )
+
+            video["approved"] = bool(approve)
+            audits[str(video.get("fingerprint", ""))] = {
+                "video_key": key,
+                "approved": bool(approve),
+                "ap": int(video.get("ap", 0) or 0) if approve else 0,
+                "decided_by": interaction.user.id,
+                "timestamp": ts
+            }
+
+            await save(VIDEO_FILE, videos)
+            await save(AUDIT_FILE, audits)
+
             try:
-                submitter = await interaction.guild.fetch_member(submitter_id)
+                if interaction.message and interaction.message.embeds:
+                    base = interaction.message.embeds[0]
+                    updated = decision_embed(base, approved=bool(approve), decided_by=interaction.user, ts_iso=ts)
+                    disabled = disable_view(ApprovalView(self, key))
+                    await interaction.message.edit(embed=updated, view=disabled)
             except Exception:
-                submitter = None
+                pass
 
-        awarded_ap = 0
-        ceo_bonus_each = 0
-        ts = now_iso()
+            status = "✅ Approved" if approve else "❌ Rejected"
+            who = interaction.user.mention
+            sub = submitter.mention if submitter else f"<@{submitter_id}>"
+            title = str(video.get("title", "Untitled"))
 
-        if approve:
-            awarded_ap = int(video.get("ap", 0) or 0)
-            uid = str(submitter_id)
+            extra = ""
+            if approve:
+                extra = f" — Awarded **+{int(video.get('ap', 0) or 0)} AP**"
+                if ceo_bonus_each > 0:
+                    extra += f" (CEO bonus: **+{ceo_bonus_each} AP** each)"
 
-            ap_data.setdefault(uid, {"ap": 0})
-            ap_data[uid]["ap"] = int(ap_data[uid].get("ap", 0) or 0) + awarded_ap
-
-            had_security = video.get("submitter_had_security")
-            if had_security is None and submitter:
-                had_security = any(r.name == SECURITY_ROLE for r in submitter.roles)
-            had_security = bool(had_security)
-
-            if had_security:
-                ceo_bonus_each = int(awarded_ap * 0.10)
-                for leader in corp_ceos(interaction.guild):
-                    lid = str(leader.id)
-                    ap_data.setdefault(lid, {"ap": 0})
-                    ap_data[lid]["ap"] = int(ap_data[lid].get("ap", 0) or 0) + ceo_bonus_each
-
-            await save(AP_FILE, ap_data)
-
-            await post_points_distribution_confirmation(
-                interaction.guild,
-                submitter=submitter,
-                submitter_id=submitter_id,
-                title=str(video.get("title", "Untitled")),
-                url=str(video.get("url", "")),
-                seconds=float(video.get("duration", 0) or 0),
-                awarded_ap=int(awarded_ap),
-                decided_by=interaction.user,
-                ceo_bonus_each=int(ceo_bonus_each),
-                ts_iso=ts
+            await safe_send(
+                interaction,
+                f"{status} by {who} — {sub} — **{title}**{extra}",
+                ephemeral=False
             )
-
-        video["approved"] = bool(approve)
-        audits[str(video.get("fingerprint", ""))] = {
-            "video_key": key,
-            "approved": bool(approve),
-            "ap": int(video.get("ap", 0) or 0) if approve else 0,
-            "decided_by": interaction.user.id,
-            "timestamp": ts
-        }
-
-        await save(VIDEO_FILE, videos)
-        await save(AUDIT_FILE, audits)
-
-        try:
-            if interaction.message and interaction.message.embeds:
-                base = interaction.message.embeds[0]
-                updated = decision_embed(base, approved=bool(approve), decided_by=interaction.user, ts_iso=ts)
-                disabled = disable_view(ApprovalView(self, key))
-                await interaction.message.edit(embed=updated, view=disabled)
-        except Exception:
-            pass
-
-        status = "✅ Approved" if approve else "❌ Rejected"
-        who = interaction.user.mention
-        sub = submitter.mention if submitter else f"<@{submitter_id}>"
-        title = str(video.get("title", "Untitled"))
-
-        extra = ""
-        if approve:
-            extra = f" — Awarded **+{int(video.get('ap', 0) or 0)} AP**"
-            if ceo_bonus_each > 0:
-                extra += f" (CEO bonus: **+{ceo_bonus_each} AP** each)"
-
-        await safe_send(
-            interaction,
-            f"{status} by {who} — {sub} — **{title}**{extra}",
-            ephemeral=False
-        )
 
 
 async def setup(bot: commands.Bot):
