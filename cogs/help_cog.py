@@ -145,7 +145,9 @@ class HelpCog(commands.Cog):
         cog_commands: dict[str, list[str]] = {}
 
         for cmd in self.bot.tree.walk_commands():
-            cog_name = getattr(cmd, "cog_name", None) or "No Category"
+            # app_commands use `binding` (the cog instance), not `cog_name`
+            binding = getattr(cmd, "binding", None)
+            cog_name = getattr(binding, "qualified_name", None) or "No Category"
             qn = getattr(cmd, "qualified_name", cmd.name)
             desc = (cmd.description or "No description").strip()
             cog_commands.setdefault(cog_name, []).append(f"/{qn} — {desc}")
