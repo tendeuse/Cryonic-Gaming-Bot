@@ -546,6 +546,9 @@ class OverlayApiCog(commands.Cog, name="OverlayAPI"):
         description="Generate a pairing code to link the ARC Overlay desktop app to your account.",
     )
     async def overlay_pair(self, interaction: discord.Interaction):
+        # Defer immediately — guarantees Discord gets an ACK within 3s
+        # regardless of what happens next. Prevents "Unknown Integration".
+        await interaction.response.defer(ephemeral=True)
         try:
             code       = secrets.token_hex(4).upper()
             expires_at = time.time() + 300
@@ -556,29 +559,31 @@ class OverlayApiCog(commands.Cog, name="OverlayAPI"):
             }
 
             api_url = "https://cryonic-gaming-bot-production.up.railway.app"
-            line1 = "1. Open the **ARC Overlay** app on your PC"
-            line2 = "2. On first launch, paste this code in the **Pair Code** field"
-            line3 = f"3. API URL: `{api_url}`"
-            line4 = "This code expires in **5 minutes**."
-            instructions = f"{line1}\n{line2}\n{line3}\n{line4}"
+            instructions = (
+                "1. Ouvrez l'**ARC Overlay** sur votre PC\n"
+                "2. Cliquez sur **⚙** dans la barre de titre → **Re-pair**\n"
+                f"3. API URL : `{api_url}`\n"
+                "Ce code expire dans **5 minutes**."
+            )
 
             embed = discord.Embed(
-                title="ARC Overlay - Pairing Code",
+                title="ARC Overlay — Pairing Code",
                 colour=discord.Colour.from_rgb(0, 180, 212),
             )
-            embed.add_field(name="Your Code", value=f"```{code}```", inline=False)
+            embed.add_field(name="Votre code", value=f"```{code}```", inline=False)
             embed.add_field(name="Instructions", value=instructions, inline=False)
-            embed.set_footer(text="Code is single-use and tied to your Discord account.")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            embed.set_footer(text="Code à usage unique, lié à votre compte Discord.")
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
             print(f"[OverlayAPI] /overlay_pair error: {e}", flush=True)
             try:
-                await interaction.response.send_message(
-                    f"Error generating pairing code: {e}", ephemeral=True
+                await interaction.followup.send(
+                    f"⚠️ Erreur lors de la génération du code : {e}",
+                    ephemeral=True
                 )
-            except Exception:
-                pass
+            except Exception as e2:
+                print(f"[OverlayAPI] followup also failed: {e2}", flush=True)
 
 # ---------------------------------------------------------------------------
 # Required by discord.py cog loader — bot.py auto-loads this file
