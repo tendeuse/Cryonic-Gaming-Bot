@@ -65,8 +65,20 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-JWT_SECRET   = os.getenv("OVERLAY_JWT_SECRET", secrets.token_hex(32))
-API_PORT     = int(os.getenv("PORT", os.getenv("OVERLAY_API_PORT", "8080")))  # Railway injecte $PORT
+_raw_secret = os.getenv("OVERLAY_JWT_SECRET")
+if not _raw_secret:
+    print("[OverlayAPI] ⚠️  OVERLAY_JWT_SECRET not set in environment!")
+    print("[OverlayAPI]    Tokens will be invalidated on every bot restart.")
+    print("[OverlayAPI]    Set OVERLAY_JWT_SECRET in Railway environment variables.")
+    _raw_secret = secrets.token_hex(32)
+JWT_SECRET = _raw_secret
+# Railway injects $PORT — must use it or nginx 502s.
+# Read at startup so Railway has time to inject it before on_ready fires.
+def _get_api_port() -> int:
+    raw = os.getenv("PORT") or os.getenv("OVERLAY_API_PORT") or "8080"
+    port = int(raw)
+    print(f"[OverlayAPI] Will bind on port {port} ($PORT={os.getenv('PORT', 'not set')})")
+    return port
 TOKEN_TTL_H  = int(os.getenv("OVERLAY_TOKEN_TTL_H", "720"))   # 30 days
 ALGORITHM    = "HS256"
 
@@ -245,6 +257,22 @@ def build_api(bot: commands.Bot, db_path: str) -> "FastAPI":
             "UPDATE missions SET status='completed', updated_at=? WHERE id=? AND status='in_progress'",
             (_now(), mission_id))
         return _row_to_mission(_db_fetchone(db_path, "SELECT * FROM missions WHERE id=?", (mission_id,)))
+
+    # ------------------------------------------------------------------
+    # Health check — no auth, always reachable
+    # Returns: bot status, dependency status, uptime
+    # ------------------------------------------------------------------
+    @app.get("/overlay/api/v1/health")
+    async def health():
+        return {
+            "status":    "ok",
+            "bot_ready": bot.is_ready(),
+            "guilds":    len(bot.guilds),
+            "fastapi":   _FASTAPI_OK,
+            "jose":      _JOSE_OK,
+            "jwt_secret_set": bool(os.getenv("OVERLAY_JWT_SECRET")),
+            "uptime":    time.time(),
+        }
 
     # ------------------------------------------------------------------
     # Character (stub — real ESI integration requires EVE SSO OAuth2)
@@ -477,15 +505,33 @@ class OverlayApiCog(commands.Cog, name="OverlayAPI"):
             return   # already running
 
         app = build_api(self.bot, self.db_path)
-        config = uvicorn.Config(app, host="0.0.0.0", port=API_PORT,
-                                log_level="info", loop="none")
+        port = _get_api_port()
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=port,
+            log_level="info",
+            loop="none",
+            lifespan="off",
+        )
         self._server = uvicorn.Server(config)
 
+        def _run_server():
+            """Run uvicorn in its own event loop — required when the discord.py
+            bot already owns the main event loop on the main thread."""
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._server.serve())
+            finally:
+                loop.close()
+
         self._thread = threading.Thread(
-            target=self._server.run, daemon=True, name="overlay-api"
+            target=_run_server, daemon=True, name="overlay-api"
         )
         self._thread.start()
-        print(f"[OverlayAPI] Server running on port {API_PORT} (Railway $PORT={os.getenv('PORT', 'not set')})")
+        print(f"[OverlayAPI] FastAPI server starting on 0.0.0.0:{port}")
 
     def cog_unload(self):
         if self._server:
