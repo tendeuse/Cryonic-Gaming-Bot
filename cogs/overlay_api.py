@@ -82,10 +82,23 @@ def _get_api_port() -> int:
 TOKEN_TTL_H  = int(os.getenv("OVERLAY_TOKEN_TTL_H", "720"))   # 30 days
 ALGORITHM    = "HS256"
 
+# EVE SSO OAuth2 config
+# Register your app at https://developers.eveonline.com
+# Callback URL must be set to: https://<your-railway-domain>/overlay/api/v1/eve/callback
+EVE_CLIENT_ID     = os.getenv("EVE_CLIENT_ID", "")
+EVE_CLIENT_SECRET = os.getenv("EVE_CLIENT_SECRET", "")
+EVE_CALLBACK_URL  = os.getenv("EVE_CALLBACK_URL", "")
+EVE_SCOPES        = "esi-characters.read_standings.v1 esi-location.read_location.v1 esi-location.read_ship_type.v1"
+EVE_SSO_AUTH_URL  = "https://login.eveonline.com/v2/oauth/authorize"
+EVE_SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
+EVE_SSO_VERIFY_URL= "https://esi.evetech.net/verify/"
+
 # In-memory stores (reset on restart — acceptable for ephemeral data)
 _pair_codes: dict[str, dict] = {}   # code → {discord_user_id, expires_at}
 _intel_store: list[dict]     = []   # recent intel reports (last 50)
 _MAX_INTEL   = 50
+# EVE OAuth2 state → discord_user_id (expires after 10 min)
+_eve_oauth_states: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +272,102 @@ def build_api(bot: commands.Bot, db_path: str) -> "FastAPI":
         return _row_to_mission(_db_fetchone(db_path, "SELECT * FROM missions WHERE id=?", (mission_id,)))
 
     # ------------------------------------------------------------------
+    # EVE SSO OAuth2 — /eve/link  /eve/callback  /eve/status  /eve/unlink
+    # ------------------------------------------------------------------
+
+    @app.get("/overlay/api/v1/eve/link")
+    async def eve_link(user_id: int = Depends(get_current_user)):
+        """Returns the EVE SSO authorization URL for this user."""
+        if not EVE_CLIENT_ID or not EVE_CALLBACK_URL:
+            raise HTTPException(status_code=503,
+                detail="EVE_CLIENT_ID / EVE_CALLBACK_URL not configured on server")
+        state = secrets.token_hex(16)
+        _eve_oauth_states[state] = {
+            "discord_user_id": user_id,
+            "expires_at":      time.time() + 600
+        }
+        from urllib.parse import urlencode
+        params = {
+            "response_type": "code",
+            "client_id":     EVE_CLIENT_ID,
+            "redirect_uri":  EVE_CALLBACK_URL,
+            "scope":         EVE_SCOPES,
+            "state":         state,
+        }
+        url = f"{EVE_SSO_AUTH_URL}?{urlencode(params)}"
+        return {"auth_url": url}
+
+    @app.get("/overlay/api/v1/eve/callback")
+    async def eve_callback(code: str, state: str):
+        """EVE SSO redirects here after the player authorises. No auth header needed.""""
+        # Validate state
+        entry = _eve_oauth_states.pop(state, None)
+        if entry is None or time.time() > entry["expires_at"]:
+            raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+        discord_user_id = entry["discord_user_id"]
+
+        # Exchange code for tokens
+        import base64
+        creds = base64.b64encode(f"{EVE_CLIENT_ID}:{EVE_CLIENT_SECRET}".encode()).decode()
+        async with httpx.AsyncClient() as client:
+            r = await client.post(EVE_SSO_TOKEN_URL,
+                headers={"Authorization": f"Basic {creds}",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                data={"grant_type":   "authorization_code",
+                      "code":         code,
+                      "redirect_uri": EVE_CALLBACK_URL}
+            )
+            if r.status_code != 200:
+                raise HTTPException(status_code=502,
+                    detail=f"EVE token exchange failed: {r.status_code}")
+            tokens = r.json()
+
+            # Verify token → get character info
+            v = await client.get(EVE_SSO_VERIFY_URL,
+                headers={"Authorization": f"Bearer {tokens['access_token']}"})
+            if v.status_code != 200:
+                raise HTTPException(status_code=502, detail="EVE token verify failed")
+            char = v.json()
+            character_id   = char["CharacterID"]
+            character_name = char["CharacterName"]
+
+        _save_eve_token(db_path, discord_user_id, character_id, character_name,
+                        tokens["access_token"], tokens["refresh_token"],
+                        tokens.get("expires_in", 1200))
+
+        # Return a friendly HTML page the browser shows after auth
+        html = f"""<!DOCTYPE html>
+<html><head><title>EVE Linked</title>
+<style>body{{background:#0a1a2f;color:#ccd6f6;font-family:Consolas;
+  display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
+.box{{text-align:center;border:1px solid #1e3148;padding:40px;border-radius:8px}}
+h1{{color:#00b4d4}}p{{color:#8a99aa}}</style></head>
+<body><div class="box">
+  <h1>✅ EVE Character Linked</h1>
+  <p><strong>{character_name}</strong> is now linked to your Discord account.</p>
+  <p>You can close this window and return to the overlay.</p>
+</div></body></html>"""
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(html)
+
+    @app.get("/overlay/api/v1/eve/status")
+    async def eve_status(user_id: int = Depends(get_current_user)):
+        """Returns linked character info, or null if not linked.""""
+        row = _get_eve_token(db_path, user_id)
+        if row is None:
+            return {"linked": False, "character_id": None, "character_name": None}
+        return {"linked": True,
+                "character_id":   row["character_id"],
+                "character_name": row["character_name"]}
+
+    @app.get("/overlay/api/v1/eve/unlink")
+    async def eve_unlink(user_id: int = Depends(get_current_user)):
+        _ensure_eve_tokens_table(db_path)
+        with _db_connect(db_path) as conn:
+            conn.execute("DELETE FROM eve_tokens WHERE discord_user_id=?", (user_id,))
+        return {"ok": True}
+
+    # ------------------------------------------------------------------
     # Health check — no auth, always reachable
     # Returns: bot status, dependency status, uptime
     # ------------------------------------------------------------------
@@ -280,9 +389,75 @@ def build_api(bot: commands.Bot, db_path: str) -> "FastAPI":
     # ------------------------------------------------------------------
     @app.get("/overlay/api/v1/character")
     async def get_character(user_id: int = Depends(get_current_user)):
-        # TODO: Fetch from ESI using stored EVE OAuth2 token for user_id
-        # For now return None → overlay shows "—" gracefully
-        return None
+        access_token = await _get_valid_access_token(db_path, user_id)
+        if access_token is None:
+            return None   # not linked → overlay shows "—"
+        row = _get_eve_token(db_path, user_id)
+        char_id = row["character_id"]
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                # Location
+                loc_r = await client.get(
+                    f"https://esi.evetech.net/latest/characters/{char_id}/location/",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                # Ship
+                ship_r = await client.get(
+                    f"https://esi.evetech.net/latest/characters/{char_id}/ship/",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                # Public info (corporation, security status)
+                pub_r = await client.get(
+                    f"https://esi.evetech.net/latest/characters/{char_id}/"
+                )
+
+                solar_system_id = loc_r.json().get("solar_system_id") if loc_r.is_success else None
+                ship_type_id    = ship_r.json().get("ship_type_id")   if ship_r.is_success else None
+                ship_name       = ship_r.json().get("ship_name", "")  if ship_r.is_success else ""
+                pub             = pub_r.json() if pub_r.is_success else {}
+
+                # Resolve solar system name
+                system_name = ""
+                if solar_system_id:
+                    sys_r = await client.get(
+                        f"https://esi.evetech.net/latest/universe/systems/{solar_system_id}/"
+                    )
+                    system_name = sys_r.json().get("name", "") if sys_r.is_success else ""
+
+                # Resolve ship type name
+                ship_type_name = ""
+                if ship_type_id:
+                    type_r = await client.get(
+                        f"https://esi.evetech.net/latest/universe/types/{ship_type_id}/"
+                    )
+                    ship_type_name = type_r.json().get("name", "") if type_r.is_success else ""
+
+                sec  = round(pub.get("security_status", 0.0), 1)
+                sec_colour = (
+                    "#2ECC71" if sec >= 0.5 else
+                    "#F39C12" if sec >= 0.0 else
+                    "#E74C3C"
+                )
+                corp_id = pub.get("corporation_id")
+                corp_name = ""
+                if corp_id:
+                    corp_r = await client.get(
+                        f"https://esi.evetech.net/latest/corporations/{corp_id}/"
+                    )
+                    corp_name = corp_r.json().get("name", "") if corp_r.is_success else ""
+
+                return {
+                    "character_name":  row["character_name"],
+                    "character_id":    char_id,
+                    "corporation":     corp_name,
+                    "ship_type":       ship_type_name or ship_name,
+                    "solar_system":    system_name,
+                    "security_status": sec,
+                    "security_colour": sec_colour,
+                }
+        except Exception as e:
+            print(f"[ESI] get_character error: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # ESI — Faction Standings
@@ -349,9 +524,33 @@ def build_api(bot: commands.Bot, db_path: str) -> "FastAPI":
         #     ]
         #     return factions
 
-        # Stub — returns empty list until ESI OAuth2 is wired up
-        # The overlay will show manual input fields in this case
-        return []
+        access_token = await _get_valid_access_token(db_path, user_id)
+        if access_token is None:
+            return []   # not linked — overlay falls back to manual input
+
+        row = _get_eve_token(db_path, user_id)
+        char_id = row["character_id"]
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(
+                    f"https://esi.evetech.net/latest/characters/{char_id}/standings/",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                if not r.is_success:
+                    print(f"[ESI] standings error: {r.status_code}")
+                    return []
+                return [
+                    {
+                        "faction_id":   e["from_id"],
+                        "faction_name": FACTION_NAMES.get(e["from_id"], str(e["from_id"])),
+                        "standing":     round(e["standing"], 2),
+                        "modified":     False,
+                    }
+                    for e in r.json() if e.get("from_type") == "faction"
+                ]
+        except Exception as e:
+            print(f"[ESI] get_standings error: {e}")
+            return []
 
     # ------------------------------------------------------------------
     # Intel reports
@@ -443,6 +642,78 @@ def _db_connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+def _ensure_eve_tokens_table(db_path: str):
+    """Create eve_tokens table if it doesn't exist (migration-safe)."""
+    with _db_connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS eve_tokens(
+                discord_user_id INTEGER PRIMARY KEY,
+                character_id    INTEGER NOT NULL,
+                character_name  TEXT    NOT NULL,
+                access_token    TEXT    NOT NULL,
+                refresh_token   TEXT    NOT NULL,
+                expires_at      REAL    NOT NULL
+            )
+        """)
+
+def _save_eve_token(db_path: str, discord_user_id: int, character_id: int,
+                    character_name: str, access_token: str,
+                    refresh_token: str, expires_in: int):
+    _ensure_eve_tokens_table(db_path)
+    import time as _time
+    with _db_connect(db_path) as conn:
+        conn.execute("""
+            INSERT INTO eve_tokens
+                (discord_user_id, character_id, character_name,
+                 access_token, refresh_token, expires_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(discord_user_id) DO UPDATE SET
+                character_id=excluded.character_id,
+                character_name=excluded.character_name,
+                access_token=excluded.access_token,
+                refresh_token=excluded.refresh_token,
+                expires_at=excluded.expires_at
+        """, (discord_user_id, character_id, character_name,
+                access_token, refresh_token, _time.time() + expires_in))
+
+def _get_eve_token(db_path: str, discord_user_id: int) -> Optional[sqlite3.Row]:
+    _ensure_eve_tokens_table(db_path)
+    return _db_fetchone(db_path,
+        "SELECT * FROM eve_tokens WHERE discord_user_id=?", (discord_user_id,))
+
+async def _refresh_eve_token(db_path: str, row: sqlite3.Row) -> Optional[str]:
+    """Refresh an expired EVE access token. Returns new access_token or None on failure."""
+    try:
+        import base64
+        creds = base64.b64encode(f"{EVE_CLIENT_ID}:{EVE_CLIENT_SECRET}".encode()).decode()
+        async with httpx.AsyncClient() as client:
+            r = await client.post(EVE_SSO_TOKEN_URL,
+                headers={"Authorization": f"Basic {creds}",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                data={"grant_type": "refresh_token", "refresh_token": row["refresh_token"]}
+            )
+            if r.status_code != 200:
+                print(f"[ESI] Token refresh failed: {r.status_code} {r.text}")
+                return None
+            data = r.json()
+            _save_eve_token(db_path, row["discord_user_id"],
+                            row["character_id"], row["character_name"],
+                            data["access_token"], data.get("refresh_token", row["refresh_token"]),
+                            data.get("expires_in", 1200))
+            return data["access_token"]
+    except Exception as e:
+        print(f"[ESI] Token refresh exception: {e}")
+        return None
+
+async def _get_valid_access_token(db_path: str, discord_user_id: int) -> Optional[str]:
+    """Returns a valid access token, refreshing if needed. None if not linked."""    import time as _time
+    row = _get_eve_token(db_path, discord_user_id)
+    if row is None:
+        return None
+    if _time.time() > row["expires_at"] - 60:   # refresh 60s early
+        return await _refresh_eve_token(db_path, row)
+    return row["access_token"]
 
 def _db_fetchone(db_path: str, sql: str, params=()) -> Optional[sqlite3.Row]:
     with _db_connect(db_path) as conn:
@@ -584,6 +855,68 @@ class OverlayApiCog(commands.Cog, name="OverlayAPI"):
                 )
             except Exception as e2:
                 print(f"[OverlayAPI] followup also failed: {e2}", flush=True)
+
+    @app_commands.command(
+        name="eve_link",
+        description="Link your EVE Online character to the ARC Overlay for live ESI data.",
+    )
+    async def eve_link_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if not EVE_CLIENT_ID or not EVE_CALLBACK_URL:
+                await interaction.followup.send(
+                    "⚠️ EVE SSO n'est pas configuré sur le serveur.\n"
+                    "L'admin doit définir `EVE_CLIENT_ID`, `EVE_CLIENT_SECRET` et `EVE_CALLBACK_URL` "
+                    "dans les variables Railway.",
+                    ephemeral=True
+                )
+                return
+
+            # Generate auth URL directly (reuse the /eve/link logic)
+            state = secrets.token_hex(16)
+            _eve_oauth_states[state] = {
+                "discord_user_id": interaction.user.id,
+                "expires_at":      time.time() + 600
+            }
+            from urllib.parse import urlencode
+            params = {
+                "response_type": "code",
+                "client_id":     EVE_CLIENT_ID,
+                "redirect_uri":  EVE_CALLBACK_URL,
+                "scope":         EVE_SCOPES,
+                "state":         state,
+            }
+            auth_url = f"{EVE_SSO_AUTH_URL}?{urlencode(params)}"
+
+            embed = discord.Embed(
+                title="🔗 Lier votre personnage EVE",
+                colour=discord.Colour.from_rgb(0, 180, 212),
+                description=(
+                    "Cliquez sur le bouton ci-dessous pour autoriser l'overlay à lire\n"
+                    "votre position, vaisseau et standings de faction via l'API ESI.\n\n"
+                    "⏱️ Ce lien expire dans **10 minutes**."
+                )
+            )
+            embed.add_field(
+                name="Autorisations demandées",
+                value="• Localisation · Vaisseau · Standings de faction",
+                inline=False
+            )
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(
+                label="Autoriser sur EVE Online",
+                url=auth_url,
+                style=discord.ButtonStyle.link,
+                emoji="🚀"
+            ))
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+        except Exception as e:
+            print(f"[OverlayAPI] /eve_link error: {e}", flush=True)
+            try:
+                await interaction.followup.send(f"⚠️ Erreur: {e}", ephemeral=True)
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # Required by discord.py cog loader — bot.py auto-loads this file
