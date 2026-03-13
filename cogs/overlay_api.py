@@ -299,7 +299,7 @@ def build_api(bot: commands.Bot, db_path: str) -> "FastAPI":
 
     @app.get("/overlay/api/v1/eve/callback")
     async def eve_callback(code: str, state: str):
-        """EVE SSO redirects here after the player authorises. No auth header needed.""""
+        """EVE SSO redirects here after the player authorises. No auth header needed."""
         # Validate state
         entry = _eve_oauth_states.pop(state, None)
         if entry is None or time.time() > entry["expires_at"]:
@@ -352,7 +352,7 @@ h1{{color:#00b4d4}}p{{color:#8a99aa}}</style></head>
 
     @app.get("/overlay/api/v1/eve/status")
     async def eve_status(user_id: int = Depends(get_current_user)):
-        """Returns linked character info, or null if not linked.""""
+        """Returns linked character info, or null if not linked."""
         row = _get_eve_token(db_path, user_id)
         if row is None:
             return {"linked": False, "character_id": None, "character_name": None}
@@ -707,7 +707,8 @@ async def _refresh_eve_token(db_path: str, row: sqlite3.Row) -> Optional[str]:
         return None
 
 async def _get_valid_access_token(db_path: str, discord_user_id: int) -> Optional[str]:
-    """Returns a valid access token, refreshing if needed. None if not linked."""    import time as _time
+    """Returns a valid access token, refreshing if needed. None if not linked."""
+    import time as _time
     row = _get_eve_token(db_path, discord_user_id)
     if row is None:
         return None
