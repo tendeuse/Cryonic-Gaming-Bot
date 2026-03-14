@@ -383,7 +383,12 @@ def build_event_embed(
 
     creator_id = event.get("creator")
     if isinstance(creator_id, int):
-        embed.set_footer(text=f"Created by user ID {creator_id}")
+        creator_name = f"ID {creator_id}"  # fallback if member not in cache
+        if guild is not None:
+            creator_member = guild.get_member(creator_id)
+            if creator_member:
+                creator_name = creator_member.display_name
+        embed.set_footer(text=f"Created by {creator_name}")
 
     return embed
 

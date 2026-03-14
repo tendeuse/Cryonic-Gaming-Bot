@@ -223,11 +223,13 @@ def build_order_embed(order: dict) -> discord.Embed:
     embed.add_field(name="Created", value=order.get("created_at", ""), inline=True)
 
     if status == "DELIVERED":
-        embed.add_field(name="Delivered By", value=f"<@{order.get('delivered_by')}>", inline=True)
+        delivered_tag = order.get("delivered_by_tag") or order.get("delivered_by", "Unknown")
+        embed.add_field(name="Delivered By", value=f"<@{order.get('delivered_by')}> ({delivered_tag})", inline=True)
         embed.add_field(name="Delivered At", value=order.get("delivered_at", ""), inline=True)
 
     if status == "UNDELIVERED":
-        embed.add_field(name="Marked Undelivered By", value=f"<@{order.get('undelivered_by')}>", inline=True)
+        undelivered_tag = order.get("undelivered_by_tag") or order.get("undelivered_by", "Unknown")
+        embed.add_field(name="Marked Undelivered By", value=f"<@{order.get('undelivered_by')}> ({undelivered_tag})", inline=True)
         embed.add_field(name="Undelivered At", value=order.get("undelivered_at", ""), inline=True)
         reason = order.get("undelivered_reason") or "No reason provided."
         embed.add_field(name="Reason", value=reason[:1024], inline=False)
@@ -326,6 +328,7 @@ class UndeliveredReasonModal(discord.ui.Modal):
 
             o["status"] = "UNDELIVERED"
             o["undelivered_by"] = str(interaction.user.id)
+            o["undelivered_by_tag"] = str(interaction.user)
             o["undelivered_at"] = utc_iso()
             o["undelivered_reason"] = str(self.reason.value).strip()
 
@@ -364,6 +367,7 @@ class DeliveredButton(discord.ui.Button):
 
             o["status"] = "DELIVERED"
             o["delivered_by"] = str(interaction.user.id)
+            o["delivered_by_tag"] = str(interaction.user)
             o["delivered_at"] = utc_iso()
 
             o.pop("undelivered_by", None)
