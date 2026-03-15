@@ -383,7 +383,7 @@ def build_event_embed(
 
     creator_id = event.get("creator")
     if isinstance(creator_id, int):
-        creator_name = f"ID {creator_id}"  # fallback if member not in cache
+        creator_name = f"ID {creator_id}"
         if guild is not None:
             creator_member = guild.get_member(creator_id)
             if creator_member:
@@ -426,6 +426,14 @@ async def refresh_event_message(bot: commands.Bot, event_id: str) -> bool:
     try:
         msg = await channel.fetch_message(message_id)
         await msg.edit(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        # Keep the persistent registration up-to-date after each edit.
+        try:
+            bot.add_view(
+                EventView(event_id, buttons, "", for_registration=True),
+                message_id=message_id,
+            )
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -827,6 +835,18 @@ class CreateEventModal(discord.ui.Modal, title="Create Event"):
         data[event_id] = event_record
         await save_events(data)
 
+        # Persist the view right now so button interactions survive a bot
+        # reconnect/restart without waiting for the next on_ready cycle.
+        # Use for_registration=True to strip the link button (which has no
+        # custom_id and would break is_persistent()).
+        try:
+            interaction.client.add_view(
+                EventView(event_id, selected_buttons, "", for_registration=True),
+                message_id=msg.id,
+            )
+        except Exception:
+            pass
+
         await interaction.response.send_message(
             f"Event created successfully in {channel.mention}.\nAudience: **{target_label(self.target)}**",
             ephemeral=True
@@ -931,14 +951,17 @@ class TargetSelectView(discord.ui.View):
 # -------------------- Event View --------------------
 
 class EventView(discord.ui.View):
-    def __init__(self, event_id: str, buttons: Set[str], redirect_url: str):
+    def __init__(self, event_id: str, buttons: Set[str], redirect_url: str, *, for_registration: bool = False):
         super().__init__(timeout=None)
         self.event_id = event_id
 
         for b in sorted(buttons, key=lambda x: DISPLAY_ORDER.index(x.title()) if x.title() in DISPLAY_ORDER else 999):
             self.add_item(RSVPButton(event_id, b.title()))
 
-        if redirect_url:
+        # Link buttons have no custom_id, which makes the view non-persistent.
+        # bot.add_view() requires is_persistent() == True, so skip the link
+        # button when building a view purely for interaction registration.
+        if redirect_url and not for_registration:
             self.add_item(
                 discord.ui.Button(
                     label="External Signup",
@@ -1087,7 +1110,13 @@ class EventCreator(commands.Cog):
         if self._views_registered:
             return
 
+        # Mark True FIRST to prevent a concurrent on_ready call racing in.
+        # If registration fails partway, a cog reload / full restart will reset
+        # _views_registered via __init__ and retry cleanly.
+        self._views_registered = True
+
         data = await load_events()
+        registered = 0
         for event_id, event in data.items():
             if not isinstance(event, dict):
                 continue
@@ -1100,13 +1129,23 @@ class EventCreator(commands.Cog):
                 buttons = {"accept", "damage", "logi", "salvager", "tentative", "decline"}
 
             redirect_url = str(event.get("redirect_url") or "")
+            message_id   = event.get("message")
+
             try:
-                self.bot.add_view(EventView(event_id, buttons, redirect_url))
+                # for_registration=True strips the link button so the view
+                # satisfies discord.py's is_persistent() check (all items need
+                # a custom_id).  Binding message_id means interactions route
+                # directly to this view even if another event shares button labels.
+                view = EventView(event_id, buttons, redirect_url, for_registration=True)
+                if isinstance(message_id, int):
+                    self.bot.add_view(view, message_id=message_id)
+                else:
+                    self.bot.add_view(view)
+                registered += 1
             except Exception as e:
                 print(f"[event_creator] Failed to add persistent view for {event_id}: {type(e).__name__}: {e}")
 
-        self._views_registered = True
-        print(f"[event_creator] Registered persistent views for {len(data)} event(s).")
+        print(f"[event_creator] Registered persistent views for {registered}/{len(data)} event(s).")
 
     @app_commands.command(name="create_event", description="Create a new event")
     async def create_event(self, interaction: discord.Interaction):
