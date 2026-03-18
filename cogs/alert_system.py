@@ -36,7 +36,7 @@ WH_STATUS_ROLES = {
     "ARC Security Administration Council",
     "ARC General",
     "ARC Commander",
-    "ARC Officer",
+    "ARC Lieutenant",
 }
 
 HOME_SYSTEM_NAME = "J220215"
