@@ -4,7 +4,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Set
+from typing import Optional
 
 import discord
 from discord.ext import commands
@@ -18,9 +18,7 @@ PUBLIC_CHANNEL = "eve-announcements"
 SECURITY_PING_ROLE = "ARC Security"
 SUBSIDIZED_PING_ROLE = "ARC Subsidized"
 
-DISPLAY_ORDER = ["Accept", "Damage", "Logi", "Salvager", "Tentative", "Decline"]
-
-# -------------------- STORAGE --------------------
+# ---------------- STORAGE ----------------
 
 _lock: Optional[asyncio.Lock] = None
 
@@ -35,11 +33,8 @@ async def load_events():
     async with lock:
         if not os.path.exists(DATA_PATH):
             return {}
-        try:
-            with open(DATA_PATH, "r") as f:
-                return json.load(f)
-        except:
-            return {}
+        with open(DATA_PATH, "r") as f:
+            return json.load(f)
 
 async def save_events(data):
     lock = _ensure_lock()
@@ -48,12 +43,13 @@ async def save_events(data):
         with open(DATA_PATH, "w") as f:
             json.dump(data, f, indent=2)
 
-# -------------------- HELPERS --------------------
+# ---------------- HELPERS ----------------
 
-def resolve_target_channel_name(target: str):
-    return SECURITY_ONLY_CHANNEL if target == "security_only" else PUBLIC_CHANNEL
+def resolve_channel(guild, target):
+    name = SECURITY_ONLY_CHANNEL if target == "security_only" else PUBLIC_CHANNEL
+    return discord.utils.get(guild.text_channels, name=name)
 
-def resolve_ping_mentions(guild: discord.Guild, target: str):
+def resolve_ping(guild, target):
     roles = []
     sec = discord.utils.get(guild.roles, name=SECURITY_PING_ROLE)
     sub = discord.utils.get(guild.roles, name=SUBSIDIZED_PING_ROLE)
@@ -65,40 +61,33 @@ def resolve_ping_mentions(guild: discord.Guild, target: str):
 
     return " ".join(roles)
 
-# -------------------- EMBED --------------------
+# ---------------- EMBED ----------------
 
-def build_event_embed(event):
+def build_embed(event):
     embed = discord.Embed(
         title=event["title"],
         description=event["description"],
-        color=discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc)
+        color=discord.Color.blue()
     )
 
     embed.add_field(
-        name="🕒 Time",
+        name="Time",
         value=f"<t:{event['timestamp']}:F>\n<t:{event['timestamp']}:R>",
         inline=False
     )
 
-    capacities = event.get("capacities", {})
-    roles = event.get("roles", {})
-
-    for role, users in roles.items():
-        cap = capacities.get(role)
+    for role, users in event["roles"].items():
+        cap = event.get("capacities", {}).get(role)
         count = len(users)
 
-        if cap:
-            name = f"{role} ({count}/{cap})"
-        else:
-            name = f"{role} ({count})"
-
+        name = f"{role} ({count}/{cap})" if cap else f"{role} ({count})"
         value = "\n".join(f"<@{u}>" for u in users) or "_(none)_"
+
         embed.add_field(name=name, value=value, inline=False)
 
     return embed
 
-async def refresh_event_message(bot, event_id):
+async def refresh(bot, event_id):
     data = await load_events()
     event = data.get(event_id)
     if not event:
@@ -108,21 +97,36 @@ async def refresh_event_message(bot, event_id):
     channel = guild.get_channel(event["channel"])
     msg = await channel.fetch_message(event["message"])
 
-    view = EventView(event_id, event["enabled_buttons"])
-    embed = build_event_embed(event)
+    await msg.edit(
+        embed=build_embed(event),
+        view=EventView(event_id, event["buttons"])
+    )
 
-    await msg.edit(embed=embed, view=view)
+# ---------------- STEP 1 VIEW ----------------
 
-# -------------------- MODAL --------------------
+class AudienceSelectView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=60)
+        self.user_id = user_id
 
-class EventInfoModal(discord.ui.Modal, title="Create Event"):
+    async def interaction_check(self, interaction: discord.Interaction):
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="ARC Security Only", style=discord.ButtonStyle.danger)
+    async def security_only(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EventModal(interaction.user.id, "security_only"))
+
+    @discord.ui.button(label="Security + Subsidized", style=discord.ButtonStyle.success)
+    async def public(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EventModal(interaction.user.id, "public"))
+
+# ---------------- MODAL ----------------
+
+class EventModal(discord.ui.Modal, title="Create Event"):
     name = discord.ui.TextInput(label="Event Name")
     description = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph)
-    time = discord.ui.TextInput(label="Date UTC (YYYY-MM-DD HH:MM)")
-    buttons = discord.ui.TextInput(
-        label="Buttons (use : for cap)",
-        placeholder="Accept, Damage, Logi:5, Decline"
-    )
+    time = discord.ui.TextInput(label="UTC Time (YYYY-MM-DD HH:MM)")
+    buttons = discord.ui.TextInput(label="Buttons (Logi:5 supported)")
 
     def __init__(self, creator_id, target):
         super().__init__()
@@ -138,50 +142,38 @@ class EventInfoModal(discord.ui.Modal, title="Create Event"):
 
         raw = self.buttons.value.split(",")
         buttons = []
-        capacities = {}
-        seen = set()
+        caps = {}
 
         for r in raw:
             r = r.strip()
             if ":" in r:
-                name, cap = r.split(":")
-                name = name.title()
-                capacities[name] = int(cap)
+                n, c = r.split(":")
+                n = n.title()
+                buttons.append(n)
+                caps[n] = int(c)
             else:
-                name = r.title()
-
-            if name.lower() not in seen:
-                seen.add(name.lower())
-                buttons.append(name)
-
-        if len(buttons) > 25:
-            await interaction.response.send_message("Max 25 buttons.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        channel = discord.utils.get(
-            guild.text_channels,
-            name=resolve_target_channel_name(self.target)
-        )
+                buttons.append(r.title())
 
         event_id = str(uuid.uuid4())
+        guild = interaction.guild
+        channel = resolve_channel(guild, self.target)
 
         event = {
             "title": self.name.value,
             "description": self.description.value,
             "timestamp": int(dt.timestamp()),
-            "creator": self.creator_id,
             "guild_id": guild.id,
             "channel": channel.id,
             "message": None,
-            "enabled_buttons": buttons,
-            "capacities": capacities,
-            "roles": {b: [] for b in buttons}
+            "buttons": buttons,
+            "capacities": caps,
+            "roles": {b: [] for b in buttons},
+            "creator": self.creator_id
         }
 
         msg = await channel.send(
-            content=resolve_ping_mentions(guild, self.target),
-            embed=build_event_embed(event),
+            content=resolve_ping(guild, self.target),
+            embed=build_embed(event),
             view=EventView(event_id, buttons)
         )
 
@@ -195,21 +187,19 @@ class EventInfoModal(discord.ui.Modal, title="Create Event"):
 
         await interaction.response.send_message("Event created.", ephemeral=True)
 
-# -------------------- BUTTON --------------------
+# ---------------- RSVP BUTTON ----------------
 
 class RSVPButton(discord.ui.Button):
-    def __init__(self, event_id, name, row=0):
+    def __init__(self, event_id, name, row):
         self.name = name
-        safe = "".join(c if c.isalnum() else "_" for c in name.lower())
-
         super().__init__(
             label=name,
-            style=self.get_style(name),
-            custom_id=f"rsvp:{event_id}:{safe}",
+            style=self.style_map(name),
+            custom_id=f"rsvp:{event_id}:{name}",
             row=row
         )
 
-    def get_style(self, name):
+    def style_map(self, name):
         name = name.lower()
         if name == "accept":
             return discord.ButtonStyle.success
@@ -221,34 +211,73 @@ class RSVPButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         data = await load_events()
-        event = data.get(self.view.event_id)
+        event = data[self.view.event_id]
 
         uid = interaction.user.id
-        roles = event["roles"]
-        caps = event.get("capacities", {})
 
-        cap = caps.get(self.name)
-        current = roles.get(self.name, [])
+        # Remove from all
+        for r in event["roles"]:
+            if uid in event["roles"][r]:
+                event["roles"][r].remove(uid)
 
-        if cap and len(current) >= cap:
-            await interaction.response.send_message(
-                f"{self.name} is full.",
-                ephemeral=True
-            )
+        cap = event.get("capacities", {}).get(self.name)
+        if cap and len(event["roles"][self.name]) >= cap:
+            await interaction.response.send_message("Role full.", ephemeral=True)
             return
 
-        for r in roles:
-            if uid in roles[r]:
-                roles[r].remove(uid)
-
-        roles[self.name].append(uid)
+        event["roles"][self.name].append(uid)
 
         await save_events(data)
-        await refresh_event_message(interaction.client, self.view.event_id)
+        await refresh(interaction.client, self.view.event_id)
 
         await interaction.response.send_message(f"Registered as {self.name}", ephemeral=True)
 
-# -------------------- VIEW --------------------
+# ---------------- ADMIN BUTTONS ----------------
+
+class AdminView(discord.ui.View):
+    def __init__(self, event_id):
+        super().__init__(timeout=60)
+        self.event_id = event_id
+
+    @discord.ui.button(label="Edit Event", style=discord.ButtonStyle.secondary)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EditModal(self.event_id))
+
+    @discord.ui.button(label="Delete Event", style=discord.ButtonStyle.danger)
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = await load_events()
+        event = data.get(self.event_id)
+
+        guild = interaction.guild
+        channel = guild.get_channel(event["channel"])
+        msg = await channel.fetch_message(event["message"])
+
+        await msg.delete()
+
+        del data[self.event_id]
+        await save_events(data)
+
+        await interaction.response.send_message("Event deleted.", ephemeral=True)
+
+class EditModal(discord.ui.Modal, title="Edit Event"):
+    description = discord.ui.TextInput(label="New Description", style=discord.TextStyle.paragraph)
+
+    def __init__(self, event_id):
+        super().__init__()
+        self.event_id = event_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = await load_events()
+        event = data[self.event_id]
+
+        event["description"] = self.description.value
+
+        await save_events(data)
+        await refresh(interaction.client, self.event_id)
+
+        await interaction.response.send_message("Updated.", ephemeral=True)
+
+# ---------------- VIEW ----------------
 
 class EventView(discord.ui.View):
     def __init__(self, event_id, buttons):
@@ -256,9 +285,37 @@ class EventView(discord.ui.View):
         self.event_id = event_id
 
         for i, b in enumerate(buttons):
-            self.add_item(RSVPButton(event_id, b, row=i // 5))
+            btn = RSVPButton(event_id, b, i // 5)
+            self.add_item(btn)
 
-# -------------------- COG --------------------
+        self.add_item(AdminButton(event_id))
+
+class AdminButton(discord.ui.Button):
+    def __init__(self, event_id):
+        super().__init__(
+            label="Manage",
+            style=discord.ButtonStyle.secondary,
+            row=4
+        )
+        self.event_id = event_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "Admin Panel:",
+            view=AdminView(self.event_id),
+            ephemeral=True
+        )
+
+# ---------------- DISABLE FULL BUTTONS ----------------
+
+async def disable_full_buttons(view, event):
+    for item in view.children:
+        if isinstance(item, RSVPButton):
+            cap = event.get("capacities", {}).get(item.name)
+            if cap and len(event["roles"][item.name]) >= cap:
+                item.disabled = True
+
+# ---------------- COG ----------------
 
 class EventCreator(commands.Cog):
     def __init__(self, bot):
@@ -266,19 +323,21 @@ class EventCreator(commands.Cog):
 
     @app_commands.command(name="create_event")
     async def create_event(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(
-            EventInfoModal(interaction.user.id, "public")
+        await interaction.response.send_message(
+            "Select event audience:",
+            view=AudienceSelectView(interaction.user.id),
+            ephemeral=True
         )
 
     @commands.Cog.listener()
     async def on_ready(self):
         data = await load_events()
-        for event_id, event in data.items():
+        for eid, event in data.items():
             try:
-                self.bot.add_view(
-                    EventView(event_id, event["enabled_buttons"]),
-                    message_id=event["message"]
-                )
+                view = EventView(eid, event["buttons"])
+                await disable_full_buttons(view, event)
+
+                self.bot.add_view(view, message_id=event["message"])
             except:
                 pass
 
