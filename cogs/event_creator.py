@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 
 DATA_PATH = "/data/events.json"
@@ -91,15 +91,35 @@ def build_embed(event):
 
     return embed
 
+# ---------------- SAFE REFRESH ----------------
+
 async def refresh(bot, event_id):
     data = await load_events()
     event = data.get(event_id)
+
     if not event:
         return
 
+    # ✅ Prevent crash from old data
+    if "guild_id" not in event:
+        print(f"[WARN] Event {event_id} missing guild_id — skipping")
+        return
+
     guild = bot.get_guild(event["guild_id"])
-    channel = guild.get_channel(event["channel"])
-    msg = await channel.fetch_message(event["message"])
+    if not guild:
+        print(f"[WARN] Guild not found for event {event_id}")
+        return
+
+    channel = guild.get_channel(event.get("channel"))
+    if not channel:
+        print(f"[WARN] Channel not found for event {event_id}")
+        return
+
+    try:
+        msg = await channel.fetch_message(event["message"])
+    except:
+        print(f"[WARN] Message not found for event {event_id}")
+        return
 
     view = EventView(event_id, event["buttons"])
     await disable_full_buttons(view, event)
@@ -122,15 +142,33 @@ async def auto_close_events(bot):
         updated = False
 
         for event_id, event in data.items():
+
+            # ✅ skip broken legacy events
+            if "guild_id" not in event:
+                continue
+
             if not event.get("closed") and now >= event["timestamp"]:
                 event["closed"] = True
                 updated = True
-                await refresh(bot, event_id)
+
+                try:
+                    await refresh(bot, event_id)
+                except Exception as e:
+                    print(f"[ERROR] Failed to refresh {event_id}: {e}")
 
         if updated:
             await save_events(data)
 
         await asyncio.sleep(60)
+
+# ---------------- BUTTON DISABLE LOGIC ----------------
+
+async def disable_full_buttons(view, event):
+    for item in view.children:
+        if isinstance(item, RSVPButton):
+            cap = event.get("capacities", {}).get(item.name)
+            if cap and len(event["roles"][item.name]) >= cap:
+                item.disabled = True
 
 # ---------------- STEP 1 VIEW ----------------
 
@@ -191,10 +229,6 @@ class EventModal(discord.ui.Modal, title="Create Event"):
                 seen.add(n.lower())
                 buttons.append(n)
 
-        if len(buttons) > 25:
-            await interaction.response.send_message("Max 25 buttons.", ephemeral=True)
-            return
-
         event_id = str(uuid.uuid4())
         guild = interaction.guild
         channel = resolve_channel(guild, self.target)
@@ -214,6 +248,7 @@ class EventModal(discord.ui.Modal, title="Create Event"):
         }
 
         view = EventView(event_id, buttons)
+
         msg = await channel.send(
             content=resolve_ping(guild, self.target),
             embed=build_embed(event),
@@ -300,10 +335,7 @@ class AdminButton(discord.ui.Button):
         is_creator = interaction.user.id == event["creator"]
 
         if not (is_admin or is_creator):
-            await interaction.response.send_message(
-                "You are not allowed to manage this event.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("Not allowed.", ephemeral=True)
             return
 
         await interaction.response.send_message(
@@ -364,6 +396,8 @@ class EventCreator(commands.Cog):
         data = await load_events()
 
         for eid, event in data.items():
+            if "guild_id" not in event:
+                continue
             try:
                 self.bot.add_view(EventView(eid, event["buttons"]), message_id=event["message"])
             except:
