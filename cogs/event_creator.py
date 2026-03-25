@@ -191,12 +191,14 @@ class EventModal(discord.ui.Modal, title="Create Event"):
 
 class RSVPButton(discord.ui.Button):
     def __init__(self, event_id, name, row):
-        self.name = name
+        safe = "".join(c if c.isalnum() else "_" for c in name.lower())
+
         super().__init__(
             label=name,
             style=self.style_map(name),
-            custom_id=f"rsvp:{event_id}:{name}",
+            custom_id=f"rsvp:{event_id}:{safe}",  # ✅ safe ID
             row=row
+)
         )
 
     def style_map(self, name):
@@ -292,12 +294,14 @@ class EventView(discord.ui.View):
 
 class AdminButton(discord.ui.Button):
     def __init__(self, event_id):
+        self.event_id = event_id
+
         super().__init__(
             label="Manage",
             style=discord.ButtonStyle.secondary,
+            custom_id=f"admin:{event_id}",  # ✅ REQUIRED
             row=4
         )
-        self.event_id = event_id
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
