@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 DATA_PATH = "/data/events.json"
@@ -85,6 +85,10 @@ def build_embed(event):
 
         embed.add_field(name=name, value=value, inline=False)
 
+    if event.get("closed"):
+        embed.color = discord.Color.dark_grey()
+        embed.title += " [CLOSED]"
+
     return embed
 
 async def refresh(bot, event_id):
@@ -97,10 +101,36 @@ async def refresh(bot, event_id):
     channel = guild.get_channel(event["channel"])
     msg = await channel.fetch_message(event["message"])
 
-    await msg.edit(
-        embed=build_embed(event),
-        view=EventView(event_id, event["buttons"])
-    )
+    view = EventView(event_id, event["buttons"])
+    await disable_full_buttons(view, event)
+
+    if event.get("closed"):
+        for item in view.children:
+            item.disabled = True
+
+    await msg.edit(embed=build_embed(event), view=view)
+
+# ---------------- AUTO CLOSE LOOP ----------------
+
+async def auto_close_events(bot):
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        data = await load_events()
+        now = int(datetime.now(timezone.utc).timestamp())
+
+        updated = False
+
+        for event_id, event in data.items():
+            if not event.get("closed") and now >= event["timestamp"]:
+                event["closed"] = True
+                updated = True
+                await refresh(bot, event_id)
+
+        if updated:
+            await save_events(data)
+
+        await asyncio.sleep(60)
 
 # ---------------- STEP 1 VIEW ----------------
 
@@ -143,16 +173,27 @@ class EventModal(discord.ui.Modal, title="Create Event"):
         raw = self.buttons.value.split(",")
         buttons = []
         caps = {}
+        seen = set()
 
         for r in raw:
             r = r.strip()
+            if not r:
+                continue
+
             if ":" in r:
                 n, c = r.split(":")
-                n = n.title()
-                buttons.append(n)
-                caps[n] = int(c)
+                n = n.strip().title()
+                caps[n] = int(c.strip())
             else:
-                buttons.append(r.title())
+                n = r.title()
+
+            if n.lower() not in seen:
+                seen.add(n.lower())
+                buttons.append(n)
+
+        if len(buttons) > 25:
+            await interaction.response.send_message("Max 25 buttons.", ephemeral=True)
+            return
 
         event_id = str(uuid.uuid4())
         guild = interaction.guild
@@ -168,13 +209,15 @@ class EventModal(discord.ui.Modal, title="Create Event"):
             "buttons": buttons,
             "capacities": caps,
             "roles": {b: [] for b in buttons},
-            "creator": self.creator_id
+            "creator": self.creator_id,
+            "closed": False
         }
 
+        view = EventView(event_id, buttons)
         msg = await channel.send(
             content=resolve_ping(guild, self.target),
             embed=build_embed(event),
-            view=EventView(event_id, buttons)
+            view=view
         )
 
         event["message"] = msg.id
@@ -183,7 +226,7 @@ class EventModal(discord.ui.Modal, title="Create Event"):
         data[event_id] = event
         await save_events(data)
 
-        interaction.client.add_view(EventView(event_id, buttons), message_id=msg.id)
+        interaction.client.add_view(view, message_id=msg.id)
 
         await interaction.response.send_message("Event created.", ephemeral=True)
 
@@ -191,14 +234,14 @@ class EventModal(discord.ui.Modal, title="Create Event"):
 
 class RSVPButton(discord.ui.Button):
     def __init__(self, event_id, name, row):
+        self.name = name
         safe = "".join(c if c.isalnum() else "_" for c in name.lower())
 
         super().__init__(
             label=name,
             style=self.style_map(name),
-            custom_id=f"rsvp:{event_id}:{safe}",  # ✅ safe ID
+            custom_id=f"rsvp:{event_id}:{safe}",
             row=row
-)
         )
 
     def style_map(self, name):
@@ -215,9 +258,12 @@ class RSVPButton(discord.ui.Button):
         data = await load_events()
         event = data[self.view.event_id]
 
+        if event.get("closed"):
+            await interaction.response.send_message("Event is closed.", ephemeral=True)
+            return
+
         uid = interaction.user.id
 
-        # Remove from all
         for r in event["roles"]:
             if uid in event["roles"][r]:
                 event["roles"][r].remove(uid)
@@ -234,50 +280,57 @@ class RSVPButton(discord.ui.Button):
 
         await interaction.response.send_message(f"Registered as {self.name}", ephemeral=True)
 
-# ---------------- ADMIN BUTTONS ----------------
+# ---------------- ADMIN ----------------
+
+class AdminButton(discord.ui.Button):
+    def __init__(self, event_id):
+        self.event_id = event_id
+        super().__init__(
+            label="Manage",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"admin:{event_id}",
+            row=4
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        data = await load_events()
+        event = data[self.event_id]
+
+        is_admin = interaction.user.guild_permissions.administrator
+        is_creator = interaction.user.id == event["creator"]
+
+        if not (is_admin or is_creator):
+            await interaction.response.send_message(
+                "You are not allowed to manage this event.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "Admin Panel:",
+            view=AdminView(self.event_id),
+            ephemeral=True
+        )
 
 class AdminView(discord.ui.View):
     def __init__(self, event_id):
         super().__init__(timeout=60)
         self.event_id = event_id
 
-    @discord.ui.button(label="Edit Event", style=discord.ButtonStyle.secondary)
-    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(EditModal(self.event_id))
-
     @discord.ui.button(label="Delete Event", style=discord.ButtonStyle.danger)
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
         data = await load_events()
-        event = data.get(self.event_id)
+        event = data[self.event_id]
 
         guild = interaction.guild
         channel = guild.get_channel(event["channel"])
         msg = await channel.fetch_message(event["message"])
 
         await msg.delete()
-
         del data[self.event_id]
         await save_events(data)
 
-        await interaction.response.send_message("Event deleted.", ephemeral=True)
-
-class EditModal(discord.ui.Modal, title="Edit Event"):
-    description = discord.ui.TextInput(label="New Description", style=discord.TextStyle.paragraph)
-
-    def __init__(self, event_id):
-        super().__init__()
-        self.event_id = event_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        data = await load_events()
-        event = data[self.event_id]
-
-        event["description"] = self.description.value
-
-        await save_events(data)
-        await refresh(interaction.client, self.event_id)
-
-        await interaction.response.send_message("Updated.", ephemeral=True)
+        await interaction.response.send_message("Deleted.", ephemeral=True)
 
 # ---------------- VIEW ----------------
 
@@ -287,43 +340,16 @@ class EventView(discord.ui.View):
         self.event_id = event_id
 
         for i, b in enumerate(buttons):
-            btn = RSVPButton(event_id, b, i // 5)
-            self.add_item(btn)
+            self.add_item(RSVPButton(event_id, b, i // 5))
 
         self.add_item(AdminButton(event_id))
-
-class AdminButton(discord.ui.Button):
-    def __init__(self, event_id):
-        self.event_id = event_id
-
-        super().__init__(
-            label="Manage",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"admin:{event_id}",  # ✅ REQUIRED
-            row=4
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            "Admin Panel:",
-            view=AdminView(self.event_id),
-            ephemeral=True
-        )
-
-# ---------------- DISABLE FULL BUTTONS ----------------
-
-async def disable_full_buttons(view, event):
-    for item in view.children:
-        if isinstance(item, RSVPButton):
-            cap = event.get("capacities", {}).get(item.name)
-            if cap and len(event["roles"][item.name]) >= cap:
-                item.disabled = True
 
 # ---------------- COG ----------------
 
 class EventCreator(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.bot.loop.create_task(auto_close_events(bot))
 
     @app_commands.command(name="create_event")
     async def create_event(self, interaction: discord.Interaction):
@@ -336,14 +362,14 @@ class EventCreator(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         data = await load_events()
+
         for eid, event in data.items():
             try:
-                view = EventView(eid, event["buttons"])
-                await disable_full_buttons(view, event)
-
-                self.bot.add_view(view, message_id=event["message"])
+                self.bot.add_view(EventView(eid, event["buttons"]), message_id=event["message"])
             except:
                 pass
+
+        await self.bot.tree.sync()
 
 async def setup(bot):
     await bot.add_cog(EventCreator(bot))
