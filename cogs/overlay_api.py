@@ -587,6 +587,59 @@ h1{{color:#00b4d4}}p{{color:#8a99aa}}</style></head>
         return {"ok": True}
 
     # ------------------------------------------------------------------
+    # Mission complete — overlay reports a completed EVE mission → credits AP
+    # ------------------------------------------------------------------
+    class MissionCompleteRequest(BaseModel):
+        character_name: str
+        mission_name:   str
+        faction:        str = ""
+        level:          int = 4
+        standing_gain:  float = 0.0
+        ap:             int = 50
+
+    @app.post("/overlay/api/v1/mission_complete", status_code=201)
+    async def post_mission_complete(
+        body: MissionCompleteRequest,
+        user_id: int = Depends(get_current_user)
+    ):
+        try:
+            from cogs.missions_ap import MissionsAP
+            discord_id = MissionsAP.record_mission(
+                character_name = body.character_name,
+                mission_name   = body.mission_name,
+                faction        = body.faction,
+                level          = body.level,
+                standing_gain  = body.standing_gain,
+                ap             = body.ap,
+            )
+            # Post notification to Discord channel if configured
+            async def _notify():
+                guild = _get_first_guild(bot)
+                if guild is None:
+                    return
+                ch = discord.utils.get(guild.text_channels,
+                                       name="eve-missions")
+                if ch is None:
+                    return
+                colour = 0xFFD54F  # gold
+                embed  = discord.Embed(
+                    title   = f"✅ Mission Completed — +{body.ap} AP",
+                    colour  = colour,
+                )
+                embed.add_field(name="Pilot",    value=body.character_name, inline=True)
+                embed.add_field(name="Mission",  value=body.mission_name,   inline=True)
+                embed.add_field(name="Faction",  value=body.faction or "—", inline=True)
+                embed.add_field(name="Standing Gain",
+                                value=f"+{body.standing_gain:.4f}", inline=True)
+                embed.set_footer(text="Tracked by Cryonic Overlay")
+                await ch.send(embed=embed)
+            asyncio.run_coroutine_threadsafe(_notify(), bot.loop)
+        except Exception as e:
+            # Don't fail the overlay if AP recording errors
+            pass
+        return {"ok": True, "ap_credited": body.ap}
+
+    # ------------------------------------------------------------------
     # Snapshot — missions + character + intel in one call
     # ------------------------------------------------------------------
     @app.get("/overlay/api/v1/snapshot", response_model=SnapshotOut)
