@@ -49,9 +49,10 @@ WS_RECONNECT_MAX    = 320
 WS_HEARTBEAT        = 30    # seconds between pings to keep connection alive
 
 # Safety-net catchup poll (runs even when WebSocket is healthy)
-CATCHUP_POLL_MINUTES = 10
-CATCHUP_PAGES        = 3    # how many zKill pages to scan (newest-first, frontier-aware)
-ZKILL_REQUEST_DELAY  = 0.15
+CATCHUP_POLL_MINUTES     = 5     # was 10 — tighter safety net
+CATCHUP_PAGES            = 3     # pages when WS is healthy
+CATCHUP_PAGES_WS_DOWN    = 10    # pages when WS is disconnected (more ground to cover)
+ZKILL_REQUEST_DELAY      = 0.15
 
 # ESI
 ESI_CONCURRENCY         = 8
@@ -388,9 +389,15 @@ class KillmailFeed(commands.Cog):
     async def _ws_connect_and_listen(self):
         await self._ensure_session()
 
+        # zKillboard requires an Origin header — without it the server returns 403.
+        ws_headers = {
+            "User-Agent": USER_AGENT,
+            "Origin":     "https://zkillboard.com",
+        }
+
         async with self.session.ws_connect(
             ZKILL_WS_URL,
-            headers={"User-Agent": USER_AGENT},
+            headers=ws_headers,
             heartbeat=WS_HEARTBEAT,
             max_msg_size=0,
         ) as ws:
@@ -497,6 +504,7 @@ class KillmailFeed(commands.Cog):
         """
         Runs every CATCHUP_POLL_MINUTES regardless of WebSocket health.
         Posts anything missed during a disconnect window.
+        When the WebSocket is down, scans more pages to cover the gap.
         """
         if self._catchup_lock.locked():
             return
@@ -512,8 +520,11 @@ class KillmailFeed(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def _catchup_feed(self, feed_key: str, cfg: Dict[str, Any]):
+        # Use more pages when the WebSocket is down so we don't miss kills
+        # that accumulated while the connection was failing.
+        pages = CATCHUP_PAGES if self._ws_connected else CATCHUP_PAGES_WS_DOWN
         new_kills = await self._fetch_zkill_frontier(
-            int(cfg["corp_id"]), feed_key, max_pages=CATCHUP_PAGES
+            int(cfg["corp_id"]), feed_key, max_pages=pages
         )
         if not new_kills:
             return
@@ -1002,12 +1013,15 @@ class KillmailFeed(commands.Cog):
     async def killmail_status(self, interaction: discord.Interaction):
         await safe_defer(interaction, ephemeral=True)
 
-        ws_icon = "🟢" if self._ws_connected else "🔴"
+        ws_icon  = "🟢" if self._ws_connected else "🔴"
+        ws_state = "Connected" if self._ws_connected else f"Disconnected (next retry in {self._ws_reconnect_delay}s)"
+        pages_now = CATCHUP_PAGES if self._ws_connected else CATCHUP_PAGES_WS_DOWN
         lines = [
-            f"**WebSocket:** {ws_icon} {'Connected' if self._ws_connected else 'Disconnected'}",
+            f"**WebSocket:** {ws_icon} {ws_state}",
             f"**Last WS message (UTC):** {self._ws_last_message_utc or 'Never'}",
             f"**Total WS messages:** {self._ws_total_received}",
-            f"**Catchup poll:** every {CATCHUP_POLL_MINUTES} min, last {CATCHUP_PAGES} page(s)",
+            f"**Catchup poll:** every {CATCHUP_POLL_MINUTES} min — scanning **{pages_now}** page(s) "
+            f"({'WS healthy' if self._ws_connected else '⚠️ WS down — extended scan active'})",
             "",
         ]
         for feed_key, cfg in FEEDS.items():
