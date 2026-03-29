@@ -433,12 +433,111 @@ class UndoButton(discord.ui.Button):
         await safe_reply(interaction, "✅ Status reset to PENDING.", ephemeral=True)
 
 
+class UpdateIGNModal(discord.ui.Modal):
+    def __init__(self, cog: "ShopCog", order_id: str, current_ign: str):
+        super().__init__(title="Update In-Game Name")
+        self.cog = cog
+        self.order_id = order_id
+
+        self.ign = discord.ui.TextInput(
+            label="New In-Game Name (IGN)",
+            placeholder="Enter your correct IGN",
+            default=current_ign,
+            required=True,
+            max_length=64,
+        )
+        self.add_item(self.ign)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_ign = str(self.ign.value).strip()
+        if not new_ign:
+            await safe_reply(interaction, "❌ IGN cannot be empty.", ephemeral=True)
+            return
+
+        await safe_defer(interaction, ephemeral=True)
+
+        async with SHOP_LOCK:
+            data = load_orders()
+            orders = data.setdefault("orders", {})
+            o = orders.get(self.order_id)
+            if not o:
+                await safe_reply(interaction, "❌ Order not found.", ephemeral=True)
+                return
+
+            # Only the buyer may update their own IGN
+            if str(interaction.user.id) != str(o.get("buyer_id")):
+                await safe_reply(interaction, "❌ Only the buyer can update the IGN.", ephemeral=True)
+                return
+
+            # IGN changes are blocked once the order is delivered
+            if o.get("status") == "DELIVERED":
+                await safe_reply(interaction, "❌ This order is already delivered — the IGN cannot be changed.", ephemeral=True)
+                return
+
+            old_ign = o.get("ign", "")
+            o["ign"] = new_ign
+            orders[self.order_id] = o
+            save_orders(data)
+
+        if interaction.guild:
+            await self.cog.refresh_order_message(interaction.guild, self.order_id)
+        await safe_reply(interaction, f"✅ IGN updated: `{old_ign}` → `{new_ign}`", ephemeral=True)
+
+
+class UpdateIGNButton(discord.ui.Button):
+    def __init__(self, cog: "ShopCog", order_id: str, *, disabled: bool = False):
+        super().__init__(
+            label="✏️ Update IGN",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"order:update_ign:{order_id}",
+            disabled=disabled,
+        )
+        self.cog = cog
+        self.order_id = order_id
+
+    async def callback(self, interaction: discord.Interaction):
+        data = load_orders()
+        o = (data.get("orders") or {}).get(self.order_id)
+        if not o:
+            await safe_reply(interaction, "❌ Order not found.", ephemeral=True)
+            return
+
+        # Only the buyer can update their IGN
+        if str(interaction.user.id) != str(o.get("buyer_id")):
+            await safe_reply(interaction, "❌ Only the buyer can update the IGN on their order.", ephemeral=True)
+            return
+
+        # Guard against DELIVERED state (should already be disabled visually, but belt-and-suspenders)
+        if o.get("status") == "DELIVERED":
+            await safe_reply(interaction, "❌ This order is already delivered — IGN cannot be changed.", ephemeral=True)
+            return
+
+        await safe_send_modal(interaction, UpdateIGNModal(self.cog, self.order_id, str(o.get("ign", ""))))
+
+
 class OrderStatusView(discord.ui.View):
-    def __init__(self, cog: "ShopCog", order_id: str):
+    """
+    Buttons visible on every order card in the orders channel.
+
+    Status rules:
+    • PENDING / UNDELIVERED  → all four buttons active
+    • DELIVERED              → only Undo is active; the other three are disabled
+                               (IGN can no longer change once delivered)
+    """
+    def __init__(self, cog: "ShopCog", order_id: str, status: str = "PENDING"):
         super().__init__(timeout=None)
+        delivered = (status == "DELIVERED")
+
         self.add_item(DeliveredButton(cog, order_id))
         self.add_item(UndeliveredButton(cog, order_id))
         self.add_item(UndoButton(cog, order_id))
+        self.add_item(UpdateIGNButton(cog, order_id, disabled=delivered))
+
+        # When delivered, disable Delivered + Undelivered buttons too
+        if delivered:
+            for item in self.children:
+                if isinstance(item, (DeliveredButton, UndeliveredButton)):
+                    item.disabled = True
 
 
 # ----------------------------
@@ -549,7 +648,7 @@ class BuyItemModal(discord.ui.Modal):
         self.cog.register_order_view(order_id)
 
         embed = build_order_embed(order)
-        msg = await order_ch.send(embed=embed, view=OrderStatusView(self.cog, order_id))
+        msg = await order_ch.send(embed=embed, view=OrderStatusView(self.cog, order_id, "PENDING"))
 
         async with SHOP_LOCK:
             orders_data = load_orders()
@@ -1290,7 +1389,8 @@ class ShopCog(commands.Cog):
             return
 
         self.register_order_view(order_id)
-        await self.safe_edit_if_needed(msg, embed=build_order_embed(o), view=OrderStatusView(self, order_id))
+        status = str(o.get("status", "PENDING"))
+        await self.safe_edit_if_needed(msg, embed=build_order_embed(o), view=OrderStatusView(self, order_id, status))
 
     # ----------------------------
     # Slash Command
