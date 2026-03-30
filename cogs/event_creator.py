@@ -1349,11 +1349,17 @@ class AdminView(discord.ui.View):
 
 class AudienceSelectView(discord.ui.View):
     def __init__(self, user_id: int):
-        super().__init__(timeout=60)
+        super().__init__(timeout=300)   # 5 minutes — was 60 s
         self.user_id = user_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.user_id
+
+    async def on_check_failure(self, interaction: discord.Interaction) -> None:
+        # Without this, Discord shows a silent "Interaction Failed" to non-creators.
+        await interaction.response.send_message(
+            "This menu belongs to someone else.", ephemeral=True
+        )
 
     @discord.ui.button(label="ARC Security Only", style=discord.ButtonStyle.danger)
     async def security_only(
@@ -1403,23 +1409,27 @@ class RSVPButton(discord.ui.Button):
             await interaction.response.send_message("Invalid view.", ephemeral=True)
             return
 
+        # Defer immediately — load_events() is async I/O that can exceed
+        # Discord's 3-second acknowledgement window (error 10062).
+        await interaction.response.defer(ephemeral=True)
+
         data  = await load_events()
         event = data.get(self.view.event_id)
         if not isinstance(event, dict):
-            await interaction.response.send_message("Event not found.", ephemeral=True)
+            await interaction.followup.send("Event not found.", ephemeral=True)
             return
 
         event    = normalize_event(event)
         is_active = event.get("active", True) and not event.get("closed", False)
 
         if not is_active:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "This event is closed.", ephemeral=True
             )
             return
 
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Must be used in a server.", ephemeral=True
             )
             return
@@ -1436,7 +1446,7 @@ class RSVPButton(discord.ui.Button):
         # Capacity check
         cap = event.get("capacities", {}).get(name)
         if cap and len(event["roles"].get(name, [])) >= int(cap):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"**{name}** is full ({cap}/{cap}).", ephemeral=True
             )
             return
@@ -1465,7 +1475,7 @@ class RSVPButton(discord.ui.Button):
         data[self.view.event_id] = event
         await save_events(data)
         await refresh(interaction.client, self.view.event_id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Registered as **{name}**.", ephemeral=True
         )
 
@@ -1483,10 +1493,14 @@ class ManageEventButton(discord.ui.Button):
         self.event_id = event_id
 
     async def callback(self, interaction: discord.Interaction):
+        # Defer immediately — load_events() is async I/O that can exceed
+        # Discord's 3-second acknowledgement window (error 10062).
+        await interaction.response.defer(ephemeral=True)
+
         data  = await load_events()
         event = data.get(self.event_id)
         if not isinstance(event, dict):
-            await interaction.response.send_message("Event not found.", ephemeral=True)
+            await interaction.followup.send("Event not found.", ephemeral=True)
             return
 
         is_creator = interaction.user.id == event.get("creator")
@@ -1495,7 +1509,7 @@ class ManageEventButton(discord.ui.Button):
             and interaction.user.guild_permissions.administrator
         )
         if not (is_creator or is_admin):
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            await interaction.followup.send("Not authorized.", ephemeral=True)
             return
 
         event = normalize_event(event)
@@ -1510,44 +1524,14 @@ class ManageEventButton(discord.ui.Button):
             f"**Redirect URL:** {event.get('redirect_url') or '_(none)_'}",
         ]
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "\n".join(lines),
             view=AdminView(self.event_id, event),
             ephemeral=True,
         )
 
 
-class AdminView(discord.ui.View):
-    def __init__(self, event_id: str):
-        super().__init__(timeout=60)
-        self.event_id = event_id
-
-    @discord.ui.button(label="✏️ Edit", style=discord.ButtonStyle.primary)
-    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(EditEventModal(self.event_id))
-
-    @discord.ui.button(label="🗑 Delete", style=discord.ButtonStyle.danger)
-    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data  = await load_events()
-        event = data.get(self.event_id)
-        if not event:
-            await interaction.response.send_message("Event not found.", ephemeral=True)
-            return
-
-        event = normalize_event(event)
-        guild = interaction.guild
-        if guild:
-            channel = guild.get_channel(event.get("channel"))
-            if isinstance(channel, discord.TextChannel):
-                try:
-                    msg = await channel.fetch_message(event["message"])
-                    await msg.delete()
-                except Exception:
-                    pass
-
-        del data[self.event_id]
-        await save_events(data)
-        await interaction.response.send_message("✅ Event deleted.", ephemeral=True)
+# (Duplicate AdminView removed — the full AdminView above is the active one)
 
 
 # ============================================================

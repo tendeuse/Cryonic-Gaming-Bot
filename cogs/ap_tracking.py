@@ -716,12 +716,16 @@ class APCheckView(discord.ui.View):
         custom_id="apcheck:balance"
     )
     async def check_balance(self, interaction: discord.Interaction, _):
+        # Defer immediately to prevent 10062 "Unknown interaction" errors when
+        # the async load() call takes longer than Discord's 3-second ack window.
+        await interaction.response.defer(ephemeral=True)
+
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Could not resolve member.", ephemeral=True)
+            await interaction.followup.send("Could not resolve member.", ephemeral=True)
             return
         data = await load()
         ap = safe_int_ap(data.get(str(interaction.user.id), {}).get("ap", 0))
-        await interaction.response.send_message(f"You have **{ap} AP**.", ephemeral=True)
+        await interaction.followup.send(f"You have **{ap} AP**.", ephemeral=True)
 
 # -------------------------
 # AP Claim Flow (Buttons -> Modal)
