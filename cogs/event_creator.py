@@ -712,6 +712,122 @@ class PresenceConfirmView(discord.ui.View):
 
 
 # ============================================================
+# SHARED EVENT POSTING HELPER
+# ============================================================
+
+async def _do_post_event(
+    interaction: discord.Interaction,
+    partial:     Dict[str, Any],
+    names:       List[str],
+) -> None:
+    """
+    Validates channel/permissions, builds the event record, posts the message,
+    saves to disk, and sends the creator a confirmation followup.
+
+    The caller MUST have already deferred the interaction before calling this
+    (interaction.response.defer(ephemeral=True)) — this function uses followup.
+    """
+    link_only = bool(partial.get("link_only", False))
+    guild     = interaction.guild
+    if not guild:
+        await interaction.followup.send("Must be used in a server.", ephemeral=True)
+        return
+
+    channel = resolve_channel(guild, partial["target"])
+    if not channel:
+        ch_name = (
+            SECURITY_ONLY_CHANNEL
+            if partial["target"] == "security_only"
+            else PUBLIC_CHANNEL
+        )
+        await interaction.followup.send(
+            f"❌ Channel `#{ch_name}` not found.", ephemeral=True
+        )
+        return
+
+    bot_m = (
+        guild.get_member(interaction.client.user.id)
+        if interaction.client.user else None
+    )
+    if bot_m:
+        p = channel.permissions_for(bot_m)
+        if not (p.view_channel and p.send_messages and p.embed_links):
+            await interaction.followup.send(
+                f"❌ I'm missing permissions in {channel.mention}.", ephemeral=True
+            )
+            return
+
+    event_id = str(uuid.uuid4())
+    redir    = partial.get("redirect_url", "")
+
+    event: Dict[str, Any] = {
+        "title":                partial["event_name"],
+        "description":          partial["description"],
+        "creator":              partial["creator_id"],
+        "timestamp":            partial["timestamp"],
+        "guild_id":             guild.id,
+        "channel":              channel.id,
+        "channel_name":         channel.name,
+        "message":              None,
+        "target":               partial["target"],
+        "buttons":              names,
+        "enabled_buttons":      names,
+        "link_only":            link_only,
+        "capacities":           {},
+        "roles":                {n: [] for n in names},
+        "active":               True,
+        "closed":               False,
+        "presence":             {},
+        "presence_dm_sent_to":  [],
+        "presence_started":     False,
+        "presence_started_utc": None,
+        "redirect_url":         redir,
+        "created_utc":          datetime.now(timezone.utc).isoformat(),
+    }
+
+    view = EventView(event_id, names, redir, link_only=link_only)
+
+    try:
+        msg = await channel.send(
+            content=          resolve_ping(guild, partial["target"]) or None,
+            embed=            build_embed(event, guild),
+            view=             view,
+            allowed_mentions= discord.AllowedMentions(roles=True),
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Failed to post in {channel.mention}: `{e}`", ephemeral=True
+        )
+        return
+
+    event["message"] = msg.id
+
+    data = await load_events()
+    data[event_id] = event
+    await save_events(data)
+
+    try:
+        interaction.client.add_view(
+            EventView(event_id, names, "", link_only=link_only, for_registration=True),
+            message_id=msg.id,
+        )
+    except Exception:
+        pass
+
+    mode_str = (
+        f"🔗 Link-only (no RSVP buttons) — [{redir}]({redir})"
+        if link_only
+        else f"Buttons: {', '.join(f'**{n}**' for n in names)}"
+    )
+    await interaction.followup.send(
+        f"✅ Event created in {channel.mention}.\n"
+        f"Audience: **{target_label(partial['target'])}**\n"
+        f"{mode_str}",
+        ephemeral=True,
+    )
+
+
+# ============================================================
 # CREATE EVENT — STEP 1: EVENT INFO MODAL
 # ============================================================
 
@@ -796,11 +912,22 @@ class EventInfoModal(discord.ui.Modal, title="Create Event — Step 1 of 2"):
             "link_only":    link_only,
         }
 
+        # Discord does NOT allow responding to a modal with another modal (error 50035).
+        # For link-only: all data is in hand, defer and post directly.
+        # For normal mode: defer and present a "Step 2" button so the user can
+        #   open ButtonNamesModal from a component interaction (allowed by Discord).
+        await interaction.response.defer(ephemeral=True)
+
         if link_only:
-            # Skip step 2 — post directly with just the link button
-            await interaction.response.send_modal(ButtonNamesModal(partial))
+            await _do_post_event(interaction, partial, [])
         else:
-            await interaction.response.send_modal(ButtonNamesModal(partial))
+            await interaction.followup.send(
+                f"✅ **Step 1 complete!**\n"
+                f"Event: **{partial['event_name']}** — {count} RSVP button(s)\n\n"
+                f"Click below to name your buttons.",
+                view=Step2ButtonView(partial),
+                ephemeral=True,
+            )
 
 
 # ============================================================
@@ -865,110 +992,38 @@ class ButtonNamesModal(discord.ui.Modal):
                     names.append(name)
 
             if not names:
+                # Pure validation — no async before this, send_message is safe.
                 await interaction.response.send_message(
                     "❌ No valid button names provided.", ephemeral=True
                 )
                 return
 
-        guild = interaction.guild
-        if not guild:
-            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
-            return
+        # Defer now — _do_post_event does channel.send + load/save (async I/O).
+        await interaction.response.defer(ephemeral=True)
+        await _do_post_event(interaction, self.partial, names)
 
-        channel = resolve_channel(guild, self.partial["target"])
-        if not channel:
-            ch_name = (
-                SECURITY_ONLY_CHANNEL
-                if self.partial["target"] == "security_only"
-                else PUBLIC_CHANNEL
-            )
-            await interaction.response.send_message(
-                f"❌ Channel `#{ch_name}` not found.", ephemeral=True
-            )
-            return
 
-        # Permission check
-        bot_m = (
-            guild.get_member(interaction.client.user.id)
-            if interaction.client.user else None
-        )
-        if bot_m:
-            p = channel.permissions_for(bot_m)
-            if not (p.view_channel and p.send_messages and p.embed_links):
-                await interaction.response.send_message(
-                    f"❌ I'm missing permissions in {channel.mention}.", ephemeral=True
-                )
-                return
+# ============================================================
+# CREATE EVENT — STEP 2 BRIDGE VIEW
+# ============================================================
 
-        event_id  = str(uuid.uuid4())
-        redir     = self.partial.get("redirect_url", "")
+class Step2ButtonView(discord.ui.View):
+    """
+    Sent ephemerally after Step 1 (EventInfoModal) completes.
+    Discord forbids modal→modal chaining, so we bridge via a button:
+      EventInfoModal.on_submit → defer → this view
+      user clicks "Set Button Names" → send_modal(ButtonNamesModal)  ← allowed
+    """
 
-        # Write BOTH old key (buttons) and new key (enabled_buttons) for compat.
-        event: Dict[str, Any] = {
-            "title":               self.partial["event_name"],
-            "description":         self.partial["description"],
-            "creator":             self.partial["creator_id"],
-            "timestamp":           self.partial["timestamp"],
-            "guild_id":            guild.id,
-            "channel":             channel.id,
-            "channel_name":        channel.name,
-            "message":             None,
-            "target":              self.partial["target"],
-            "buttons":             names,
-            "enabled_buttons":     names,
-            "link_only":           link_only,
-            "capacities":          {},
-            "roles":               {n: [] for n in names},
-            "active":              True,
-            "closed":              False,
-            "presence":            {},
-            "presence_dm_sent_to": [],
-            "presence_started":    False,
-            "presence_started_utc":None,
-            "redirect_url":        redir,
-            "created_utc":         datetime.now(timezone.utc).isoformat(),
-        }
+    def __init__(self, partial: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.partial = partial
 
-        view = EventView(event_id, names, redir, link_only=link_only)
-
-        try:
-            msg = await channel.send(
-                content= resolve_ping(guild, self.partial["target"]) or None,
-                embed=   build_embed(event, guild),
-                view=    view,
-                allowed_mentions=discord.AllowedMentions(roles=True),
-            )
-        except Exception as e:
-            await interaction.response.send_message(
-                f"❌ Failed to post in {channel.mention}: `{e}`", ephemeral=True
-            )
-            return
-
-        event["message"] = msg.id
-
-        data = await load_events()
-        data[event_id] = event
-        await save_events(data)
-
-        try:
-            interaction.client.add_view(
-                EventView(event_id, names, "", link_only=link_only, for_registration=True),
-                message_id=msg.id,
-            )
-        except Exception:
-            pass
-
-        mode_str = (
-            f"🔗 Link-only (no RSVP buttons) — [{redir}]({redir})"
-            if link_only
-            else f"Buttons: {', '.join(f'**{n}**' for n in names)}"
-        )
-        await interaction.response.send_message(
-            f"✅ Event created in {channel.mention}.\n"
-            f"Audience: **{target_label(self.partial['target'])}**\n"
-            f"{mode_str}",
-            ephemeral=True,
-        )
+    @discord.ui.button(label="Set Button Names →", style=discord.ButtonStyle.primary)
+    async def proceed(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_modal(ButtonNamesModal(self.partial))
 
 
 # ============================================================

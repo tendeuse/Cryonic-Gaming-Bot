@@ -744,6 +744,7 @@ class APClaimIGNModal(discord.ui.Modal):
         self.add_item(self.ign_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Pure validation first — these fire before any async I/O so send_message is safe.
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
             return
@@ -751,6 +752,10 @@ class APClaimIGNModal(discord.ui.Modal):
         if not ign:
             await interaction.response.send_message("IGN cannot be empty.", ephemeral=True)
             return
+
+        # Defer now — async I/O below would exceed Discord's 3-second ack window (10062).
+        await interaction.response.defer(ephemeral=True)
+
         data = await load()
         rec  = data.setdefault(str(interaction.user.id), {"ap": 0, "last_chat": None})
         rec[CLAIM_GAME_KEY] = self.game_value
@@ -761,7 +766,7 @@ class APClaimIGNModal(discord.ui.Modal):
             description= f"Saved your claim:\n**Game:** {self.game_value}\n**IGN:** {ign}",
             timestamp=   datetime.datetime.utcnow()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 class APClaimGameView(discord.ui.View):
     def __init__(self, owner_id: int):
