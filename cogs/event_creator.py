@@ -1868,6 +1868,15 @@ class EventCreator(commands.Cog):
 
         if member:
             # ── per-member report ──────────────────────────────────────────
+            # Only report on members who currently hold the ARC Subsidized role.
+            if not has_any_role(member, {SUBSIDIZED_PING_ROLE}):
+                await interaction.followup.send(
+                    f"{member.mention} does not have the **{SUBSIDIZED_PING_ROLE}** role "
+                    f"and is not included in the event log.",
+                    ephemeral=True,
+                )
+                return
+
             uid   = member.id
             lines: List[str] = []
 
@@ -1907,6 +1916,7 @@ class EventCreator(commands.Cog):
 
         else:
             # ── all-events report ──────────────────────────────────────────
+            # Only list participants who currently hold the ARC Subsidized role.
             sections: List[str] = []
 
             for event_id, event in sorted_events:
@@ -1920,19 +1930,17 @@ class EventCreator(commands.Cog):
                 part_lines: List[str] = []
                 for btn, users in event.get("roles", {}).items():
                     for uid in users:
-                        if guild:
-                            m        = guild.get_member(uid)
-                            name_str = m.display_name if m else f"ID:{uid}"
-                        else:
-                            name_str = f"ID:{uid}"
-
+                        m = guild.get_member(uid) if guild else None
+                        # Skip anyone who doesn't currently hold ARC Subsidized.
+                        if not m or not has_any_role(m, {SUBSIDIZED_PING_ROLE}):
+                            continue
                         confirmed = event.get("presence", {}).get(str(uid))
                         conf_tag  = (
                             " ✅" if confirmed is True
                             else " ❌" if confirmed is False
                             else ""
                         )
-                        part_lines.append(f"  • {name_str} ({btn}{conf_tag})")
+                        part_lines.append(f"  • {m.display_name} ({btn}{conf_tag})")
 
                 if part_lines:
                     sections.append(
@@ -1942,12 +1950,13 @@ class EventCreator(commands.Cog):
 
             if not sections:
                 await interaction.followup.send(
-                    "No participation records found.", ephemeral=True
+                    f"No participation records found for **{SUBSIDIZED_PING_ROLE}** members.",
+                    ephemeral=True,
                 )
                 return
 
             header = (
-                f"📋 **Event Participation Log**  "
+                f"📋 **Event Participation Log** — {SUBSIDIZED_PING_ROLE} members only  "
                 f"({len(sorted_events)} event(s))\n\n"
             )
             body = "\n\n".join(sections)
