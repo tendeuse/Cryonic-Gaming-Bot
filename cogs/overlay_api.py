@@ -830,6 +830,7 @@ class OverlayApiCog(commands.Cog, name="OverlayAPI"):
             return   # already running
 
         app = build_api(self.bot, self.db_path)
+        self.app = app          # exposed so other cogs (e.g. arc_seat) can add routes
         port = _get_api_port()
         config = uvicorn.Config(
             app,
