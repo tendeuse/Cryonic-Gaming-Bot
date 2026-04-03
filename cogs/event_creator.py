@@ -572,6 +572,81 @@ async def ensure_hierarchy_log_channel(
         return None
 
 
+def _build_vc_overwrites(
+    guild:      discord.Guild,
+    target:     str,
+    bot_member: Optional[discord.Member] = None,
+) -> Dict[Any, discord.PermissionOverwrite]:
+    """
+    Build permission overwrites for the auto-created event voice channel.
+
+    Access policy
+    -------------
+    • @everyone        → cannot see or connect  (hidden from unauthorised members)
+    • ARC Security     → can see and connect    (always — all events include security)
+    • ARC Subsidized   → can see and connect    (only when target == "public")
+    • Bot member       → full channel control   (view, connect, move_members, manage)
+
+    Compatibility with Discord native Scheduled Events
+    ---------------------------------------------------
+    Discord's own scheduled-event system lets admins link an event to an
+    existing VC.  Our auto-created VC is a brand-new channel that is never
+    registered as a Discord scheduled event, so there is zero overlap.
+    The on_voice_state_update listener only fires for VCs present in
+    _vc_event_map, so moves triggered by Discord's own scheduled events
+    (which point to different VCs entirely) are silently ignored.
+
+    Returns an empty dict (no overwrites) if required roles are missing —
+    Discord falls back to category-inherited permissions and a warning is
+    printed so ops can investigate.
+    """
+    overwrites: Dict[Any, discord.PermissionOverwrite] = {}
+
+    # ── Deny everyone by default ─────────────────────────────────────────────
+    overwrites[guild.default_role] = discord.PermissionOverwrite(
+        view_channel=False,
+        connect=False,
+    )
+
+    # ── ARC Security — always allowed ────────────────────────────────────────
+    sec_role = discord.utils.get(guild.roles, name=SECURITY_PING_ROLE)
+    if sec_role:
+        overwrites[sec_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+        )
+    else:
+        print(
+            f"[event_creator] WARNING: Role '{SECURITY_PING_ROLE}' not found — "
+            "event VC will not restrict access correctly."
+        )
+
+    # ── ARC Subsidized — only for public-audience events ─────────────────────
+    if target == "public":
+        sub_role = discord.utils.get(guild.roles, name=SUBSIDIZED_PING_ROLE)
+        if sub_role:
+            overwrites[sub_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+            )
+        else:
+            print(
+                f"[event_creator] WARNING: Role '{SUBSIDIZED_PING_ROLE}' not found — "
+                "subsidized members cannot join the public event VC."
+            )
+
+    # ── Bot itself — needs move_members + manage_channels to do its job ───────
+    if bot_member:
+        overwrites[bot_member] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            move_members=True,
+            manage_channels=True,
+        )
+
+    return overwrites
+
+
 async def log_confirmed_participants(
     guild:         discord.Guild,
     *,
@@ -1828,14 +1903,41 @@ class EventCreator(commands.Cog):
                 ann_channel, discord.TextChannel
             ) else None
 
-            # ── 2. Create the event voice channel ────────────────────────────
+            # ── 2. Build permission overwrites for the event audience ─────────
+            bot_member = guild.get_member(self.bot.user.id) if self.bot.user else None
+            overwrites = _build_vc_overwrites(
+                guild,
+                target=     event.get("target", "security_only"),
+                bot_member= bot_member,
+            )
+
+            # ── 3. Create the event voice channel ────────────────────────────
             vc_name = f"🔴 {str(event.get('title', 'Event'))[:90]}"
             try:
                 event_vc = await guild.create_voice_channel(
-                    name=     vc_name,
-                    category= category,
-                    reason=   f"Event attendance tracking: {event_id}",
+                    name=       vc_name,
+                    category=   category,
+                    overwrites= overwrites,
+                    reason=     f"Event attendance tracking: {event_id}",
                 )
+            except discord.Forbidden:
+                print(
+                    f"[event_creator] Missing 'Manage Roles' permission — cannot "
+                    f"set overwrites for event VC ({event_id}). "
+                    "Creating without access restrictions as fallback."
+                )
+                try:
+                    event_vc = await guild.create_voice_channel(
+                        name=     vc_name,
+                        category= category,
+                        reason=   f"Event attendance tracking (no overwrites): {event_id}",
+                    )
+                except Exception as e2:
+                    print(
+                        f"[event_creator] Fallback VC creation also failed for "
+                        f"{event_id}: {type(e2).__name__}: {e2}"
+                    )
+                    continue
             except Exception as e:
                 print(
                     f"[event_creator] Failed to create event VC for {event_id}: "
@@ -1843,7 +1945,7 @@ class EventCreator(commands.Cog):
                 )
                 continue
 
-            # ── 3. Mark event as started, record VC id ───────────────────────
+            # ── 4. Mark event as started, record VC id ───────────────────────
             event["presence_started"]      = True
             event["presence_started_utc"]  = datetime.now(timezone.utc).isoformat()
             event["event_vc_id"]           = event_vc.id
@@ -1855,7 +1957,7 @@ class EventCreator(commands.Cog):
             self._vc_join_times.setdefault(event_id, {})
             self._vc_cumulative.setdefault(event_id, {})
 
-            # ── 4. Pull RSVP'd members who are already in a VC ──────────────
+            # ── 5. Pull RSVP'd members who are already in a VC ──────────────
             participants = compute_participants(event)
             pulled       = 0
             for pid in participants:
@@ -1878,7 +1980,7 @@ class EventCreator(commands.Cog):
                 f"RSVP'd member(s)."
             )
 
-            # ── 5. DM the creator with the "Mark as Done" button ─────────────
+            # ── 6. DM the creator with the "Mark as Done" button ─────────────
             try:
                 dm    = await creator.create_dm()
                 embed = discord.Embed(
