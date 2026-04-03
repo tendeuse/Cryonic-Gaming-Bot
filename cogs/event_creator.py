@@ -80,6 +80,10 @@ PRESENCE_BONUS_EXCLUDED_ROLES: Set[str] = {
     "ARC Security Corporation Leader",
 }
 
+# Voice-channel attendance tracking
+ARC_MAIN_VC          = "ARC Main"      # destination VC after event ends
+EVENT_VC_MIN_SECONDS = 15 * 60         # 900 s  — minimum cumulative time to qualify
+
 # Clicking these button names grants the "Event Participant" temp-role
 ROLE_ASSIGN_TYPES: Set[str] = {"accept", "damage", "logi", "salvager"}
 
@@ -192,6 +196,11 @@ def normalize_event(event: Dict[str, Any]) -> Dict[str, Any]:
     event.setdefault("presence_started",    False)
     event.setdefault("presence_started_utc", None)
 
+    # ── voice-channel attendance (new system) ─────────────────────────────────
+    event.setdefault("event_vc_id",         None)   # int: created event VC
+    event.setdefault("vc_cumulative_times", {})     # {str(uid): seconds}
+    event.setdefault("vc_qualified",        [])     # [uid, ...] hit 15-min threshold
+
     # ── other new fields ─────────────────────────────────────────────────────
     event.setdefault("target",       "security_only")
     event.setdefault("redirect_url", "")
@@ -253,6 +262,29 @@ def compute_participants(event: Dict[str, Any]) -> List[int]:
 def current_confirmed_ids(event: Dict[str, Any]) -> List[int]:
     presence = event.get("presence", {})
     return sorted({int(k) for k, v in presence.items() if v is True})
+
+
+def current_absent_ids(event: Dict[str, Any]) -> List[int]:
+    """IDs of participants the creator explicitly marked as NOT present."""
+    presence = event.get("presence", {})
+    return sorted({int(k) for k, v in presence.items() if v is False})
+
+
+def current_qualified_ids(event: Dict[str, Any]) -> List[int]:
+    """
+    IDs of members who accumulated >= EVENT_VC_MIN_SECONDS in the event VC.
+    Reads from the persisted vc_qualified list (set at finalize time) or
+    falls back to computing directly from vc_cumulative_times.
+    """
+    qualified = event.get("vc_qualified")
+    if isinstance(qualified, list) and qualified:
+        return sorted(int(x) for x in qualified if isinstance(x, int))
+    # Fallback: compute from cumulative times
+    cumulative = event.get("vc_cumulative_times", {})
+    return sorted(
+        int(k) for k, v in cumulative.items()
+        if isinstance(v, (int, float)) and v >= EVENT_VC_MIN_SECONDS
+    )
 
 
 def target_label(target: str) -> str:
@@ -541,38 +573,67 @@ async def ensure_hierarchy_log_channel(
 
 
 async def log_confirmed_participants(
-    guild:       discord.Guild,
+    guild:         discord.Guild,
     *,
-    event_title: str,
-    event_id:    str,
-    confirmed_ids: List[int],
+    event_title:   str,
+    event_id:      str,
+    qualified_ids: List[int],
+    rsvp_ids:      List[int],
 ) -> None:
+    """
+    Posts the final attendance summary to #arc-hierarchy-log.
+
+    ✅  Qualified (≥15 min in event VC) — these members earned AP.
+    ⏱   RSVP'd but did not reach the threshold — shown for transparency.
+
+    Decline-button people are never included (excluded upstream by
+    compute_participants).
+    """
     ch = await ensure_hierarchy_log_channel(guild)
     if not ch:
         return
 
-    lines    = []
+    qualified_set = set(qualified_ids)
+
+    def _names(ids: List[int]) -> str:
+        lines = []
+        for uid in ids:
+            m = guild.get_member(uid)
+            lines.append(f"- {m.display_name} ({m.mention})" if m else f"- <@{uid}>")
+        return "\n".join(lines) if lines else "_(none)_"
+
+    # RSVP'd members who didn't qualify
+    no_threshold = [uid for uid in rsvp_ids if uid not in qualified_set]
+
+    embed = discord.Embed(
+        title=     "📋 Fleet Attendance — Final",
+        color=     discord.Color.green() if qualified_ids else discord.Color.orange(),
+        timestamp= datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Fleet",    value=event_title,     inline=True)
+    embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
+    embed.add_field(name="\u200b",   value="\u200b",        inline=True)
+
+    embed.add_field(
+        name=  f"✅ Qualified — {len(qualified_ids)} member(s)  (≥15 min)",
+        value= _names(qualified_ids),
+        inline=False,
+    )
+    if no_threshold:
+        embed.add_field(
+            name=  f"⏱ RSVP'd — did not reach threshold ({len(no_threshold)})",
+            value= _names(no_threshold),
+            inline=False,
+        )
+
+    # Mention only qualified members
     mentions = []
-    for uid in confirmed_ids:
+    for uid in qualified_ids:
         m = guild.get_member(uid)
         if m:
             mentions.append(m.mention)
-            lines.append(f"- {m.display_name} ({m.mention})")
-        else:
-            lines.append(f"- <@{uid}>")
-
-    embed = discord.Embed(
-        title=       "Event Presence Confirmed",
-        description= (
-            f"**Event:** {event_title}\n"
-            f"**Event ID:** `{event_id}`\n"
-            f"**Confirmed present:** {len(lines)}\n\n"
-            + ("\n".join(lines) if lines else "_(none)_")
-        ),
-        color=     discord.Color.green(),
-        timestamp= datetime.now(timezone.utc),
-    )
     content = (" ".join(mentions))[:1800] if mentions else ""
+
     try:
         await ch.send(content=content, embed=embed)
     except Exception:
@@ -580,135 +641,82 @@ async def log_confirmed_participants(
 
 
 # ============================================================
-# PRESENCE CONFIRM VIEW  (DM buttons sent to the event creator)
+# EVENT DONE VIEW  (single DM button sent to the event creator)
 # ============================================================
 
-class PresenceConfirmView(discord.ui.View):
+class EventDoneView(discord.ui.View):
     """
-    Sent to the event creator via DM for each participant.
-    Timeout=48h — not persistent (same behaviour as the previous full version).
-    If the bot restarts mid-window the buttons stop responding, which is a
-    known Discord limitation for non-persistent DM views.
+    Sent to the event creator once via DM when the event VC is created.
+    A single "✅ Mark Event as Done" button triggers finalization:
+      • Cumulative VC times are locked in.
+      • Members ≥ EVENT_VC_MIN_SECONDS are qualified and receive AP.
+      • Everyone still in the event VC is moved to ARC Main.
+      • The event VC is deleted.
+      • Results are logged to #arc-hierarchy-log.
+
+    Timeout = 24 h.  If the bot restarts the button stops responding
+    (known Discord limitation for non-persistent DM views) — the creator
+    can use /close_event as a fallback (future work).
     """
 
-    def __init__(self, *, event_id: str, participant_id: int):
-        super().__init__(timeout=48 * 3600)
-        self.event_id       = event_id
-        self.participant_id = participant_id
+    def __init__(self, event_id: str, bot: commands.Bot):
+        super().__init__(timeout=86_400)   # 24 hours
+        self.event_id = event_id
+        self.bot      = bot
 
-        yes = discord.ui.Button(
-            label="Yes", style=discord.ButtonStyle.success,
-            custom_id=f"presence_yes:{event_id}:{participant_id}",
-        )
-        no = discord.ui.Button(
-            label="No", style=discord.ButtonStyle.danger,
-            custom_id=f"presence_no:{event_id}:{participant_id}",
-        )
-        yes.callback = self.yes_callback
-        no.callback  = self.no_callback
-        self.add_item(yes)
-        self.add_item(no)
-
-    async def _handle(self, interaction: discord.Interaction, present: bool) -> None:
-        events = await load_events()
-        event  = events.get(self.event_id)
+    @discord.ui.button(
+        label="✅ Mark Event as Done",
+        style=discord.ButtonStyle.success,
+        custom_id="event_done_btn",          # NOTE: not truly persistent (DM view)
+    )
+    async def done(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        # Only the creator should be DMing with this bot
+        data  = await load_events()
+        event = data.get(self.event_id)
         if not isinstance(event, dict):
-            await interaction.response.send_message("Event not found.", ephemeral=True)
-            return
-
-        event = normalize_event(event)
-
-        creator_id = event.get("creator")
-        guild_id   = event.get("guild_id")
-
-        if not isinstance(creator_id, int) or interaction.user.id != creator_id:
             await interaction.response.send_message(
-                "Only the event creator can confirm presence.", ephemeral=True
+                "Event not found.", ephemeral=True
             )
             return
 
-        guild = interaction.client.get_guild(guild_id) if isinstance(guild_id, int) else None
-        if not guild:
-            await interaction.response.send_message("Guild not found.", ephemeral=True)
+        if interaction.user.id != event.get("creator"):
+            await interaction.response.send_message(
+                "Only the event creator can mark this event as done.",
+                ephemeral=True,
+            )
             return
 
-        presence = event.setdefault("presence", {})
-        key      = str(self.participant_id)
+        is_active = event.get("active", True) and not event.get("closed", False)
+        if not is_active:
+            await interaction.response.send_message(
+                "This event is already closed.", ephemeral=True
+            )
+            return
 
-        # Already recorded
-        if key in presence:
-            for child in self.children:
-                if isinstance(child, discord.ui.Button):
-                    child.disabled = True
+        # Disable the button immediately so it can't be double-clicked
+        button.disabled = True
+        button.label    = "⏳ Finalizing…"
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception:
+            await interaction.response.defer()
+
+        # Delegate all finalization logic to the cog
+        cog = self.bot.cogs.get("EventCreator")
+        if cog:
+            await cog._finalize_event(
+                interaction=interaction,
+                event_id=   self.event_id,
+            )
+        else:
             try:
-                await interaction.response.edit_message(
-                    content="Already recorded (no changes made).", view=self
+                await interaction.followup.send(
+                    "❌ EventCreator cog not found.", ephemeral=True
                 )
             except Exception:
-                await interaction.response.send_message(
-                    "Already recorded.", ephemeral=True
-                )
-            return
-
-        presence[key]          = present
-        event["presence"]      = presence
-        events[self.event_id]  = event
-        await save_events(events)
-
-        bonus_ap  = False
-        boost_ok  = False
-        creator_m = guild.get_member(creator_id)
-        part_m    = guild.get_member(self.participant_id)
-
-        if present and creator_m and part_m:
-            if not has_any_role(creator_m, PRESENCE_BONUS_EXCLUDED_ROLES):
-                bonus_ap = await award_creator_5ap(
-                    guild, creator_m, part_m,
-                    str(event.get("title", "Event")),
-                )
-                boost_ok = await register_or_extend_boost(
-                    creator_id=    creator_m.id,
-                    participant_id=part_m.id,
-                    event_id=      self.event_id,
-                )
-
-        try:
-            await log_confirmed_participants(
-                guild,
-                event_title=    str(event.get("title", "Event")),
-                event_id=       self.event_id,
-                confirmed_ids=  current_confirmed_ids(event),
-            )
-        except Exception:
-            pass
-
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
-        lines = [f"Saved: **{'Present' if present else 'Not present'}**."]
-        if present:
-            if creator_m and has_any_role(creator_m, PRESENCE_BONUS_EXCLUDED_ROLES):
-                lines.append("No bonuses (creator excluded by role).")
-            else:
-                lines.append(
-                    "Creator bonus: **+5 AP** "
-                    + ("applied." if bonus_ap else "(could not apply — ap_tracking missing?).")
-                )
-                lines.append(
-                    "Boost: **+10% for 24 h** "
-                    + ("registered." if boost_ok else "(could not register).")
-                )
-        try:
-            await interaction.response.edit_message(content="\n".join(lines), view=self)
-        except Exception:
-            await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-    async def yes_callback(self, interaction: discord.Interaction):
-        await self._handle(interaction, True)
-
-    async def no_callback(self, interaction: discord.Interaction):
-        await self._handle(interaction, False)
+                pass
 
 
 # ============================================================
@@ -1639,14 +1647,36 @@ class EventView(discord.ui.View):
 
 class EventCreator(commands.Cog):
     def __init__(self, bot: commands.Bot):
-        self.bot                 = bot
-        self._views_registered   = False
+        self.bot               = bot
+        self._views_registered = False
+
+        # ── In-memory voice-channel attendance tracking ───────────────────────
+        # These are rebuilt from disk on on_ready / on bot restart.
+        #
+        # _vc_event_map:   {voice_channel_id: event_id}
+        #   Fast lookup: is this VC one of ours?
+        #
+        # _vc_join_times:  {event_id: {user_id: unix_join_timestamp}}
+        #   Records when a member *entered* the event VC this session.
+        #   Cleared when they leave; their time is folded into _vc_cumulative.
+        #
+        # _vc_cumulative:  {event_id: {user_id: total_seconds_so_far}}
+        #   Accumulated VC time since tracking began.
+        #   Persisted to disk every 2 min by _vc_save_loop.
+        self._vc_event_map:  Dict[int, str]            = {}
+        self._vc_join_times: Dict[str, Dict[int, int]] = {}
+        self._vc_cumulative: Dict[str, Dict[int, int]] = {}
+
         if not self.presence_loop.is_running():
             self.presence_loop.start()
+        if not self._vc_save_loop.is_running():
+            self._vc_save_loop.start()
 
     def cog_unload(self):
         if self.presence_loop.is_running():
             self.presence_loop.cancel()
+        if self._vc_save_loop.is_running():
+            self._vc_save_loop.cancel()
 
     def _can_create(self, member: discord.Member) -> bool:
         return any(r.name in CREATOR_ROLES for r in member.roles)
@@ -1664,6 +1694,8 @@ class EventCreator(commands.Cog):
 
         data       = await load_events()
         registered = 0
+        vc_rebuilt = 0
+        needs_save = False
 
         for event_id, event in data.items():
             if not isinstance(event, dict):
@@ -1678,9 +1710,43 @@ class EventCreator(commands.Cog):
             if not is_active:
                 continue
 
-            msg_id   = event.get("message")
-            buttons  = get_enabled_button_titles(event)
-            redirect = event.get("redirect_url", "")
+            # ── Rebuild VC tracking state for events that were mid-session ────
+            vc_id = event.get("event_vc_id")
+            if isinstance(vc_id, int):
+                guild = self.bot.get_guild(event["guild_id"])
+                vc    = guild.get_channel(vc_id) if guild else None
+                if isinstance(vc, discord.VoiceChannel):
+                    # Restore in-memory maps
+                    self._vc_event_map[vc_id] = event_id
+                    # Load persisted cumulative times
+                    persisted = event.get("vc_cumulative_times", {})
+                    self._vc_cumulative[event_id] = {
+                        int(k): int(v) for k, v in persisted.items()
+                        if str(k).isdigit()
+                    }
+                    # Re-baseline join times for anyone already in the VC
+                    now = int(datetime.now(timezone.utc).timestamp())
+                    self._vc_join_times[event_id] = {
+                        m.id: now for m in vc.members
+                    }
+                    vc_rebuilt += 1
+                    print(
+                        f"[event_creator] Restored VC tracking for event "
+                        f"{event_id} (vc={vc_id}, {len(vc.members)} member(s) present)."
+                    )
+                else:
+                    # VC no longer exists — clear the stale ID
+                    event["event_vc_id"] = None
+                    data[event_id]       = event
+                    needs_save           = True
+                    print(
+                        f"[event_creator] Event {event_id}: stale event_vc_id "
+                        f"{vc_id} cleared (VC not found)."
+                    )
+
+            msg_id    = event.get("message")
+            buttons   = get_enabled_button_titles(event)
+            redirect  = event.get("redirect_url", "")
             link_only = bool(event.get("link_only", False))
 
             try:
@@ -1696,9 +1762,12 @@ class EventCreator(commands.Cog):
                     f"{type(e).__name__}: {e}"
                 )
 
+        if needs_save:
+            await save_events(data)
+
         print(
             f"[event_creator] Registered {registered}/{len(data)} "
-            "persistent event view(s)."
+            f"persistent event view(s); restored {vc_rebuilt} active event VC(s)."
         )
 
         for guild in self.bot.guilds:
@@ -1708,23 +1777,23 @@ class EventCreator(commands.Cog):
                 pass
 
     # ----------------------------------------------------------------
-    # Presence loop
+    # Presence loop — fires every 60 s
     # ----------------------------------------------------------------
 
     @tasks.loop(seconds=60)
     async def presence_loop(self):
         """
-        Fires every 60 s.  When an event's timestamp is reached and
-        presence_started is False, DMs the creator once per participant.
-
-        Safety for old events
-        ---------------------
-        • Old events with closed=True are skipped (active=False after normalise).
-        • Old events without guild_id are skipped (can't resolve guild/members).
-        • Events without participants produce no DMs.
+        When an event's scheduled time is reached and presence_started is
+        False, the bot:
+          1. Creates a temporary voice channel in the same category as the
+             announcement channel.
+          2. Pulls every RSVP'd (non-Decline) member who is currently in any
+             VC into the new event VC.
+          3. Begins tracking cumulative VC time for all members.
+          4. DMs the event creator a single "Mark Event as Done" button.
         """
-        data   = await load_events()
-        now_ts = int(datetime.now(timezone.utc).timestamp())
+        data    = await load_events()
+        now_ts  = int(datetime.now(timezone.utc).timestamp())
         changed = False
 
         for event_id, event in list(data.items()):
@@ -1748,62 +1817,101 @@ class EventCreator(commands.Cog):
             if not isinstance(guild_id, int) or not isinstance(creator_id, int):
                 continue
 
-            guild = self.bot.get_guild(guild_id)
-            if not guild:
+            guild   = self.bot.get_guild(guild_id)
+            creator = guild.get_member(creator_id) if guild else None
+            if not guild or not creator:
                 continue
 
-            creator = guild.get_member(creator_id)
-            if not creator:
+            # ── 1. Determine VC category (same as announcement channel) ──────
+            ann_channel = guild.get_channel(event.get("channel"))
+            category    = ann_channel.category if isinstance(
+                ann_channel, discord.TextChannel
+            ) else None
+
+            # ── 2. Create the event voice channel ────────────────────────────
+            vc_name = f"🔴 {str(event.get('title', 'Event'))[:90]}"
+            try:
+                event_vc = await guild.create_voice_channel(
+                    name=     vc_name,
+                    category= category,
+                    reason=   f"Event attendance tracking: {event_id}",
+                )
+            except Exception as e:
+                print(
+                    f"[event_creator] Failed to create event VC for {event_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
                 continue
 
-            participants = compute_participants(event)
-
+            # ── 3. Mark event as started, record VC id ───────────────────────
             event["presence_started"]      = True
             event["presence_started_utc"]  = datetime.now(timezone.utc).isoformat()
+            event["event_vc_id"]           = event_vc.id
             data[event_id]                 = event
             changed                        = True
 
-            sent_list = event.setdefault("presence_dm_sent_to", [])
+            # Seed in-memory tracking
+            self._vc_event_map[event_vc.id] = event_id
+            self._vc_join_times.setdefault(event_id, {})
+            self._vc_cumulative.setdefault(event_id, {})
 
+            # ── 4. Pull RSVP'd members who are already in a VC ──────────────
+            participants = compute_participants(event)
+            pulled       = 0
             for pid in participants:
-                if pid in sent_list:
-                    continue
-
                 member = guild.get_member(pid)
-                sent_list.append(pid)
-
                 if not member:
                     continue
+                if member.voice and member.voice.channel:
+                    try:
+                        await member.move_to(
+                            event_vc,
+                            reason="Event started — moved to event VC",
+                        )
+                        pulled += 1
+                    except Exception:
+                        pass  # member may have left VC between check and move
 
-                try:
-                    dm    = await creator.create_dm()
-                    embed = discord.Embed(
-                        title="Was this participant present?",
-                        description=(
-                            f"**Event:** {event.get('title', 'Event')}\n"
-                            f"**Participant:** {member.display_name} ({member.mention})\n"
-                            f"**Event time:** <t:{ts}:F>"
-                        ),
-                        color=     discord.Color.blurple(),
-                        timestamp= datetime.now(timezone.utc),
-                    )
-                    await dm.send(
-                        embed=embed,
-                        view=PresenceConfirmView(
-                            event_id=event_id, participant_id=pid
-                        ),
-                    )
-                except discord.Forbidden:
-                    print(
-                        f"[event_creator] Cannot DM creator {creator_id} "
-                        "(DMs closed)."
-                    )
-                    break
-                except Exception as e:
-                    print(
-                        f"[event_creator] DM error for {event_id}/{pid}: "
-                        f"{type(e).__name__}: {e}"
-                    )
+            print(
+                f"[event_creator] Event '{event.get('title')}' started. "
+                f"VC={event_vc.id}, pulled {pulled}/{len(participants)} "
+                f"RSVP'd member(s)."
+            )
+
+            # ── 5. DM the creator with the "Mark as Done" button ─────────────
+            try:
+                dm    = await creator.create_dm()
+                embed = discord.Embed(
+                    title=       "⚔️ Your event has started!",
+                    description= (
+                        f"**Fleet:** {event.get('title', 'Event')}\n"
+                        f"**Scheduled time:** <t:{ts}:F>\n\n"
+                        f"A temporary voice channel **{vc_name}** has been created.\n"
+                        f"RSVP'd members currently in a VC have been pulled in.\n\n"
+                        f"**Attendance is being tracked automatically.**\n"
+                        f"Members need **15 minutes** of cumulative VC time to qualify.\n\n"
+                        f"When the fleet is over, press the button below."
+                    ),
+                    color=     discord.Color.blurple(),
+                    timestamp= datetime.now(timezone.utc),
+                )
+                embed.set_footer(
+                    text=f"Event ID: {event_id}"
+                )
+                await dm.send(
+                    embed= embed,
+                    view=  EventDoneView(event_id, self.bot),
+                )
+            except discord.Forbidden:
+                print(
+                    f"[event_creator] Cannot DM creator {creator_id} "
+                    "(DMs closed). Event {event_id} VC created but creator not notified."
+                )
+            except Exception as e:
+                print(
+                    f"[event_creator] DM error for event {event_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
 
         if changed:
             await save_events(data)
@@ -1811,6 +1919,290 @@ class EventCreator(commands.Cog):
     @presence_loop.before_loop
     async def _before_presence_loop(self):
         await self.bot.wait_until_ready()
+
+    # ----------------------------------------------------------------
+    # Voice-channel attendance tracking
+    # ----------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after:  discord.VoiceState,
+    ):
+        """
+        Tracks cumulative VC time and pulls RSVP'd members into the event VC.
+
+        Four cases handled per update:
+          A) Member LEFT the event VC  → fold session time into cumulative.
+          B) Member JOINED the event VC → record join timestamp.
+          C) RSVP'd member joined any OTHER VC → move them to the event VC.
+          D) All other updates          → ignored.
+        """
+        if not self._vc_event_map:
+            return   # No active event VCs — fast exit
+
+        now = int(datetime.now(timezone.utc).timestamp())
+
+        left_event_vc   = before.channel and before.channel.id in self._vc_event_map
+        joined_event_vc = after.channel  and after.channel.id  in self._vc_event_map
+
+        # ── A: Member left the event VC ──────────────────────────────────────
+        if left_event_vc:
+            event_id = self._vc_event_map[before.channel.id]
+            join_ts  = self._vc_join_times.get(event_id, {}).pop(member.id, None)
+            if join_ts is not None:
+                elapsed  = max(0, now - join_ts)
+                cum      = self._vc_cumulative.setdefault(event_id, {})
+                cum[member.id] = cum.get(member.id, 0) + elapsed
+
+        # ── B: Member joined the event VC ────────────────────────────────────
+        if joined_event_vc and not left_event_vc:
+            event_id = self._vc_event_map[after.channel.id]
+            self._vc_join_times.setdefault(event_id, {})[member.id] = now
+            return   # Nothing else to do
+
+        # ── C: RSVP'd member joined a NON-event VC ───────────────────────────
+        # Pull them into the event VC for their guild (if exactly one active
+        # event VC exists in this guild and they have a valid RSVP).
+        if after.channel and not joined_event_vc:
+            guild = member.guild
+            # Find any event VC in this guild
+            for vc_id, event_id in list(self._vc_event_map.items()):
+                event_vc = guild.get_channel(vc_id)
+                if not isinstance(event_vc, discord.VoiceChannel):
+                    continue
+
+                data  = await load_events()
+                event = data.get(event_id)
+                if not isinstance(event, dict):
+                    continue
+
+                event        = normalize_event(event)
+                participants = set(compute_participants(event))
+
+                if member.id in participants:
+                    try:
+                        await member.move_to(
+                            event_vc,
+                            reason="Event in progress — RSVP'd member joined a VC",
+                        )
+                    except Exception:
+                        pass
+                    # The resulting on_voice_state_update for the move into
+                    # event_vc will be handled by case B above.
+                    break
+
+    # ----------------------------------------------------------------
+    # Periodic persistence of in-memory VC times  (every 2 minutes)
+    # ----------------------------------------------------------------
+
+    @tasks.loop(seconds=120)
+    async def _vc_save_loop(self):
+        """
+        Saves in-memory cumulative VC times to disk so that a bot restart
+        mid-event does not lose all attendance progress.
+
+        For members currently inside the event VC, their ongoing session time
+        is estimated and added to their persisted cumulative total.
+        """
+        if not self._vc_event_map:
+            return
+
+        data    = await load_events()
+        changed = False
+        now     = int(datetime.now(timezone.utc).timestamp())
+
+        for vc_id, event_id in list(self._vc_event_map.items()):
+            event = data.get(event_id)
+            if not isinstance(event, dict):
+                continue
+
+            cum       = dict(self._vc_cumulative.get(event_id, {}))
+            join_times = self._vc_join_times.get(event_id, {})
+
+            # Credit ongoing sessions (estimate only — not finalised yet)
+            for uid, join_ts in join_times.items():
+                elapsed      = max(0, now - join_ts)
+                cum[uid]     = cum.get(uid, 0) + elapsed
+
+            event["vc_cumulative_times"] = {str(k): v for k, v in cum.items()}
+            data[event_id]               = event
+            changed                      = True
+
+        if changed:
+            await save_events(data)
+
+    @_vc_save_loop.before_loop
+    async def _before_vc_save_loop(self):
+        await self.bot.wait_until_ready()
+
+    # ----------------------------------------------------------------
+    # Event finalization  (called by EventDoneView)
+    # ----------------------------------------------------------------
+
+    async def _finalize_event(
+        self,
+        interaction: discord.Interaction,
+        event_id:    str,
+    ) -> None:
+        """
+        Called when the creator marks the event as done.
+
+          1. Lock in all cumulative times (including ongoing sessions).
+          2. Determine qualified members (≥ EVENT_VC_MIN_SECONDS).
+          3. Award +5 AP and boost to each qualified participant (excluding
+             the creator if they hold an excluded role).
+          4. Log the final attendance list to #arc-hierarchy-log.
+          5. Move everyone currently in the event VC to ARC Main.
+          6. Delete the event VC.
+          7. Close the event.
+        """
+        data  = await load_events()
+        event = data.get(event_id)
+        if not isinstance(event, dict):
+            try:
+                await interaction.followup.send("Event not found.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        event     = normalize_event(event)
+        guild_id  = event.get("guild_id")
+        guild     = self.bot.get_guild(guild_id) if isinstance(guild_id, int) else None
+        if not guild:
+            try:
+                await interaction.followup.send("Guild not found.", ephemeral=True)
+            except Exception:
+                pass
+            return
+
+        now    = int(datetime.now(timezone.utc).timestamp())
+        vc_id  = event.get("event_vc_id")
+        vc     = guild.get_channel(vc_id) if isinstance(vc_id, int) else None
+
+        # ── 1. Lock in cumulative times ───────────────────────────────────────
+        cum        = dict(self._vc_cumulative.get(event_id, {}))
+        join_times = dict(self._vc_join_times.get(event_id, {}))
+
+        for uid, join_ts in join_times.items():
+            elapsed  = max(0, now - join_ts)
+            cum[uid] = cum.get(uid, 0) + elapsed
+
+        event["vc_cumulative_times"] = {str(k): v for k, v in cum.items()}
+
+        # ── 2. Determine qualified members ────────────────────────────────────
+        qualified_ids = [
+            uid for uid, secs in cum.items()
+            if secs >= EVENT_VC_MIN_SECONDS
+        ]
+        event["vc_qualified"] = qualified_ids
+
+        # ── 3. Award AP to each qualified participant ─────────────────────────
+        creator_id = event.get("creator")
+        creator_m  = guild.get_member(creator_id) if isinstance(creator_id, int) else None
+        event_title = str(event.get("title", "Event"))
+
+        ap_count = 0
+        if creator_m and not has_any_role(creator_m, PRESENCE_BONUS_EXCLUDED_ROLES):
+            for uid in qualified_ids:
+                part_m = guild.get_member(uid)
+                if not part_m:
+                    continue
+                try:
+                    await award_creator_5ap(guild, creator_m, part_m, event_title)
+                    await register_or_extend_boost(
+                        creator_id=     creator_m.id,
+                        participant_id= part_m.id,
+                        event_id=       event_id,
+                    )
+                    ap_count += 1
+                except Exception as e:
+                    print(
+                        f"[event_creator] AP award failed for {uid} "
+                        f"in event {event_id}: {e}"
+                    )
+
+        # ── 4. Log to #arc-hierarchy-log ──────────────────────────────────────
+        rsvp_ids = compute_participants(event)
+        try:
+            await log_confirmed_participants(
+                guild,
+                event_title=   event_title,
+                event_id=      event_id,
+                qualified_ids= qualified_ids,
+                rsvp_ids=      rsvp_ids,
+            )
+        except Exception as e:
+            print(f"[event_creator] Log error for {event_id}: {e}")
+
+        # ── 5. Move everyone in the event VC → ARC Main ───────────────────────
+        moved = 0
+        if isinstance(vc, discord.VoiceChannel):
+            arc_main = discord.utils.get(guild.voice_channels, name=ARC_MAIN_VC)
+            if arc_main:
+                for member in list(vc.members):
+                    try:
+                        await member.move_to(
+                            arc_main,
+                            reason="Event ended — moved to ARC Main",
+                        )
+                        moved += 1
+                    except Exception:
+                        pass
+            else:
+                print(
+                    f"[event_creator] ARC Main VC not found in guild {guild_id}. "
+                    "Members not moved."
+                )
+
+        # ── 6. Delete the event VC ────────────────────────────────────────────
+        if isinstance(vc, discord.VoiceChannel):
+            try:
+                await vc.delete(reason=f"Event ended: {event_id}")
+            except Exception as e:
+                print(
+                    f"[event_creator] Could not delete event VC {vc_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        # ── 7. Close the event ────────────────────────────────────────────────
+        event["active"]    = False
+        event["closed"]    = True
+        event["event_vc_id"] = None
+        data[event_id]     = event
+        await save_events(data)
+        await refresh(self.bot, event_id)
+
+        # Clean up in-memory state
+        self._vc_event_map.pop(vc_id, None)
+        self._vc_join_times.pop(event_id, None)
+        self._vc_cumulative.pop(event_id, None)
+
+        print(
+            f"[event_creator] Event '{event_title}' finalized. "
+            f"Qualified: {len(qualified_ids)}, AP awarded: {ap_count}, "
+            f"Members moved to ARC Main: {moved}."
+        )
+
+        # ── DM summary back to creator ────────────────────────────────────────
+        summary_lines = [
+            f"✅ **Fleet '{event_title}' has been closed.**\n",
+            f"**Qualified attendees (≥15 min):** {len(qualified_ids)}",
+            f"**AP awards sent:** {ap_count}",
+            f"**Members moved to ARC Main:** {moved}",
+        ]
+        if creator_m and has_any_role(creator_m, PRESENCE_BONUS_EXCLUDED_ROLES):
+            summary_lines.append(
+                "\n_(No AP bonuses applied — your role is excluded from receiving them.)_"
+            )
+        try:
+            await interaction.followup.send(
+                "\n".join(summary_lines), ephemeral=False
+            )
+        except Exception:
+            pass
 
     # ----------------------------------------------------------------
     # /create_event
@@ -1840,10 +2232,10 @@ class EventCreator(commands.Cog):
 
     @app_commands.command(
         name="event_log",
-        description="Show participation log — who signed up for which events.",
+        description="Show fleet attendance — 15-min qualified members only.",
     )
     @app_commands.describe(
-        member="Optional: filter to a single member's participation history.",
+        member="Optional: filter to a single member's attendance history.",
     )
     async def event_log(
         self,
@@ -1859,7 +2251,7 @@ class EventCreator(commands.Cog):
 
         guild = interaction.guild
 
-        # Sort all events by timestamp descending (newest first)
+        # Newest-first
         sorted_events = sorted(
             [(eid, e) for eid, e in data.items() if isinstance(e, dict)],
             key=lambda kv: kv[1].get("timestamp", 0),
@@ -1868,11 +2260,10 @@ class EventCreator(commands.Cog):
 
         if member:
             # ── per-member report ──────────────────────────────────────────
-            # Only report on members who currently hold the ARC Subsidized role.
             if not has_any_role(member, {SUBSIDIZED_PING_ROLE}):
                 await interaction.followup.send(
                     f"{member.mention} does not have the **{SUBSIDIZED_PING_ROLE}** role "
-                    f"and is not included in the event log.",
+                    f"and is not included in the fleet log.",
                     ephemeral=True,
                 )
                 return
@@ -1885,62 +2276,58 @@ class EventCreator(commands.Cog):
                 title = str(event.get("title", "Untitled"))
                 ts    = event.get("timestamp", 0)
 
-                buttons_found: List[str] = []
-                for btn, users in event.get("roles", {}).items():
-                    if uid in users:
-                        confirmed = event.get("presence", {}).get(str(uid))
-                        tag = (
-                            " ✅" if confirmed is True
-                            else " ❌" if confirmed is False
-                            else ""
-                        )
-                        buttons_found.append(f"{btn}{tag}")
+                qualified = current_qualified_ids(event)
+                if uid not in qualified:
+                    continue
 
-                if buttons_found:
-                    date_str = f"<t:{ts}:d>" if ts else "?"
-                    lines.append(
-                        f"• **{title}** ({date_str}) — {', '.join(buttons_found)}"
-                    )
+                # Show cumulative time for this member
+                secs     = event.get("vc_cumulative_times", {}).get(str(uid), 0)
+                mins     = int(secs) // 60
+                date_str = f"<t:{ts}:d>" if ts else "?"
+                lines.append(
+                    f"• **{title}** ({date_str}) — ✅ Qualified  _{mins} min_"
+                )
 
             if not lines:
                 await interaction.followup.send(
-                    f"{member.mention} has no participation records.", ephemeral=True
+                    f"{member.mention} has no qualified fleet attendance records.",
+                    ephemeral=True,
                 )
                 return
 
             header = (
-                f"📋 Participation log for **{member.display_name}** "
-                f"— {len(lines)} event(s)\n\n"
+                f"📋 Fleet attendance for **{member.display_name}** "
+                f"— {len(lines)} fleet(s) with ≥15 min\n\n"
             )
             body = "\n".join(lines)
 
         else:
-            # ── all-events report ──────────────────────────────────────────
-            # Only list participants who currently hold the ARC Subsidized role.
+            # ── all-fleets report ──────────────────────────────────────────
+            # Only list members who currently hold the ARC Subsidized role.
             sections: List[str] = []
 
             for event_id, event in sorted_events:
-                event    = normalize_event(event)
-                title    = str(event.get("title", "Untitled"))
-                ts       = event.get("timestamp", 0)
+                event     = normalize_event(event)
+                title     = str(event.get("title", "Untitled"))
+                ts        = event.get("timestamp", 0)
                 is_active = event.get("active", True) and not event.get("closed", False)
-                status   = "🟢" if is_active else "🔴"
-                date_str = f"<t:{ts}:d>" if ts else "?"
+                status    = "🟢" if is_active else "🔴"
+                date_str  = f"<t:{ts}:d>" if ts else "?"
+
+                qualified_ids = current_qualified_ids(event)
+                if not qualified_ids:
+                    continue
 
                 part_lines: List[str] = []
-                for btn, users in event.get("roles", {}).items():
-                    for uid in users:
-                        m = guild.get_member(uid) if guild else None
-                        # Skip anyone who doesn't currently hold ARC Subsidized.
-                        if not m or not has_any_role(m, {SUBSIDIZED_PING_ROLE}):
-                            continue
-                        confirmed = event.get("presence", {}).get(str(uid))
-                        conf_tag  = (
-                            " ✅" if confirmed is True
-                            else " ❌" if confirmed is False
-                            else ""
-                        )
-                        part_lines.append(f"  • {m.display_name} ({btn}{conf_tag})")
+                cum_times = event.get("vc_cumulative_times", {})
+
+                for uid in qualified_ids:
+                    m = guild.get_member(uid) if guild else None
+                    if not m or not has_any_role(m, {SUBSIDIZED_PING_ROLE}):
+                        continue
+                    secs = cum_times.get(str(uid), 0)
+                    mins = int(secs) // 60
+                    part_lines.append(f"  ✅ {m.display_name} — _{mins} min_")
 
                 if part_lines:
                     sections.append(
@@ -1950,32 +2337,32 @@ class EventCreator(commands.Cog):
 
             if not sections:
                 await interaction.followup.send(
-                    f"No participation records found for **{SUBSIDIZED_PING_ROLE}** members.",
+                    f"No qualified attendance records found for "
+                    f"**{SUBSIDIZED_PING_ROLE}** members.",
                     ephemeral=True,
                 )
                 return
 
             header = (
-                f"📋 **Event Participation Log** — {SUBSIDIZED_PING_ROLE} members only  "
-                f"({len(sorted_events)} event(s))\n\n"
+                f"📋 **Fleet Attendance Log** — {SUBSIDIZED_PING_ROLE} members  "
+                f"(✅ = qualified, ≥15 min in event VC)\n\n"
             )
             body = "\n\n".join(sections)
 
         full = header + body
 
-        # Send inline if short enough; otherwise attach as a plain-text file
         if len(full) <= 2000:
             await interaction.followup.send(full, ephemeral=True)
         else:
             buf = io.BytesIO(full.encode("utf-8"))
             await interaction.followup.send(
                 (
-                    f"📋 Participation log for **{member.display_name}**"
+                    f"📋 Fleet attendance for **{member.display_name}**"
                     if member
-                    else "📋 Event Participation Log"
+                    else "📋 Fleet Attendance Log"
                 )
                 + " — too long to display inline, see attached file.",
-                file=discord.File(buf, filename="participation_log.txt"),
+                file=discord.File(buf, filename="fleet_attendance_log.txt"),
                 ephemeral=True,
             )
 
