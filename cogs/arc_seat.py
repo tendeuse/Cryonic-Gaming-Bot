@@ -121,10 +121,10 @@ SEAT_SCOPES = " ".join([
 # ============================================================
 # DISCORD CONFIG
 # ============================================================
-WATCH_LIST_CHANNEL  = "watch-list"       # forum channel name
-ARC_SECURITY_ROLE   = "ARC Security"
-ARC_SUBSIDIZED_ROLE = "ARC Subsidized"
-HIERARCHY_LOG_CH    = "arc-hierarchy-log"
+WATCH_LIST_CHANNEL_ID = 1461162252173316249   # existing forum channel — never recreated
+ARC_SECURITY_ROLE     = "ARC Security"
+ARC_SUBSIDIZED_ROLE   = "ARC Subsidized"
+HIERARCHY_LOG_CH      = "arc-hierarchy-log"
 
 # Rank roles flagged for manual review (NOT auto-removed)
 ARC_RANK_ROLES: Set[str] = {
@@ -186,7 +186,6 @@ def _default_data() -> Dict[str, Any]:
             "arc_corp_id":         ARC_CORP_ID_ENV,
             "hostile_corps":       [],   # List[int]  corp IDs
             "hostile_alliances":   [],   # List[int]  alliance IDs
-            "watch_list_channel_id": None,
         },
         "oauth_states":   {},   # state_token → {discord_id, is_alt, expires}
         "skill_snapshots": {},  # str(discord_id) → {str(char_id) → [snapshots]}
@@ -1420,35 +1419,28 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         data:  Dict[str, Any],
     ) -> Optional[discord.ForumChannel]:
         """
-        Find or create the watch-list forum channel.
-        Saves the channel ID to config.
+        Returns the watch-list forum channel using the hardcoded channel ID.
+        Never creates a new channel — if the channel is not found the bot
+        logs a warning and returns None gracefully.
         """
-        cfg    = data.setdefault("config", {})
-        ch_id  = cfg.get("watch_list_channel_id")
-        ch     = guild.get_channel(ch_id) if ch_id else None
-
+        ch = guild.get_channel(WATCH_LIST_CHANNEL_ID)
         if isinstance(ch, discord.ForumChannel):
             return ch
 
-        # Try to find by name
-        ch = discord.utils.get(guild.forums, name=WATCH_LIST_CHANNEL)
-        if isinstance(ch, discord.ForumChannel):
-            cfg["watch_list_channel_id"] = ch.id
-            return ch
-
-        # Create it
+        # Channel not in cache — try fetching it
         try:
-            ch = await guild.create_forum(
-                name=   WATCH_LIST_CHANNEL,
-                topic=  "ARC-SEAT member intelligence watch-list. One thread per flagged member.",
-                reason= "ARC-SEAT: auto-created watch-list channel",
-            )
-            cfg["watch_list_channel_id"] = ch.id
-            print(f"[ARC-SEAT] Created watch-list forum channel #{WATCH_LIST_CHANNEL}")
-            return ch
-        except Exception as e:
-            print(f"[ARC-SEAT] Could not create watch-list channel: {e}")
-            return None
+            ch = await guild.fetch_channel(WATCH_LIST_CHANNEL_ID)
+            if isinstance(ch, discord.ForumChannel):
+                return ch
+        except Exception:
+            pass
+
+        print(
+            f"[ARC-SEAT] WARNING: Watch-list forum channel "
+            f"{WATCH_LIST_CHANNEL_ID} not found in guild '{guild.name}'. "
+            "Check that the channel ID is correct and the bot has access."
+        )
+        return None
 
     async def _update_watchlist_thread(
         self,
