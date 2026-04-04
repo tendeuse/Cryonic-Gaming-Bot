@@ -6,68 +6,64 @@
 # A self-contained SeAT equivalent built as a discord.py cog.
 # Runs entirely inside the existing Railway-hosted bot — no extra server needed.
 #
+# AUTH FLOW
+# ---------
+# Reuses the existing overlay_api.py SSO flow.
+# Members authenticate ONCE via /eve_link — no separate /seat_auth needed.
+# arc_seat reads tokens directly from the overlay's SQLite database
+# (MISSION_DB_PATH, default: /data/missions.db).
+# The overlay's EVE_SCOPES have been expanded to cover all SEAT endpoints.
+#
+# ON STARTUP
+# ----------
+# arc_seat scans the overlay DB and auto-imports any character that has
+# already authenticated via /eve_link.  New members just run /eve_link
+# followed by /seat_sync.
+#
 # FEATURES
 # --------
-# 1.  Per-member EVE SSO auth  (/seat_auth, /seat_add_alt)
-#     • Separate ESI scopes from overlay_api.py
-#     • Callback registered on the overlay FastAPI server (/seat/auth/callback)
+# 1.  Auto-import from overlay DB on startup
+# 2.  /seat_sync   — register with SEAT after /eve_link
+# 3.  Full ESI pull every 6 h per character
+#     • Corp membership, corp history, character info (public)
+#     • Skills + skill queue, wallet, assets, contacts, standings,
+#       clones, implants, industry jobs  (authenticated)
+#     • Killmails via zkillboard public API (no auth)
+# 4.  Automated spy-detection scoring on every ESI pull
+# 5.  Corp sync loop every 1 h
+#     • Corp check fails → ARC Security auto-removed
+#     • ARC Subsidized + rank roles → flagged for manual review only
+# 6.  Skill snapshot every 24 h (SP progression history)
+# 7.  Forum watch-list — one thread per flagged member
+# 8.  Migration from ign_registry.json on first run
 #
-# 2.  Full ESI data pull  (every 6 h per character)
-#     • Corp membership, corp history, character info
-#     • Skills + skill queue  (progression tracking)
-#     • Wallet balance + journal
-#     • Assets
-#     • Contacts + standings
-#     • Clone / implants
-#     • Recent killmails  (via zkillboard public API)
+# RAILWAY ENV VARS  (no new vars needed beyond existing overlay setup)
+# --------------------------------------------------------------------
+#   EVE_CLIENT_ID      — already set for overlay
+#   EVE_CLIENT_SECRET  — already set for overlay
+#   EVE_CORP_ID        — integer ARC corp ID
+#   MISSION_DB_PATH    — path to overlay SQLite DB (default: /data/missions.db)
 #
-# 3.  Automated spy-detection scoring on every pull
-#     Flags: corp hopping, alt in hostile corp, young character, injected SP,
-#            high spy skills, large ISK transfers, hostile contacts,
-#            killed ARC members, widespread assets
-#
-# 4.  Corp sync loop  (every 1 h)
-#     • Members who leave ARC corp → ARC Security removed; ARC Subsidized kept
-#     • Rank roles (Lieutenant, Commander, etc.) → flagged for manual review
-#     • Any flag or corp failure → forum watch-list thread created / updated
-#
-# 5.  Skill snapshot loop  (every 24 h)
-#     • Stores daily SP total per character for progression graphs
-#
-# 6.  Migration from ign_registry.json
-#     • Imports existing character names / IDs on first run
-#     • Members must re-auth via /seat_auth to obtain fresh tokens
-#
-# REQUIREMENTS
-# ------------
-# overlay_api.py  must expose  self.app  on OverlayApiCog  (one-line change,
-#   already applied — see overlay_api.py line ~833).
-#
-# Railway env vars (add these):
-#   SEAT_CALLBACK_URL  — full public URL of the callback, e.g.
-#                        https://your-app.up.railway.app/seat/auth/callback
-#   EVE_CORP_ID        — integer corp ID for ARC Security (already set if
-#                        ign_registration uses it)
-#   EVE_CLIENT_ID      — same EVE developer app as overlay  (already set)
-#   EVE_CLIENT_SECRET  — same EVE developer app as overlay  (already set)
-#
-# BACKWARD COMPATIBILITY
-# ----------------------
-# • Does not touch ign_registry.json  (read-only migration source)
-# • Does not modify any other cog
-# • Safe to add/remove without affecting other features
+# COMMANDS
+# --------
+#   /seat_sync          — register after /eve_link
+#   /seat_status        — view your profile
+#   /seat_whois         — [admin] full intel profile for a member
+#   /seat_skills        — [admin] skill progression
+#   /seat_scan          — [admin] force spy scan
+#   /seat_verify_all    — [admin] force corp sync for all members
+#   /seat_hostile_corp  — [admin] add/remove hostile corp
+#   /seat_unlink        — remove a character from your profile
 
 import asyncio
 import base64
 import io
 import json
 import os
-import secrets
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlencode
 
 import aiohttp
 import discord
@@ -86,37 +82,22 @@ IGN_DATA_FILE = PERSIST_ROOT / "ign_registry.json"   # read-only migration sourc
 # ============================================================
 EVE_CLIENT_ID     = os.getenv("EVE_CLIENT_ID",     "")
 EVE_CLIENT_SECRET = os.getenv("EVE_CLIENT_SECRET", "")
-SEAT_CALLBACK_URL = os.getenv("SEAT_CALLBACK_URL", "")
 ARC_CORP_ID_ENV   = int(os.getenv("EVE_CORP_ID",   "0") or "0") or None
+
+# Path to the overlay's SQLite database — tokens are read from here.
+# Must match MISSION_DB_PATH in overlay_api.py (default: /data/missions.db).
+OVERLAY_DB_PATH = os.getenv("MISSION_DB_PATH", "/data/missions.db")
 
 # ============================================================
 # ESI / SSO ENDPOINTS
 # ============================================================
 ESI_BASE      = "https://esi.evetech.net/latest"
-SSO_AUTH_URL  = "https://login.eveonline.com/v2/oauth/authorize"
 SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
-SSO_VERIFY_URL = "https://esi.evetech.net/verify/"
 ZKILL_BASE    = "https://zkillboard.com/api"
 
-# ============================================================
-# ESI SCOPES  (comprehensive — separate from overlay scopes)
-# ============================================================
-SEAT_SCOPES = " ".join([
-    "esi-skills.read_skills.v1",
-    "esi-skills.read_skillqueue.v1",
-    "esi-wallet.read_character_wallet.v1",
-    "esi-assets.read_assets.v1",
-    "esi-characters.read_contacts.v1",
-    "esi-characters.read_standings.v1",
-    "esi-location.read_location.v1",
-    "esi-location.read_ship_type.v1",
-    "esi-clones.read_clones.v1",
-    "esi-clones.read_implants.v1",
-    "esi-killmails.read_killmails.v1",
-    "esi-industry.read_character_jobs.v1",
-    "esi-characters.read_fatigue.v1",
-    "esi-characters.read_corporation_roles.v1",
-])
+# NOTE: ESI scopes are defined in overlay_api.py (EVE_SCOPES).
+# Members authorise once via /eve_link — arc_seat reads tokens from
+# the same overlay SQLite database (OVERLAY_DB_PATH).
 
 # ============================================================
 # DISCORD CONFIG
@@ -149,9 +130,6 @@ TOKEN_REFRESH_INTERVAL  = 900    # 15 min
 CORP_SYNC_INTERVAL      = 3600   # 1 h
 ESI_PULL_INTERVAL       = 21600  # 6 h
 SKILL_SNAPSHOT_INTERVAL = 86400  # 24 h
-
-# OAuth state TTL
-OAUTH_STATE_TTL = 600  # 10 min
 
 # ============================================================
 # ESI SKILL IDs  (spy-relevant)
@@ -225,12 +203,9 @@ def _default_character(
         "security_status": 0.0,
         "birthday":        None,
         "total_sp":        0,
-        "access_token":    None,
-        "refresh_token":   None,
-        "token_expires":   0,
         "in_arc_corp":     False,
         "last_esi_pull":   None,
-        "has_tokens":      False,
+        "has_tokens":      False,   # True when overlay DB has a valid token for this user
         "cache": {
             "skills":         None,
             "skill_queue":    None,
@@ -298,6 +273,81 @@ async def save_seat_data(data: Dict[str, Any]) -> None:
 
 
 # ============================================================
+# OVERLAY DATABASE HELPERS
+# ============================================================
+# arc_seat reads EVE SSO tokens from the same SQLite database
+# that overlay_api.py manages. This avoids duplicate auth flows —
+# members authenticate once via /eve_link and both cogs share
+# the same tokens.
+
+import sqlite3 as _sqlite3
+
+
+def _overlay_db_connect() -> _sqlite3.Connection:
+    conn = _sqlite3.connect(OVERLAY_DB_PATH)
+    conn.row_factory = _sqlite3.Row
+    return conn
+
+
+def _overlay_get_token(discord_user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Read the EVE token row for a Discord user from the overlay DB.
+    Returns a plain dict or None if no row exists.
+    """
+    try:
+        with _overlay_db_connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS eve_tokens(
+                    discord_user_id INTEGER PRIMARY KEY,
+                    character_id    INTEGER NOT NULL,
+                    character_name  TEXT    NOT NULL,
+                    access_token    TEXT    NOT NULL,
+                    refresh_token   TEXT    NOT NULL,
+                    expires_at      REAL    NOT NULL
+                )
+            """)
+            row = conn.execute(
+                "SELECT * FROM eve_tokens WHERE discord_user_id=?",
+                (discord_user_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return dict(row)
+    except Exception as e:
+        print(f"[ARC-SEAT] Overlay DB read error: {e}")
+        return None
+
+
+def _overlay_save_token(
+    discord_user_id: int,
+    character_id:    int,
+    character_name:  str,
+    access_token:    str,
+    refresh_token:   str,
+    expires_in:      int,
+) -> None:
+    """Write a refreshed token back to the overlay DB."""
+    try:
+        with _overlay_db_connect() as conn:
+            conn.execute("""
+                INSERT INTO eve_tokens
+                    (discord_user_id, character_id, character_name,
+                     access_token, refresh_token, expires_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(discord_user_id) DO UPDATE SET
+                    access_token=excluded.access_token,
+                    refresh_token=excluded.refresh_token,
+                    expires_at=excluded.expires_at
+            """, (
+                discord_user_id, character_id, character_name,
+                access_token, refresh_token,
+                time.time() + expires_in,
+            ))
+    except Exception as e:
+        print(f"[ARC-SEAT] Overlay DB write error: {e}")
+
+
+# ============================================================
 # ESI CLIENT
 # ============================================================
 
@@ -330,44 +380,18 @@ class ESIClient:
         ).decode()
         return f"Basic {creds}"
 
-    async def exchange_code(self, code: str) -> Optional[Dict[str, Any]]:
-        """Exchange auth code → {access_token, refresh_token, expires_in}."""
-        sess = await self._sess()
-        try:
-            async with sess.post(
-                SSO_TOKEN_URL,
-                headers={
-                    "Authorization": self._basic_auth_header(),
-                    "Content-Type":  "application/x-www-form-urlencoded",
-                },
-                data={
-                    "grant_type":   "authorization_code",
-                    "code":         code,
-                    "redirect_uri": SEAT_CALLBACK_URL,
-                },
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as r:
-                return await r.json() if r.status == 200 else None
-        except Exception as e:
-            print(f"[ARC-SEAT] Code exchange error: {e}")
-            return None
-
-    async def verify_token(self, access_token: str) -> Optional[Dict[str, Any]]:
-        """Verify access token → {CharacterID, CharacterName, …}."""
-        sess = await self._sess()
-        try:
-            async with sess.get(
-                SSO_VERIFY_URL,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                return await r.json() if r.status == 200 else None
-        except Exception as e:
-            print(f"[ARC-SEAT] Token verify error: {e}")
-            return None
-
-    async def refresh_token(self, refresh_tok: str) -> Optional[Dict[str, Any]]:
-        """Refresh access token → new token dict or None."""
+    async def refresh_token(
+        self,
+        discord_user_id: int,
+        character_id:    int,
+        character_name:  str,
+        refresh_tok:     str,
+    ) -> Optional[str]:
+        """
+        Refresh the EVE access token.
+        Writes the new token back to the overlay DB so both cogs stay in sync.
+        Returns the new access_token or None on failure.
+        """
         sess = await self._sess()
         try:
             async with sess.post(
@@ -382,7 +406,24 @@ class ESIClient:
                 },
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as r:
-                return await r.json() if r.status == 200 else None
+                if r.status != 200:
+                    return None
+                new_tokens = await r.json()
+
+            access  = new_tokens.get("access_token")
+            refresh = new_tokens.get("refresh_token", refresh_tok)
+            expires = int(new_tokens.get("expires_in", 1200))
+
+            if not access:
+                return None
+
+            # Write back to overlay DB so /eve_link and arc_seat stay in sync
+            _overlay_save_token(
+                discord_user_id, character_id, character_name,
+                access, refresh, expires,
+            )
+            return access
+
         except Exception as e:
             print(f"[ARC-SEAT] Token refresh error: {e}")
             return None
@@ -944,9 +985,6 @@ class ArcSeatCog(commands.Cog, name="ArcSeat"):
         self._esi           = ESIClient()
         self._spy_engine:   Optional[SpyDetectionEngine] = None
 
-        # In-memory OAuth state store (keyed by state token)
-        self._oauth_states: Dict[str, Dict[str, Any]] = {}
-
         # Start background tasks
         if not self._token_refresh_loop.is_running():
             self._token_refresh_loop.start()
@@ -992,174 +1030,108 @@ class ArcSeatCog(commands.Cog, name="ArcSeat"):
                 data["members"] = migrated
                 await save_seat_data(data)
 
-        # Register the OAuth callback on the overlay FastAPI app
-        self._register_callback_route()
+        # Sync characters from overlay DB for any registered member
+        # who doesn't yet have a character record (e.g. freshly migrated)
+        await self._sync_characters_from_overlay(data)
 
-        # Ensure watch-list channel exists in each guild
+        # Ensure watch-list channel is reachable
         for guild in self.bot.guilds:
             await self._ensure_watchlist_channel(guild, data)
 
         await save_seat_data(data)
         print(
-            f"[ARC-SEAT] Ready. {len(data.get('members', {}))} member(s) tracked."
+            f"[ARC-SEAT] Ready. {len(data.get('members', {}))} member(s) tracked. "
+            "Tokens shared with overlay_api via overlay DB."
         )
 
-    def _register_callback_route(self) -> None:
+    async def _sync_characters_from_overlay(
+        self, data: Dict[str, Any]
+    ) -> None:
         """
-        Add /seat/auth/callback to the existing overlay FastAPI app.
-        Requires overlay_api.py to expose self.app on OverlayApiCog (already done).
+        For every member in arc_seat.json, check the overlay DB.
+        If the overlay has a token for that Discord user and arc_seat
+        doesn't have a character record yet, create one automatically.
+        This means a member who ran /eve_link is picked up by arc_seat
+        without any extra steps.
         """
+        members  = data.setdefault("members", {})
+        changed  = False
+
+        # Also scan overlay DB for any Discord user not yet in members
         try:
-            overlay_cog = (
-                self.bot.get_cog("OverlayAPI")
-                or self.bot.get_cog("OverlayApiCog")
-            )
-            app = getattr(overlay_cog, "app", None)
-            if app is None:
-                print(
-                    "[ARC-SEAT] ⚠️  Could not find overlay FastAPI app. "
-                    "OAuth callback not registered. "
-                    "Ensure overlay_api.py exposes self.app on OverlayApiCog."
+            with _overlay_db_connect() as conn:
+                rows = conn.execute("SELECT * FROM eve_tokens").fetchall()
+        except Exception:
+            rows = []
+
+        for row in rows:
+            row      = dict(row)
+            disc_id  = row["discord_user_id"]
+            key      = str(disc_id)
+
+            if key not in members:
+                members[key] = _default_member(disc_id)
+
+            member = members[key]
+            chars  = member.setdefault("characters", [])
+
+            # Check if this character is already registered
+            if not any(c["character_id"] == row["character_id"] for c in chars):
+                char = _default_character(
+                    character_id=   row["character_id"],
+                    character_name= row["character_name"],
+                    is_main=        True,
                 )
-                return
+                char["has_tokens"] = True
+                chars.append(char)
+                member["verified"]      = True
+                member["registered_at"] = member.get("registered_at") or _now_iso()
+                changed = True
+                print(
+                    f"[ARC-SEAT] Auto-imported character '{row['character_name']}' "
+                    f"(Discord {disc_id}) from overlay DB."
+                )
 
-            # Register route on the FastAPI app instance
-            app.add_api_route(
-                "/seat/auth/callback",
-                self._oauth_callback_handler,
-                methods=["GET"],
-            )
-            print("[ARC-SEAT] OAuth callback route registered: /seat/auth/callback")
-
-        except Exception as e:
-            print(f"[ARC-SEAT] Could not register callback route: {e}")
-
-    # ── OAuth callback handler (called by FastAPI) ────────────────────────────
-
-    async def _oauth_callback_handler(self, code: str, state: str):
-        """
-        FastAPI GET /seat/auth/callback
-        Called when EVE SSO redirects back after member authorisation.
-        """
-        from fastapi.responses import HTMLResponse
-
-        def _html(title: str, body: str, colour: str = "#2ECC71") -> HTMLResponse:
-            return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><title>ARC SEAT</title>
-<style>body{{background:#0a1a2f;color:#ccd6f6;font-family:Consolas;
-  display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
-.box{{text-align:center;border:1px solid #1e3148;padding:40px;border-radius:8px}}
-h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
-<body><div class="box"><h1>{title}</h1><p>{body}</p>
-<p>You can close this window and return to Discord.</p>
-</div></body></html>""")
-
-        # Validate state
-        state_entry = self._oauth_states.pop(state, None)
-        if state_entry is None or time.time() > state_entry["expires"]:
-            return _html("❌ Auth Failed", "Invalid or expired state token.", "#E74C3C")
-
-        discord_id = state_entry["discord_id"]
-        is_alt     = state_entry.get("is_alt", False)
-
-        # Exchange code for tokens
-        tokens = await self._esi.exchange_code(code)
-        if not tokens or "access_token" not in tokens:
-            return _html("❌ Auth Failed", "Token exchange with EVE SSO failed.", "#E74C3C")
-
-        # Verify and extract character info
-        char_info = await self._esi.verify_token(tokens["access_token"])
-        if not char_info:
-            return _html("❌ Auth Failed", "Could not verify EVE character.", "#E74C3C")
-
-        char_id   = int(char_info["CharacterID"])
-        char_name = str(char_info["CharacterName"])
-
-        # Save to data store
-        data    = await load_seat_data()
-        members = data.setdefault("members", {})
-        key     = str(discord_id)
-
-        if key not in members:
-            members[key] = _default_member(discord_id)
-
-        member   = members[key]
-        chars    = member.setdefault("characters", [])
-        is_first = not chars and not is_alt
-
-        # Check if character already registered
-        existing = next((c for c in chars if c["character_id"] == char_id), None)
-        if existing:
-            # Update tokens
-            existing["access_token"]  = tokens["access_token"]
-            existing["refresh_token"] = tokens["refresh_token"]
-            existing["token_expires"] = int(time.time()) + int(tokens.get("expires_in", 1200))
-            existing["has_tokens"]    = True
-        else:
-            char = _default_character(char_id, char_name, is_main=is_first)
-            char["access_token"]  = tokens["access_token"]
-            char["refresh_token"] = tokens["refresh_token"]
-            char["token_expires"] = int(time.time()) + int(tokens.get("expires_in", 1200))
-            char["has_tokens"]    = True
-            chars.append(char)
-
-        member["verified"]       = True
-        member["registered_at"]  = member.get("registered_at") or _now_iso()
-        data["members"][key]     = member
-        await save_seat_data(data)
-
-        print(
-            f"[ARC-SEAT] Auth complete: Discord {discord_id} → "
-            f"{'alt' if is_alt else 'main'} {char_name} ({char_id})"
-        )
-
-        # Schedule an immediate ESI pull for this character
-        asyncio.create_task(self._pull_character_esi(discord_id, char_id))
-
-        return _html(
-            "✅ Character Linked",
-            f"<strong>{char_name}</strong> has been linked to your Discord account.",
-        )
+        if changed:
+            data["members"] = members
+            await save_seat_data(data)
 
     # ── Token management ─────────────────────────────────────────────────────
 
     async def _ensure_valid_token(
         self,
-        data:      Dict[str, Any],
         discord_id: int,
         char_id:    int,
     ) -> Optional[str]:
         """
-        Returns a valid access token for the given character, refreshing if needed.
-        Saves updated token data to `data` (caller must save to disk).
+        Returns a valid ESI access token for the given Discord user.
+
+        Tokens live in the overlay's SQLite DB (managed by overlay_api.py).
+        The overlay only stores ONE token per Discord user (the main character).
+        Alts without a stored token will only receive public ESI data.
+
+        Flow:
+          1. Read row from overlay DB.
+          2. If the token is still valid → return it.
+          3. If expired → refresh via EVE SSO and write back to overlay DB.
+          4. If no row found → return None (user has not yet run /eve_link).
         """
-        key    = str(discord_id)
-        member = data.get("members", {}).get(key)
-        if not member:
+        row = _overlay_get_token(discord_id)
+        if row is None:
             return None
 
-        char = next(
-            (c for c in member.get("characters", []) if c["character_id"] == char_id),
-            None,
+        # Token still valid
+        if row["expires_at"] > time.time() + 60:
+            return row["access_token"]
+
+        # Expired — refresh
+        new_access = await self._esi.refresh_token(
+            discord_user_id= discord_id,
+            character_id=    row["character_id"],
+            character_name=  row["character_name"],
+            refresh_tok=     row["refresh_token"],
         )
-        if not char or not char.get("refresh_token"):
-            return None
-
-        # Valid if not expiring within 60 s
-        if char.get("token_expires", 0) > time.time() + 60:
-            return char.get("access_token")
-
-        # Refresh
-        new_tokens = await self._esi.refresh_token(char["refresh_token"])
-        if not new_tokens or "access_token" not in new_tokens:
-            char["has_tokens"] = False
-            return None
-
-        char["access_token"]  = new_tokens["access_token"]
-        char["refresh_token"] = new_tokens.get("refresh_token", char["refresh_token"])
-        char["token_expires"] = int(time.time()) + int(new_tokens.get("expires_in", 1200))
-        char["has_tokens"]    = True
-        return char["access_token"]
+        return new_access
 
     # ── ESI data pull ─────────────────────────────────────────────────────────
 
@@ -1182,7 +1154,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         if not char:
             return
 
-        token = await self._ensure_valid_token(data, discord_id, char_id)
+        token = await self._ensure_valid_token(discord_id, char_id)
         cache = char.setdefault("cache", {})
 
         # ── Public (no token needed) ──────────────────────────────────────────
@@ -1289,6 +1261,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             cache["industry_jobs"] = jobs
 
         char["last_esi_pull"] = _now_iso()
+        char["has_tokens"]    = (_overlay_get_token(discord_id) is not None)
         data["members"][key]  = member
         await save_seat_data(data)
         print(f"[ARC-SEAT] ESI pull complete: {char.get('character_name')} ({char_id})")
@@ -1354,8 +1327,8 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         any_in_corp  = False
 
         for char in characters:
-            token = await self._ensure_valid_token(data, discord_id, char["character_id"])
-            pub   = await self._esi.get(f"/characters/{char['character_id']}/")
+            # Corp membership is a public ESI endpoint — no token needed
+            pub = await self._esi.get(f"/characters/{char['character_id']}/")
             if pub:
                 char["corporation_id"] = pub.get("corporation_id")
                 char["in_arc_corp"]    = (char["corporation_id"] == arc_corp_id)
@@ -1615,30 +1588,28 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
 
     @tasks.loop(seconds=TOKEN_REFRESH_INTERVAL)
     async def _token_refresh_loop(self) -> None:
-        """Refresh all tokens expiring in the next 5 minutes."""
-        data    = await load_seat_data()
-        changed = False
-        soon    = time.time() + 300
+        """
+        Refresh any overlay DB tokens that are expiring within 5 minutes.
+        This keeps the shared token store current for both overlay_api and arc_seat.
+        """
+        try:
+            with _overlay_db_connect() as conn:
+                rows = conn.execute("SELECT * FROM eve_tokens").fetchall()
+        except Exception:
+            return
 
-        for key, member in data.get("members", {}).items():
-            for char in member.get("characters", []):
-                if not char.get("refresh_token"):
-                    continue
-                if char.get("token_expires", 0) > soon:
-                    continue
-                new_tokens = await self._esi.refresh_token(char["refresh_token"])
-                if new_tokens and "access_token" in new_tokens:
-                    char["access_token"]  = new_tokens["access_token"]
-                    char["refresh_token"] = new_tokens.get("refresh_token", char["refresh_token"])
-                    char["token_expires"] = int(time.time()) + int(new_tokens.get("expires_in", 1200))
-                    char["has_tokens"]    = True
-                    changed               = True
-                else:
-                    char["has_tokens"] = False
-                    changed            = True
-
-        if changed:
-            await save_seat_data(data)
+        soon = time.time() + 300
+        for row in rows:
+            row = dict(row)
+            if row.get("expires_at", 0) > soon:
+                continue
+            await self._esi.refresh_token(
+                discord_user_id= row["discord_user_id"],
+                character_id=    row["character_id"],
+                character_name=  row["character_name"],
+                refresh_tok=     row["refresh_token"],
+            )
+            await asyncio.sleep(1)
 
     @_token_refresh_loop.before_loop
     async def _before_token_refresh(self) -> None:
@@ -1720,99 +1691,65 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
     # ── Slash commands ────────────────────────────────────────────────────────
 
     @app_commands.command(
-        name="seat_auth",
-        description="Link your main EVE character to the ARC intelligence system.",
+        name="seat_sync",
+        description="Sync your EVE character with ARC-SEAT intelligence tracking.",
     )
-    async def seat_auth(self, interaction: discord.Interaction) -> None:
+    async def seat_sync(self, interaction: discord.Interaction) -> None:
+        """
+        Tells the member to use /eve_link if they haven't already, then
+        immediately syncs their character from the overlay DB into arc_seat.
+        """
         await interaction.response.defer(ephemeral=True)
 
-        if not EVE_CLIENT_ID or not SEAT_CALLBACK_URL:
+        # Check if the overlay already has a token for this user
+        row = _overlay_get_token(interaction.user.id)
+
+        if row is None:
             await interaction.followup.send(
-                "❌ ARC-SEAT is not configured. "
-                "Ask an admin to set `EVE_CLIENT_ID`, `EVE_CLIENT_SECRET`, "
-                "and `SEAT_CALLBACK_URL` in Railway.",
+                "You don't have an EVE character linked yet.\n\n"
+                "Use **`/eve_link`** to authorise your EVE character first, "
+                "then run `/seat_sync` again to register it with ARC-SEAT.",
                 ephemeral=True,
             )
             return
 
-        state = secrets.token_hex(16)
-        self._oauth_states[state] = {
-            "discord_id": interaction.user.id,
-            "is_alt":     False,
-            "expires":    time.time() + OAUTH_STATE_TTL,
-        }
+        # Import character into arc_seat if not already there
+        data    = await load_seat_data()
+        key     = str(interaction.user.id)
+        members = data.setdefault("members", {})
 
-        params = {
-            "response_type": "code",
-            "client_id":     EVE_CLIENT_ID,
-            "redirect_uri":  SEAT_CALLBACK_URL,
-            "scope":         SEAT_SCOPES,
-            "state":         state,
-        }
-        url = f"{SSO_AUTH_URL}?{urlencode(params)}"
+        if key not in members:
+            members[key] = _default_member(interaction.user.id)
 
-        embed = discord.Embed(
-            title=       "🔗 Link your EVE character",
-            description= (
-                "Click the button below to authorise ARC-SEAT access to your EVE character.\n\n"
-                "This grants ARC security officers access to:\n"
-                "• Corp membership & history\n"
-                "• Skills & skill queue\n"
-                "• Wallet activity\n"
-                "• Assets, contacts & standings\n"
-                "• Clones & implants\n\n"
-                "⏱ This link expires in **10 minutes**."
-            ),
-            color= discord.Color.blurple(),
+        member = members[key]
+        chars  = member.setdefault("characters", [])
+
+        already_registered = any(
+            c["character_id"] == row["character_id"] for c in chars
+        )
+        if not already_registered:
+            char = _default_character(
+                character_id=   row["character_id"],
+                character_name= row["character_name"],
+                is_main=        True,
+            )
+            char["has_tokens"]    = True
+            chars.append(char)
+            member["verified"]      = True
+            member["registered_at"] = _now_iso()
+            data["members"][key]    = member
+            await save_seat_data(data)
+
+        await interaction.followup.send(
+            f"✅ **{row['character_name']}** is now registered with ARC-SEAT.\n"
+            "An ESI pull will run in the background — "
+            "use `/seat_status` to check your profile.",
+            ephemeral=True,
         )
 
-        view = discord.ui.View()
-        view.add_item(discord.ui.Button(
-            label= "Authorise on EVE Online",
-            url=   url,
-            style= discord.ButtonStyle.link,
-            emoji= "🚀",
-        ))
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-    @app_commands.command(
-        name="seat_add_alt",
-        description="Register an additional EVE character (alt) to your profile.",
-    )
-    async def seat_add_alt(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-
-        if not EVE_CLIENT_ID or not SEAT_CALLBACK_URL:
-            await interaction.followup.send(
-                "❌ ARC-SEAT is not configured.", ephemeral=True
-            )
-            return
-
-        state = secrets.token_hex(16)
-        self._oauth_states[state] = {
-            "discord_id": interaction.user.id,
-            "is_alt":     True,
-            "expires":    time.time() + OAUTH_STATE_TTL,
-        }
-
-        params = {
-            "response_type": "code",
-            "client_id":     EVE_CLIENT_ID,
-            "redirect_uri":  SEAT_CALLBACK_URL,
-            "scope":         SEAT_SCOPES,
-            "state":         state,
-        }
-        url = f"{SSO_AUTH_URL}?{urlencode(params)}"
-
-        view = discord.ui.View()
-        view.add_item(discord.ui.Button(
-            label="Authorise Alt", url=url, style=discord.ButtonStyle.link, emoji="👤"
-        ))
-        await interaction.followup.send(
-            "Click below to add an alt character. "
-            "Link expires in **10 minutes**.",
-            view=view,
-            ephemeral=True,
+        # Trigger an immediate ESI pull
+        asyncio.create_task(
+            self._pull_character_esi(interaction.user.id, row["character_id"])
         )
 
     @app_commands.command(
@@ -1827,18 +1764,28 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
 
         if not member or not member.get("characters"):
             await interaction.followup.send(
-                "You have no characters registered. Use `/seat_auth` to link your main.",
+                "You have no characters registered with ARC-SEAT.\n\n"
+                "**Step 1:** Run `/eve_link` to authorise your EVE character.\n"
+                "**Step 2:** Run `/seat_sync` to register it with ARC-SEAT.",
                 ephemeral=True,
             )
             return
+
+        # Check token status from overlay DB
+        overlay_row = _overlay_get_token(interaction.user.id)
+        token_status = (
+            "✅ Active (via `/eve_link`)" if overlay_row else
+            "⚠️ No token — run `/eve_link` then `/seat_sync`"
+        )
 
         embed = discord.Embed(
             title= "🛡️ Your ARC-SEAT Profile",
             color= discord.Color.blurple(),
         )
+        embed.add_field(name="Token", value=token_status, inline=False)
+
         for char in member.get("characters", []):
             corp    = char.get("corporation_name") or str(char.get("corporation_id", "?"))
-            tokens  = "✅ Active" if char.get("has_tokens") else "⚠️ Needs re-auth"
             in_corp = "✅ In ARC" if char.get("in_arc_corp") else "❌ Not in ARC"
             last    = (char.get("last_esi_pull") or "Never")[:19]
             embed.add_field(
@@ -1847,7 +1794,6 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                     f"Corp: **{corp}**\n"
                     f"Status: {in_corp}\n"
                     f"SP: {char.get('total_sp', 0):,}\n"
-                    f"Token: {tokens}\n"
                     f"Last pull: {last} UTC"
                 ),
                 inline=True,
