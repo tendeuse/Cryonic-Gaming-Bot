@@ -1169,30 +1169,48 @@ class ArcSeatCog(commands.Cog, name="ArcSeat"):
 
     def _register_callback_route(self) -> None:
         """
-        Register /seat/auth/callback on the overlay FastAPI app.
-        Used exclusively by /seat_add_char — the main character still uses /eve_link.
+        Schedules the callback route registration as a background task.
+        This avoids on_ready race conditions between cogs — the task
+        retries until the overlay FastAPI app is available.
         """
-        try:
+        asyncio.create_task(self._register_callback_route_with_retry())
+
+    async def _register_callback_route_with_retry(self) -> None:
+        """
+        Retry registering /seat/auth/callback on the overlay FastAPI app
+        for up to 60 seconds (30 attempts × 2 s). This handles the case
+        where overlay_api's on_ready fires after arc_seat's on_ready.
+        """
+        for attempt in range(30):
             overlay_cog = (
                 self.bot.get_cog("OverlayAPI")
                 or self.bot.get_cog("OverlayApiCog")
             )
             app = getattr(overlay_cog, "app", None)
-            if app is None:
-                print(
-                    "[ARC-SEAT] ⚠️  Overlay FastAPI app not found. "
-                    "/seat_add_char OAuth callback not registered. "
-                    "Ensure overlay_api.py is loaded and exposes self.app."
-                )
-                return
-            app.add_api_route(
-                "/seat/auth/callback",
-                self._oauth_callback_handler,
-                methods=["GET"],
-            )
-            print("[ARC-SEAT] /seat/auth/callback registered on overlay FastAPI app.")
-        except Exception as e:
-            print(f"[ARC-SEAT] Could not register callback route: {e}")
+
+            if app is not None:
+                try:
+                    app.add_api_route(
+                        "/seat/auth/callback",
+                        self._oauth_callback_handler,
+                        methods=["GET"],
+                    )
+                    print(
+                        f"[ARC-SEAT] /seat/auth/callback registered "
+                        f"(attempt {attempt + 1})."
+                    )
+                    return
+                except Exception as e:
+                    print(f"[ARC-SEAT] Callback route registration error: {e}")
+                    return
+
+            await asyncio.sleep(2)
+
+        print(
+            "[ARC-SEAT] ⚠️  Could not register /seat/auth/callback after 60 s. "
+            "Ensure overlay_api.py is loaded and exposes self.app. "
+            "/seat_add_char will not work until the bot restarts."
+        )
 
     async def _oauth_callback_handler(self, code: str, state: str):
         """
