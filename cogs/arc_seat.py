@@ -1279,8 +1279,6 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             print(f"[ARC-SEAT] JWT decode failed: {e}")
             return _html("❌ Auth Failed", "Could not read character info from token.", "#E74C3C")
 
-        char_id   = int(char_info["CharacterID"])
-        char_name = str(char_info["CharacterName"])
         expires   = int(tokens.get("expires_in", 1200))
 
         # ── 1. Save token to arc_seat.db  (sync — safe from any event loop) ──
