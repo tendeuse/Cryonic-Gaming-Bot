@@ -104,7 +104,6 @@ ARC_CORP_ID_ENV   = int(os.getenv("EVE_CORP_ID",   "0") or "0") or None
 ESI_BASE       = "https://esi.evetech.net/latest"
 SSO_AUTH_URL   = "https://login.eveonline.com/v2/oauth/authorize"
 SSO_TOKEN_URL  = "https://login.eveonline.com/v2/oauth/token"
-SSO_VERIFY_URL = "https://esi.evetech.net/verify/"
 ZKILL_BASE     = "https://zkillboard.com/api"
 
 # ============================================================
@@ -484,20 +483,6 @@ class ESIClient:
                 return await r.json() if r.status == 200 else None
         except Exception as e:
             print(f"[ARC-SEAT] Code exchange error: {e}")
-            return None
-
-    async def verify_token(self, access_token: str) -> Optional[Dict[str, Any]]:
-        """Verify access token → {CharacterID, CharacterName, …}."""
-        sess = await self._sess()
-        try:
-            async with sess.get(
-                SSO_VERIFY_URL,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                return await r.json() if r.status == 200 else None
-        except Exception as e:
-            print(f"[ARC-SEAT] Token verify error: {e}")
             return None
 
     async def refresh_token(
@@ -1245,16 +1230,13 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
 
         discord_id = state_entry["discord_id"]
 
-        # ── Token exchange and verification ───────────────────────────────────
-        # Use a fresh aiohttp session scoped to THIS event loop (FastAPI's).
-        # Never use self._esi here — its session belongs to the discord.py loop.
+        # ── Token exchange ────────────────────────────────────────────────────
+        # Fresh session scoped to this (FastAPI) event loop.
         creds = base64.b64encode(
             f"{EVE_CLIENT_ID}:{EVE_CLIENT_SECRET}".encode()
         ).decode()
 
         async with aiohttp.ClientSession() as sess:
-
-            # Exchange code → tokens
             async with sess.post(
                 SSO_TOKEN_URL,
                 headers={
@@ -1274,20 +1256,28 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                     return _html("❌ Auth Failed", "Token exchange with EVE SSO failed.", "#E74C3C")
                 tokens = await r.json()
 
-            if "access_token" not in tokens:
-                return _html("❌ Auth Failed", "Token exchange with EVE SSO failed.", "#E74C3C")
+        if "access_token" not in tokens:
+            return _html("❌ Auth Failed", "Token exchange with EVE SSO failed.", "#E74C3C")
 
-            # Verify token → character info
-            async with sess.get(
-                SSO_VERIFY_URL,
-                headers={"Authorization": f"Bearer {tokens['access_token']}"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status != 200:
-                    text = await r.text()
-                    print(f"[ARC-SEAT] Token verify failed {r.status}: {text[:200]}")
-                    return _html("❌ Auth Failed", "Could not verify EVE character.", "#E74C3C")
-                char_info = await r.json()
+        # ── Extract character info from JWT payload ────────────────────────────
+        # EVE SSO v2 issues JWT access tokens. The character ID and name are
+        # encoded directly in the payload — no verify HTTP call needed.
+        # payload['sub'] = "CHARACTER:EVE:<character_id>"
+        # payload['name'] = "Character Name"
+        try:
+            parts   = tokens["access_token"].split(".")
+            padding = "=" * (4 - len(parts[1]) % 4)
+            payload = json.loads(
+                base64.urlsafe_b64decode(parts[1] + padding).decode("utf-8")
+            )
+            sub       = payload.get("sub", "")      # "CHARACTER:EVE:12345678"
+            char_id   = int(sub.split(":")[-1])
+            char_name = str(payload.get("name", ""))
+            if not char_id or not char_name:
+                raise ValueError(f"Missing sub/name in JWT payload: {payload}")
+        except Exception as e:
+            print(f"[ARC-SEAT] JWT decode failed: {e}")
+            return _html("❌ Auth Failed", "Could not read character info from token.", "#E74C3C")
 
         char_id   = int(char_info["CharacterID"])
         char_name = str(char_info["CharacterName"])
