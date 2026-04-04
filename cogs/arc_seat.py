@@ -1216,7 +1216,14 @@ class ArcSeatCog(commands.Cog, name="ArcSeat"):
         """
         FastAPI GET /seat/auth/callback
         Called by EVE SSO after a member authorises via /seat_add_char.
-        Stores the token in seat_tokens (NOT in overlay eve_tokens).
+
+        IMPORTANT: This runs inside FastAPI's event loop (background thread),
+        NOT the discord.py main loop. Therefore:
+          • _seat_save_token()  — sync SQLite write, safe from any loop ✅
+          • _atomic_write()     — sync file write, bypasses asyncio lock ✅
+          • ESI pull            — scheduled on bot loop via run_coroutine_threadsafe ✅
+        Never call load_seat_data() / save_seat_data() here — they use an
+        asyncio.Lock() that belongs to the discord.py loop and will deadlock.
         """
         from fastapi.responses import HTMLResponse
 
@@ -1252,14 +1259,21 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         char_name = str(char_info["CharacterName"])
         expires   = int(tokens.get("expires_in", 1200))
 
-        # Store in seat_tokens (composite PK — supports unlimited characters)
+        # ── 1. Save token to arc_seat.db  (sync — safe from any event loop) ──
         _seat_save_token(
             discord_id, char_id, char_name,
             tokens["access_token"], tokens["refresh_token"], expires,
         )
 
-        # Import into arc_seat.json if not already present
-        data    = await load_seat_data()
+        # ── 2. Update arc_seat.json  (sync atomic write — no asyncio lock) ───
+        try:
+            raw  = DATA_FILE.read_text(encoding="utf-8").strip() if DATA_FILE.exists() else ""
+            data = json.loads(raw) if raw else _default_data()
+            if not isinstance(data, dict):
+                data = _default_data()
+        except Exception:
+            data = _default_data()
+
         key     = str(discord_id)
         members = data.setdefault("members", {})
 
@@ -1273,22 +1287,32 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             char = _default_character(
                 character_id=   char_id,
                 character_name= char_name,
-                is_main=        not chars,   # first char is main
+                is_main=        not chars,
             )
-            char["has_tokens"]    = True
+            char["has_tokens"]      = True
             chars.append(char)
             member["verified"]      = True
             member["registered_at"] = member.get("registered_at") or _now_iso()
             data["members"][key]    = member
-            await save_seat_data(data)
+
+        try:
+            _atomic_write(data)
+        except Exception as e:
+            print(f"[ARC-SEAT] Callback JSON write error: {e}")
 
         print(
-            f"[ARC-SEAT] /seat_add_char: Discord {discord_id} → "
-            f"{char_name} ({char_id}) stored in seat_tokens."
+            f"[ARC-SEAT] Auth complete: Discord {discord_id} → "
+            f"{char_name} ({char_id}) saved to arc_seat.db + arc_seat.json."
         )
 
-        # Trigger immediate ESI pull
-        asyncio.create_task(self._pull_character_esi(discord_id, char_id))
+        # ── 3. Schedule ESI pull on the discord.py main loop ─────────────────
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._pull_character_esi(discord_id, char_id),
+                self.bot.loop,
+            )
+        except Exception as e:
+            print(f"[ARC-SEAT] Could not schedule ESI pull: {e}")
 
         return _html(
             "✅ Character Added",
