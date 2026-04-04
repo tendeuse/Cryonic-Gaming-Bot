@@ -1245,15 +1245,49 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
 
         discord_id = state_entry["discord_id"]
 
-        # Exchange code for tokens
-        tokens = await self._esi.exchange_code(code)
-        if not tokens or "access_token" not in tokens:
-            return _html("❌ Auth Failed", "Token exchange with EVE SSO failed.", "#E74C3C")
+        # ── Token exchange and verification ───────────────────────────────────
+        # Use a fresh aiohttp session scoped to THIS event loop (FastAPI's).
+        # Never use self._esi here — its session belongs to the discord.py loop.
+        creds = base64.b64encode(
+            f"{EVE_CLIENT_ID}:{EVE_CLIENT_SECRET}".encode()
+        ).decode()
 
-        # Verify character identity
-        char_info = await self._esi.verify_token(tokens["access_token"])
-        if not char_info:
-            return _html("❌ Auth Failed", "Could not verify EVE character.", "#E74C3C")
+        async with aiohttp.ClientSession() as sess:
+
+            # Exchange code → tokens
+            async with sess.post(
+                SSO_TOKEN_URL,
+                headers={
+                    "Authorization": f"Basic {creds}",
+                    "Content-Type":  "application/x-www-form-urlencoded",
+                },
+                data={
+                    "grant_type":   "authorization_code",
+                    "code":         code,
+                    "redirect_uri": SEAT_CALLBACK_URL,
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status != 200:
+                    text = await r.text()
+                    print(f"[ARC-SEAT] Token exchange failed {r.status}: {text[:200]}")
+                    return _html("❌ Auth Failed", "Token exchange with EVE SSO failed.", "#E74C3C")
+                tokens = await r.json()
+
+            if "access_token" not in tokens:
+                return _html("❌ Auth Failed", "Token exchange with EVE SSO failed.", "#E74C3C")
+
+            # Verify token → character info
+            async with sess.get(
+                SSO_VERIFY_URL,
+                headers={"Authorization": f"Bearer {tokens['access_token']}"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    text = await r.text()
+                    print(f"[ARC-SEAT] Token verify failed {r.status}: {text[:200]}")
+                    return _html("❌ Auth Failed", "Could not verify EVE character.", "#E74C3C")
+                char_info = await r.json()
 
         char_id   = int(char_info["CharacterID"])
         char_name = str(char_info["CharacterName"])
