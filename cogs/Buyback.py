@@ -109,6 +109,16 @@ ESI_MAX_ATTEMPTS       = int(os.getenv("BUYBACK_ESI_MAX_ATTEMPTS", "5"))
 ESI_BACKOFF_CAP_SECONDS = int(os.getenv("BUYBACK_ESI_BACKOFF_CAP", "10"))
 
 # =========================
+# EMBED SIZE CONSTANTS
+# =========================
+# Discord hard limits:
+#   Total embed size:  6000 chars
+#   Field value:       1024 chars
+# We use 5800 as our working ceiling to leave a safe buffer.
+EMBED_CHAR_LIMIT = 5800
+FIELD_VALUE_LIMIT = 1024
+
+# =========================
 # ORE -> COMPRESSED (name-based)
 # =========================
 ORE_TO_COMPRESSED_NAME: Dict[str, str] = {
@@ -433,6 +443,9 @@ class PaidButton(discord.ui.DynamicItem[discord.ui.Button], template=r"buyback:p
 
         mark_paid(self.contract_id, interaction.user.id, str(interaction.user))
 
+        # The Paid button is always on embed 1 (the first message for this contract).
+        # Embed 1 always contains the "Status" field, so we can safely update it here
+        # regardless of whether the contract spanned multiple embeds.
         msg = interaction.message
         if not msg or not msg.embeds:
             await interaction.response.send_message("✅ Marked as PAID. (Could not edit message embed.)", ephemeral=True)
@@ -493,6 +506,49 @@ class BuybackPaidView(discord.ui.View):
         self.add_item(btn)
 
 # =========================
+# HELPERS: embed size tracking
+# =========================
+
+def _embed_len(embed: discord.Embed) -> int:
+    """Return the current total character count of an embed."""
+    total = 0
+    if embed.title:
+        total += len(embed.title)
+    if embed.description:
+        total += len(embed.description)
+    for f in embed.fields:
+        total += len(f.name or "") + len(f.value or "")
+    if embed.footer and embed.footer.text:
+        total += len(embed.footer.text)
+    if embed.author and embed.author.name:
+        total += len(embed.author.name)
+    return total
+
+
+def _pack_rows_into_chunks(item_rows: List[str]) -> List[str]:
+    """
+    Pack individual item row strings into field-value-sized chunks.
+    Each chunk is guaranteed to be ≤ FIELD_VALUE_LIMIT chars.
+    A single oversized row is hard-truncated as a last resort.
+    """
+    chunks: List[str] = []
+    buf = ""
+    for row in item_rows:
+        # Hard-truncate a single row that is itself too large (shouldn't happen in practice)
+        if len(row) > FIELD_VALUE_LIMIT:
+            row = row[: FIELD_VALUE_LIMIT - 4] + "…\n"
+        if len(buf) + len(row) > FIELD_VALUE_LIMIT:
+            if buf:
+                chunks.append(buf)
+            buf = row
+        else:
+            buf += row
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+# =========================
 # COG
 # =========================
 class BuybackContracts(commands.Cog):
@@ -517,23 +573,17 @@ class BuybackContracts(commands.Cog):
                 return ch
         return None
 
-    # -------------------------
-    # CHANGED: now checks against the full BUYBACK_LOCATIONS dict
-    # -------------------------
     def _contract_matches(self, row: dict) -> bool:
         try:
             return (
                 row.get("status") == BUYBACK_STATUS
                 and row.get("type") == BUYBACK_TYPE
                 and int(row.get("assignee_id", 0)) == BUYBACK_ASSIGNEE_ID
-                and int(row.get("start_location_id", 0)) in BUYBACK_LOCATIONS  # <-- multi-location
+                and int(row.get("start_location_id", 0)) in BUYBACK_LOCATIONS
             )
         except Exception:
             return False
 
-    # -------------------------
-    # NEW: resolve location label from a contract row
-    # -------------------------
     def _location_label(self, row: dict) -> str:
         try:
             loc_id = int(row.get("start_location_id", 0))
@@ -635,7 +685,22 @@ class BuybackContracts(commands.Cog):
             conn.close()
 
     # -------------------------
-    # CHANGED: new drop_location_label parameter + embed field
+    # CHANGED: multi-embed posting to bypass the 6000-char limit
+    #
+    # Strategy:
+    #   • Embed 1  — contract header (title, issuer, pricing), drop-off location,
+    #                status, contract meta, as many item chunks as fit, and the
+    #                Paid button.  The Paid button ALWAYS lives here so its
+    #                callback (which edits msg.embeds[0]) always finds the
+    #                "Status" field without needing to hunt across messages.
+    #
+    #   • Embeds 2…N — plain continuation embeds (no button) with the remaining
+    #                  item chunks.
+    #
+    #   • Total Payout — appended to whichever embed is last (1 or a continuation).
+    #
+    #   Embed size is tracked via _embed_len() so the logic self-adapts to any
+    #   contract size without needing a hard item cap.
     # -------------------------
     async def _post_appraisal(
         self,
@@ -645,7 +710,7 @@ class BuybackContracts(commands.Cog):
         issuer_id: int,
         issuer_name: str,
         discord_user_id: Optional[int],
-        drop_location_label: str = "Unknown Location",   # <-- NEW
+        drop_location_label: str = "Unknown Location",
         contract_status: Optional[str] = None,
         contract_type: Optional[str] = None,
     ) -> None:
@@ -653,12 +718,12 @@ class BuybackContracts(commands.Cog):
         total = payload["total"]
         mult  = payload["multiplier"]
 
-        mention    = f"<@{discord_user_id}>" if discord_user_id else None
+        mention     = f"<@{discord_user_id}>" if discord_user_id else None
         issuer_line = f"**{issuer_name}** (`{issuer_id}`)" + (f" — {mention}" if mention else "")
 
         paid = get_paid_status(cid)
         if paid:
-            status_value      = (
+            status_value = (
                 f"**PAID** ✅\n"
                 f"By: <@{paid['paid_by_discord_id']}> (`{paid['paid_by_tag']}`)\n"
                 f"At: `{_utc_iso(paid['paid_at'])}`"
@@ -668,58 +733,89 @@ class BuybackContracts(commands.Cog):
             status_value         = "**UNPAID** ❌"
             paid_button_disabled = False
 
-        embed = discord.Embed(
-            title=f"✅ Buyback Appraisal — Contract {cid}",
-            description=(
-                f"**Issuer:** {issuer_line}\n"
-                f"Pricing = **{int(mult*100)}%** of **Jita 4-4 BUY** orders (location `{JITA_LOCATION_ID}`)."
-            ),
-            color=0x2ecc71,
+        total_payout_value = f"**{total:,.2f} ISK**"
+
+        # ── Step 1: build all item row strings ────────────────────────────
+        item_rows: List[str] = []
+        for ln in payload["lines"]:
+            item_rows.append(
+                f"• **{ln['name']}** × {ln['qty']}\n"
+                f"  Jita Buy: {ln['jita_buy']:.2f} ISK | Payout/unit: {ln['payout_unit']:.2f} ISK\n"
+                f"  Line: **{ln['line_total']:.2f} ISK**\n"
+            )
+
+        # ── Step 2: pack rows into field-value-sized chunks ────────────────
+        all_chunks = _pack_rows_into_chunks(item_rows)
+
+        # ── Step 3: build embed 1 with as many chunks as fit ──────────────
+        title_str = f"✅ Buyback Appraisal — Contract {cid}"
+        desc_str  = (
+            f"**Issuer:** {issuer_line}\n"
+            f"Pricing = **{int(mult*100)}%** of **Jita 4-4 BUY** orders (location `{JITA_LOCATION_ID}`)."
         )
 
-        # NEW: drop-off location field, shown right after the header
-        embed.add_field(
-            name="Drop-off Location",
-            value=f"📍 {drop_location_label}",
-            inline=False,
-        )
+        embed1 = discord.Embed(title=title_str, description=desc_str, color=0x2ecc71)
+        embed1.add_field(name="Drop-off Location", value=f"📍 {drop_location_label}", inline=False)
+        embed1.add_field(name="Status", value=status_value, inline=False)
 
-        # Paid status
-        embed.add_field(name="Status", value=status_value, inline=False)
-
-        # Contract meta
-        meta_bits = []
+        meta_bits: List[str] = []
         if contract_status:
             meta_bits.append(f"status=`{contract_status}`")
         if contract_type:
             meta_bits.append(f"type=`{contract_type}`")
         if meta_bits:
-            embed.add_field(name="Contract Meta", value=" | ".join(meta_bits), inline=False)
+            embed1.add_field(name="Contract Meta", value=" | ".join(meta_bits), inline=False)
 
-        # Items (chunked for embed limits)
-        chunks: List[str] = []
-        buf = ""
-        for ln in payload["lines"]:
-            row = (
-                f"• **{ln['name']}** × {ln['qty']}\n"
-                f"  Jita Buy: {ln['jita_buy']:.2f} ISK | Payout/unit: {ln['payout_unit']:.2f} ISK\n"
-                f"  Line: **{ln['line_total']:.2f} ISK**\n"
-            )
-            if len(buf) + len(row) > 900:
-                chunks.append(buf)
-                buf = row
+        # Reserve space for "Total Payout" field in case everything fits in embed 1
+        total_field_chars = len("Total Payout") + len(total_payout_value)
+
+        overflow_chunks: List[str] = []
+        for idx, chunk in enumerate(all_chunks):
+            field_name  = "Items" if idx == 0 else "Items (cont.)"
+            field_chars = len(field_name) + len(chunk)
+            # Check whether this chunk + the Total Payout field still fits
+            if _embed_len(embed1) + field_chars + total_field_chars <= EMBED_CHAR_LIMIT:
+                embed1.add_field(name=field_name, value=chunk, inline=False)
             else:
-                buf += row
-        if buf:
-            chunks.append(buf)
+                # This chunk and everything after it overflows — collect for continuation
+                overflow_chunks = all_chunks[idx:]
+                break
 
-        for idx, ch in enumerate(chunks[:10]):
-            embed.add_field(name="Items" if idx == 0 else "Items (cont.)", value=ch, inline=False)
+        # ── Step 4: if no overflow, close embed 1 with Total Payout ───────
+        if not overflow_chunks:
+            embed1.add_field(name="Total Payout", value=total_payout_value, inline=False)
 
-        embed.add_field(name="Total Payout", value=f"**{total:,.2f} ISK**", inline=False)
-
+        # Send embed 1 — always carries the Paid button
         view = BuybackPaidView(cid, disabled=paid_button_disabled)
-        await channel.send(embed=embed, view=view)
+        await channel.send(embed=embed1, view=view)
+
+        # ── Step 5: send continuation embeds for overflow chunks ──────────
+        if overflow_chunks:
+            cont_title = f"✅ Buyback Appraisal — Contract {cid} (cont.)"
+
+            current_embed = discord.Embed(title=cont_title, color=0x2ecc71)
+
+            for i, chunk in enumerate(overflow_chunks):
+                is_last_chunk = (i == len(overflow_chunks) - 1)
+                field_name    = "Items (cont.)"
+                field_chars   = len(field_name) + len(chunk)
+
+                # How many chars does Total Payout need on the last chunk's embed?
+                closing_chars = (total_field_chars if is_last_chunk else 0)
+
+                # If this chunk won't fit in the current continuation embed, flush it
+                if (
+                    current_embed.fields  # never flush an empty embed
+                    and _embed_len(current_embed) + field_chars + closing_chars > EMBED_CHAR_LIMIT
+                ):
+                    await channel.send(embed=current_embed)
+                    current_embed = discord.Embed(title=cont_title, color=0x2ecc71)
+
+                current_embed.add_field(name=field_name, value=chunk, inline=False)
+
+            # Total Payout goes on the very last continuation embed
+            current_embed.add_field(name="Total Payout", value=total_payout_value, inline=False)
+            await channel.send(embed=current_embed)
 
     # =========================
     # /buyback
@@ -767,7 +863,7 @@ class BuybackContracts(commands.Cog):
                         issuer_id = int(c.get("issuer_id", 0) or 0)
                         c_status  = str(c.get("status") or "")
                         c_type    = str(c.get("type") or "")
-                        loc_label = self._location_label(c)   # <-- NEW
+                        loc_label = self._location_label(c)
 
                         conn = db_connect()
                         try:
@@ -784,7 +880,7 @@ class BuybackContracts(commands.Cog):
                             issuer_id=issuer_id,
                             issuer_name=issuer_name,
                             discord_user_id=discord_user_id,
-                            drop_location_label=loc_label,     # <-- NEW
+                            drop_location_label=loc_label,
                             contract_status=c_status,
                             contract_type=c_type,
                         )
@@ -831,7 +927,7 @@ class BuybackContracts(commands.Cog):
                     issuer_id = int(row.get("issuer_id", 0) or 0) if row else 0
                     c_status  = str(row.get("status") or "unknown") if row else "unknown"
                     c_type    = str(row.get("type") or "unknown") if row else "unknown"
-                    loc_label = self._location_label(row) if row else "Unknown Location"   # <-- NEW
+                    loc_label = self._location_label(row) if row else "Unknown Location"
 
                     if row and c_type != "item_exchange":
                         await interaction.followup.send(
@@ -855,7 +951,7 @@ class BuybackContracts(commands.Cog):
                         issuer_id=issuer_id,
                         issuer_name=issuer_name,
                         discord_user_id=discord_user_id,
-                        drop_location_label=loc_label,          # <-- NEW
+                        drop_location_label=loc_label,
                         contract_status=c_status,
                         contract_type=c_type,
                     )
