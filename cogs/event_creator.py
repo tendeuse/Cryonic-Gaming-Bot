@@ -654,6 +654,7 @@ async def log_confirmed_participants(
     event_id:      str,
     qualified_ids: List[int],
     rsvp_ids:      List[int],
+    cum_times:     Optional[Dict[str, int]] = None,
 ) -> None:
     """
     Posts the final attendance summary to #arc-hierarchy-log.
@@ -663,18 +664,36 @@ async def log_confirmed_participants(
 
     Decline-button people are never included (excluded upstream by
     compute_participants).
+
+    cum_times: {str(user_id): total_seconds} — when supplied, each member's
+    cumulative VC time is appended to their entry (e.g. "— 23 min 14 s").
     """
     ch = await ensure_hierarchy_log_channel(guild)
     if not ch:
         return
 
     qualified_set = set(qualified_ids)
+    _cum = cum_times or {}
 
-    def _names(ids: List[int]) -> str:
+    def _fmt_time(uid: int) -> str:
+        """Return a compact 'X min Y s' string for a member's cumulative time."""
+        secs  = int(_cum.get(str(uid), _cum.get(uid, 0)))  # accept str or int key
+        mins  = secs // 60
+        rem_s = secs % 60
+        if mins == 0:
+            return f"{rem_s}s"
+        if rem_s == 0:
+            return f"{mins} min"
+        return f"{mins} min {rem_s}s"
+
+    def _names(ids: List[int], show_time: bool = False) -> str:
         lines = []
         for uid in ids:
-            m = guild.get_member(uid)
-            lines.append(f"- {m.display_name} ({m.mention})" if m else f"- <@{uid}>")
+            m        = guild.get_member(uid)
+            name_str = f"{m.display_name} ({m.mention})" if m else f"<@{uid}>"
+            if show_time and _cum:
+                name_str += f" — _{_fmt_time(uid)}_"
+            lines.append(f"- {name_str}")
         return "\n".join(lines) if lines else "_(none)_"
 
     # RSVP'd members who didn't qualify
@@ -691,13 +710,13 @@ async def log_confirmed_participants(
 
     embed.add_field(
         name=  f"✅ Qualified — {len(qualified_ids)} member(s)  (≥15 min)",
-        value= _names(qualified_ids),
+        value= _names(qualified_ids, show_time=True),
         inline=False,
     )
     if no_threshold:
         embed.add_field(
             name=  f"⏱ RSVP'd — did not reach threshold ({len(no_threshold)})",
-            value= _names(no_threshold),
+            value= _names(no_threshold, show_time=True),
             inline=False,
         )
 
@@ -2235,6 +2254,7 @@ class EventCreator(commands.Cog):
                 event_id=      event_id,
                 qualified_ids= qualified_ids,
                 rsvp_ids=      rsvp_ids,
+                cum_times=     {str(k): v for k, v in cum.items()},
             )
         except Exception as e:
             print(f"[event_creator] Log error for {event_id}: {e}")
@@ -2382,13 +2402,8 @@ class EventCreator(commands.Cog):
                 if uid not in qualified:
                     continue
 
-                # Show cumulative time for this member
-                secs     = event.get("vc_cumulative_times", {}).get(str(uid), 0)
-                mins     = int(secs) // 60
                 date_str = f"<t:{ts}:d>" if ts else "?"
-                lines.append(
-                    f"• **{title}** ({date_str}) — ✅ Qualified  _{mins} min_"
-                )
+                lines.append(f"• **{title}** ({date_str}) — ✅ Attended")
 
             if not lines:
                 await interaction.followup.send(
@@ -2399,7 +2414,7 @@ class EventCreator(commands.Cog):
 
             header = (
                 f"📋 Fleet attendance for **{member.display_name}** "
-                f"— {len(lines)} fleet(s) with ≥15 min\n\n"
+                f"— {len(lines)} fleet(s) attended\n\n"
             )
             body = "\n".join(lines)
 
@@ -2421,15 +2436,12 @@ class EventCreator(commands.Cog):
                     continue
 
                 part_lines: List[str] = []
-                cum_times = event.get("vc_cumulative_times", {})
 
                 for uid in qualified_ids:
                     m = guild.get_member(uid) if guild else None
                     if not m or not has_any_role(m, {SUBSIDIZED_PING_ROLE}):
                         continue
-                    secs = cum_times.get(str(uid), 0)
-                    mins = int(secs) // 60
-                    part_lines.append(f"  ✅ {m.display_name} — _{mins} min_")
+                    part_lines.append(f"  ✅ {m.display_name}")
 
                 if part_lines:
                     sections.append(
@@ -2447,7 +2459,7 @@ class EventCreator(commands.Cog):
 
             header = (
                 f"📋 **Fleet Attendance Log** — {SUBSIDIZED_PING_ROLE} members  "
-                f"(✅ = qualified, ≥15 min in event VC)\n\n"
+                f"(✅ = attended, ≥15 min in event VC)\n\n"
             )
             body = "\n\n".join(sections)
 
