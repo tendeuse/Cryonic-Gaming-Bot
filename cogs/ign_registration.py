@@ -30,7 +30,7 @@ ALLOWED_ROLES = {
     "ARC Security Administration Council",
     "ARC General",
     "ARC Commander",
-    "ARC Officer",
+    "ARC Lieutenant",
 }
 
 MAX_IGNS_PER_USER = 10
