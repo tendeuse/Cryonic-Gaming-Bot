@@ -257,10 +257,12 @@ def _build_attendance_embed(mtg: Dict[str, Any], guild: discord.Guild) -> discor
     if attendees:
         lines = []
         for uid_str, info in attendees.items():
-            m    = guild.get_member(int(uid_str))
-            name = m.mention if m else f"<@{uid_str}>"
-            secs = int(info.get("total_seconds", 0))
-            lines.append(f"• {name} — {_fmt_duration(secs)}")
+            m            = guild.get_member(int(uid_str))
+            stored_name  = info.get("name", f"User {uid_str}")
+            display_name = m.display_name if m else stored_name
+            mention      = m.mention if m else f"<@{uid_str}>"
+            secs         = int(info.get("total_seconds", 0))
+            lines.append(f"• {mention} ({display_name}) — {_fmt_duration(secs)}")
         value = "\n".join(lines)
         if len(value) > 1024:
             value = value[:1020] + "…"
