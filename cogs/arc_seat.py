@@ -154,6 +154,12 @@ ARC_SECURITY_ROLE     = "ARC Security"
 ARC_SUBSIDIZED_ROLE   = "ARC Subsidized"
 HIERARCHY_LOG_CH      = "arc-hierarchy-log"
 
+# Roles that may press role-removal prompt buttons
+PROMPT_AUTHORIZED_ROLES: Set[str] = {
+    "ARC Security Administration Council",
+    "ARC Security Corporation Leader",
+}
+
 # Rank roles flagged for manual review (NOT auto-removed)
 ARC_RANK_ROLES: Set[str] = {
     "ARC Petty Officer",
@@ -1104,6 +1110,206 @@ def migrate_from_ign_registry() -> Dict[str, Any]:
 
 
 # ============================================================
+# ROLE REMOVAL PROMPT VIEW
+# ============================================================
+
+class RoleRemovalView(discord.ui.View):
+    """
+    Sent inside a member's watchlist thread when a corp check fails.
+    Presents two buttons — Remove All Roles / Keep Roles.
+    Only PROMPT_AUTHORIZED_ROLES may interact.
+    Disables itself after any action or after 48 h timeout.
+    """
+
+    def __init__(
+        self,
+        cog:             "ArcSeatCog",
+        guild:           discord.Guild,
+        target_member:   discord.Member,
+        roles_to_remove: List[discord.Role],
+    ) -> None:
+        super().__init__(timeout=172800)   # 48 hours
+        self.cog             = cog
+        self.guild           = guild
+        self.target_member   = target_member
+        self.roles_to_remove = roles_to_remove
+        self.prompt_msg: Optional[discord.Message] = None   # set after send
+
+    # ── Auth check ────────────────────────────────────────────────────────────
+
+    def _is_authorized(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member):
+            return False
+        return any(r.name in PROMPT_AUTHORIZED_ROLES for r in interaction.user.roles)
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        self.stop()
+
+    # ── Remove All Roles ──────────────────────────────────────────────────────
+
+    @discord.ui.button(
+        label="Remove All Roles",
+        style=discord.ButtonStyle.danger,
+        emoji="🗑️",
+    )
+    async def btn_remove(
+        self,
+        interaction: discord.Interaction,
+        button:      discord.ui.Button,
+    ) -> None:
+        if not self._is_authorized(interaction):
+            await interaction.response.send_message(
+                "❌ Only the **Administration Council** or **Corporation Leader** "
+                "can take this action.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        self._disable_all()
+
+        removed: List[str] = []
+        failed:  List[str] = []
+
+        for role in self.roles_to_remove:
+            try:
+                if role in self.target_member.roles:
+                    await self.target_member.remove_roles(
+                        role,
+                        reason=(
+                            f"ARC-SEAT: corp check — manual removal "
+                            f"by {interaction.user} ({interaction.user.id})"
+                        ),
+                    )
+                    removed.append(role.name)
+            except discord.Forbidden:
+                failed.append(role.name)
+            except Exception as e:
+                print(f"[ARC-SEAT] Role removal error for {role.name}: {e}")
+                failed.append(role.name)
+
+        result_embed = discord.Embed(
+            title=     "✅ Roles Removed",
+            color=     discord.Color.green(),
+            timestamp= datetime.now(timezone.utc),
+        )
+        result_embed.add_field(
+            name="Member",    value=self.target_member.mention, inline=True
+        )
+        result_embed.add_field(
+            name="Actioned by", value=interaction.user.mention, inline=True
+        )
+        if removed:
+            result_embed.add_field(
+                name="🗑️ Roles removed",
+                value="\n".join(f"• {r}" for r in removed),
+                inline=False,
+            )
+        if failed:
+            result_embed.add_field(
+                name="⚠️ Could not remove (missing permissions)",
+                value="\n".join(f"• {r}" for r in failed),
+                inline=False,
+            )
+
+        if self.prompt_msg:
+            try:
+                await self.prompt_msg.edit(embed=result_embed, view=self)
+            except Exception as e:
+                print(f"[ARC-SEAT] Prompt message edit failed: {e}")
+
+        await self.cog._log_to_hierarchy(
+            self.guild,
+            self.target_member,
+            roles_removed=removed,
+            rank_roles_flagged=[],
+            actioned_by=interaction.user,
+        )
+
+    # ── Keep Roles ────────────────────────────────────────────────────────────
+
+    @discord.ui.button(
+        label="Keep Roles",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔒",
+    )
+    async def btn_keep(
+        self,
+        interaction: discord.Interaction,
+        button:      discord.ui.Button,
+    ) -> None:
+        if not self._is_authorized(interaction):
+            await interaction.response.send_message(
+                "❌ Only the **Administration Council** or **Corporation Leader** "
+                "can take this action.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        self._disable_all()
+
+        result_embed = discord.Embed(
+            title=     "🔒 No Action Taken — Roles Kept",
+            color=     discord.Color.greyple(),
+            timestamp= datetime.now(timezone.utc),
+        )
+        result_embed.add_field(
+            name="Member",     value=self.target_member.mention, inline=True
+        )
+        result_embed.add_field(
+            name="Decision by", value=interaction.user.mention,  inline=True
+        )
+        result_embed.add_field(
+            name="Roles retained",
+            value="\n".join(f"• {r.name}" for r in self.roles_to_remove) or "None",
+            inline=False,
+        )
+
+        if self.prompt_msg:
+            try:
+                await self.prompt_msg.edit(embed=result_embed, view=self)
+            except Exception as e:
+                print(f"[ARC-SEAT] Prompt message edit failed: {e}")
+
+        await self.cog._log_to_hierarchy(
+            self.guild,
+            self.target_member,
+            roles_removed=[],
+            rank_roles_flagged=[r.name for r in self.roles_to_remove],
+            actioned_by=interaction.user,
+            kept=True,
+        )
+
+    # ── Timeout ───────────────────────────────────────────────────────────────
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
+        if self.prompt_msg:
+            try:
+                timeout_embed = discord.Embed(
+                    title=       "⏰ Role Review Timed Out — No Action Taken",
+                    color=       discord.Color.orange(),
+                    description= (
+                        f"No decision was made for {self.target_member.mention} "
+                        "within 48 hours. Roles have been retained. "
+                        "Please review manually."
+                    ),
+                    timestamp=   datetime.now(timezone.utc),
+                )
+                timeout_embed.add_field(
+                    name="Roles still held",
+                    value="\n".join(f"• {r.name}" for r in self.roles_to_remove) or "None",
+                    inline=False,
+                )
+                await self.prompt_msg.edit(embed=timeout_embed, view=self)
+            except Exception as e:
+                print(f"[ARC-SEAT] Timeout embed update failed: {e}")
+
+
+# ============================================================
 # COG
 # ============================================================
 
@@ -1647,45 +1853,104 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             return
 
         if not any_in_corp:
-            # Auto-remove ARC Security only
-            roles_to_remove = [
+            # Collect ALL ARC roles held by this member for the prompt
+            all_arc_roles = [
                 r for r in discord_member.roles
-                if r.name == ARC_SECURITY_ROLE
-            ]
-            if roles_to_remove:
-                try:
-                    await discord_member.remove_roles(
-                        *roles_to_remove,
-                        reason="ARC-SEAT: corp check failed — no character in ARC corp",
-                    )
-                    print(
-                        f"[ARC-SEAT] Removed {[r.name for r in roles_to_remove]} "
-                        f"from {discord_member} — not in ARC corp."
-                    )
-                except discord.Forbidden:
-                    print(
-                        f"[ARC-SEAT] Missing permissions to remove roles from "
-                        f"{discord_member}."
-                    )
-
-            # Flag ARC Subsidized + rank roles for manual review (NOT auto-removed)
-            roles_for_review = [
-                r for r in discord_member.roles
-                if r.name == ARC_SUBSIDIZED_ROLE or r.name in ARC_RANK_ROLES
+                if r.name in {ARC_SECURITY_ROLE, ARC_SUBSIDIZED_ROLE} | ARC_RANK_ROLES
             ]
 
+            # Update the watchlist thread (corp fail notice, no auto-removal)
             await self._update_watchlist_thread(
                 guild, discord_member, member, data,
                 corp_fail=True,
-                rank_roles_held=roles_for_review,
+                rank_roles_held=all_arc_roles,
+            )
+
+            # Send the role-removal prompt with buttons into that same thread
+            await self._send_role_removal_prompt(
+                guild, discord_member, member, data, all_arc_roles
             )
 
             await self._log_to_hierarchy(
                 guild,
                 discord_member,
-                roles_removed=[r.name for r in roles_to_remove],
-                rank_roles_flagged=[r.name for r in roles_for_review],
+                roles_removed=[],
+                rank_roles_flagged=[r.name for r in all_arc_roles],
             )
+
+    # ── Role removal prompt ───────────────────────────────────────────────────
+
+    async def _send_role_removal_prompt(
+        self,
+        guild:           discord.Guild,
+        discord_member:  discord.Member,
+        member_rec:      Dict[str, Any],
+        data:            Dict[str, Any],
+        roles_to_remove: List[discord.Role],
+    ) -> None:
+        """
+        Post a role-removal decision embed with buttons into the member's
+        watchlist thread.  Only PROMPT_AUTHORIZED_ROLES can interact.
+        """
+        if not roles_to_remove:
+            return
+
+        # Find or use the existing watchlist thread
+        thread_id = member_rec.get("watch_list_thread_id")
+        thread: Optional[discord.Thread] = None
+
+        if thread_id:
+            try:
+                thread = guild.get_thread(thread_id)
+                if thread is None:
+                    thread = await guild.fetch_channel(thread_id)  # type: ignore[assignment]
+            except Exception:
+                thread = None
+
+        if not isinstance(thread, discord.Thread):
+            # No thread found — can't post prompt (watchlist channel will log it)
+            print(
+                f"[ARC-SEAT] Could not find watchlist thread for "
+                f"{discord_member} — role removal prompt not sent."
+            )
+            return
+
+        prompt_embed = discord.Embed(
+            title=       "⚠️ Corp Check Failed — Action Required",
+            description= (
+                f"{discord_member.mention} has no character in an approved ARC corporation.\n\n"
+                f"**Only** <roles with Administration Council or Corporation Leader> "
+                f"may act on this.\n\n"
+                f"Choose an action below:"
+            ),
+            color=       discord.Color.orange(),
+            timestamp=   datetime.now(timezone.utc),
+        )
+        prompt_embed.add_field(
+            name="Roles pending removal",
+            value="\n".join(f"• {r.name}" for r in roles_to_remove),
+            inline=False,
+        )
+        prompt_embed.set_footer(
+            text="This prompt expires in 48 hours. If no action is taken, roles are retained."
+        )
+
+        view = RoleRemovalView(
+            cog=             self,
+            guild=           guild,
+            target_member=   discord_member,
+            roles_to_remove= roles_to_remove,
+        )
+
+        try:
+            msg = await thread.send(embed=prompt_embed, view=view)
+            view.prompt_msg = msg
+            print(
+                f"[ARC-SEAT] Role removal prompt sent for "
+                f"{discord_member} in thread {thread.id}."
+            )
+        except Exception as e:
+            print(f"[ARC-SEAT] Could not send role removal prompt: {e}")
 
     # ── Watch-list management ─────────────────────────────────────────────────
 
@@ -1786,15 +2051,15 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             )
 
         if corp_fail:
-            removed_txt = "ARC Security"
             embed.add_field(
-                name=  "🚨 Corp Check Failed",
+                name=  "🚨 Corp Check Failed — Pending Review",
                 value= (
-                    f"**Auto-removed:** {removed_txt}\n"
+                    "No character is currently in an approved ARC corporation.\n"
                     + (
-                        f"**⚠️ Roles requiring manual review (NOT auto-removed):** "
+                        f"**Roles held (pending decision):** "
                         f"{', '.join(r.name for r in (rank_roles_held or []))}"
-                        if rank_roles_held else ""
+                        if rank_roles_held else
+                        "No ARC roles currently held."
                     )
                 ),
                 inline=False,
@@ -1859,25 +2124,55 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         discord_member:      discord.Member,
         roles_removed:       List[str],
         rank_roles_flagged:  List[str],
+        actioned_by:         Optional[discord.Member] = None,
+        kept:                bool = False,
     ) -> None:
         ch = discord.utils.get(guild.text_channels, name=HIERARCHY_LOG_CH)
         if not ch:
             return
 
+        if actioned_by:
+            # Log a button decision result
+            if kept:
+                title  = "🔒 ARC-SEAT: Roles Kept — No Action Taken"
+                colour = discord.Color.greyple()
+            else:
+                title  = "✅ ARC-SEAT: Roles Removed by Admin"
+                colour = discord.Color.green()
+        else:
+            # Log the initial corp check failure (prompt sent)
+            title  = "🚨 ARC-SEAT: Corp Check Failed — Awaiting Admin Decision"
+            colour = discord.Color.orange()
+
         embed = discord.Embed(
-            title=     "🚨 ARC-SEAT: Corp Check Failed",
-            color=     discord.Color.red(),
+            title=     title,
+            color=     colour,
             timestamp= datetime.now(timezone.utc),
         )
-        embed.add_field(name="Member",    value=discord_member.mention, inline=True)
-        embed.add_field(name="Action",    value="Corp check failed — not in ARC corp", inline=False)
+        embed.add_field(name="Member", value=discord_member.mention, inline=True)
+
+        if actioned_by:
+            embed.add_field(
+                name="Actioned by", value=actioned_by.mention, inline=True
+            )
+
+        if not actioned_by:
+            embed.add_field(
+                name="Status",
+                value="Role removal prompt sent to watchlist thread. Awaiting admin decision.",
+                inline=False,
+            )
+
         if roles_removed:
             embed.add_field(
-                name="✅ Auto-removed", value=", ".join(roles_removed), inline=False
+                name="🗑️ Roles removed",
+                value=", ".join(roles_removed),
+                inline=False,
             )
         if rank_roles_flagged:
+            label = "🔒 Roles retained" if kept else "⚠️ Roles pending decision"
             embed.add_field(
-                name="⚠️ Rank roles — MANUAL REVIEW REQUIRED",
+                name=label,
                 value=", ".join(rank_roles_flagged),
                 inline=False,
             )
@@ -2095,6 +2390,47 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         embed.set_footer(text="You can add as many characters as you have EVE accounts.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    async def _resolve_missing_corp_names(
+        self,
+        m_rec: Dict[str, Any],
+        data:  Dict[str, Any],
+        key:   str,
+    ) -> bool:
+        """
+        For any character that has a corporation_id but no corporation_name,
+        do a live ESI lookup and fill in the name.  Also resolves alliance_name
+        when missing.  Writes resolved names back to data[members][key] in-place
+        and returns True if anything was updated (caller should save_seat_data).
+        Safe to call when no ESI pull has happened yet — public endpoint, no token needed.
+        """
+        changed = False
+        cfg     = data.get("config", {})
+
+        for char in m_rec.get("characters", []):
+            corp_id = char.get("corporation_id")
+
+            # ── Corp name ────────────────────────────────────────────────────────
+            if corp_id and not char.get("corporation_name"):
+                corp_info = await self._esi.get(f"/corporations/{corp_id}/")
+                if corp_info:
+                    char["corporation_name"] = corp_info.get("name", str(corp_id))
+                    # Also backfill in_arc_corp now that we have the corp_id
+                    char["in_arc_corp"] = _is_approved_corp(corp_id, cfg)
+                    changed = True
+
+            # ── Alliance name ────────────────────────────────────────────────────
+            alliance_id = char.get("alliance_id")
+            if alliance_id and not char.get("alliance_name"):
+                all_info = await self._esi.get(f"/alliances/{alliance_id}/")
+                if all_info:
+                    char["alliance_name"] = all_info.get("name", str(alliance_id))
+                    changed = True
+
+        if changed:
+            data["members"][key] = m_rec
+
+        return changed
+
     @app_commands.command(
         name="seat_status",
         description="View your ARC-SEAT registration and character status.",
@@ -2113,21 +2449,29 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             )
             return
 
+        # Resolve any missing corp/alliance names on-demand before display
+        if await self._resolve_missing_corp_names(member, data, key):
+            await save_seat_data(data)
+
         embed = discord.Embed(
             title= "🛡️ Your ARC-SEAT Profile",
             color= discord.Color.blurple(),
         )
 
         for char in member.get("characters", []):
-            row     = _seat_get_token(interaction.user.id, char["character_id"])
-            corp    = char.get("corporation_name") or str(char.get("corporation_id", "?"))
-            in_corp = "✅ In ARC" if char.get("in_arc_corp") else "❌ Not in ARC"
-            token_s = "✅ Active" if row else "⚠️ Missing — run `/seat_add_char`"
-            last    = (char.get("last_esi_pull") or "Never")[:19]
+            row        = _seat_get_token(interaction.user.id, char["character_id"])
+            corp       = char.get("corporation_name") or str(char.get("corporation_id", "Unknown"))
+            alliance   = char.get("alliance_name")
+            in_corp    = "✅ In ARC" if char.get("in_arc_corp") else f"❌ {corp}"
+            token_s    = "✅ Active" if row else "⚠️ Missing — run `/seat_add_char`"
+            last       = (char.get("last_esi_pull") or "Never")[:19]
+            corp_line  = f"Corp: **{corp}**"
+            if alliance:
+                corp_line += f"\nAlliance: **{alliance}**"
             embed.add_field(
                 name=  f"{'🌟 Main' if char.get('is_main') else '👤 Alt'}: {char['character_name']}",
                 value= (
-                    f"Corp: **{corp}**\n"
+                    f"{corp_line}\n"
                     f"Status: {in_corp}\n"
                     f"SP: {char.get('total_sp', 0):,}\n"
                     f"Token: {token_s}\n"
@@ -2179,6 +2523,10 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             )
             return
 
+        # Resolve any missing corp/alliance names on-demand before display
+        if await self._resolve_missing_corp_names(m_rec, data, key):
+            await save_seat_data(data)
+
         risk_emoji = SpyDetectionEngine.risk_emoji(m_rec.get("risk_level", "UNKNOWN"))
 
         embed = discord.Embed(
@@ -2192,12 +2540,16 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         )
 
         for char in m_rec.get("characters", []):
-            corp  = char.get("corporation_name") or str(char.get("corporation_id", "?"))
-            in_c  = "✅" if char.get("in_arc_corp") else "❌"
+            corp      = char.get("corporation_name") or str(char.get("corporation_id", "Unknown"))
+            alliance  = char.get("alliance_name")
+            in_c      = "✅" if char.get("in_arc_corp") else "❌"
+            corp_line = f"Corp: **{corp}**  {in_c}"
+            if alliance:
+                corp_line += f"\nAlliance: **{alliance}**"
             embed.add_field(
                 name=  f"{'🌟' if char.get('is_main') else '👤'} {char['character_name']}",
                 value= (
-                    f"Corp: **{corp}**  {in_c}\n"
+                    f"{corp_line}\n"
                     f"SP: {char.get('total_sp', 0):,}\n"
                     f"Born: {(char.get('birthday') or '?')[:10]}\n"
                     f"Sec: {char.get('security_status', 0.0):.1f}"
