@@ -96,7 +96,24 @@ SEAT_DB_PATH  = str(PERSIST_ROOT / "arc_seat.db")
 EVE_CLIENT_ID     = os.getenv("EVE_CLIENT_ID",     "")
 EVE_CLIENT_SECRET = os.getenv("EVE_CLIENT_SECRET", "")
 SEAT_CALLBACK_URL = os.getenv("SEAT_CALLBACK_URL", "")
-ARC_CORP_ID_ENV   = int(os.getenv("EVE_CORP_ID",   "0") or "0") or None
+# EVE_CORP_IDS — comma-separated list of ALL approved ARC corporation IDs
+# e.g. "98743131,98791781"  (main corp first, subsidiaries after)
+# Falls back to legacy EVE_CORP_ID if EVE_CORP_IDS is not set.
+def _parse_corp_ids(raw: str) -> List[int]:
+    ids: List[int] = []
+    for part in raw.replace(" ", "").split(","):
+        try:
+            cid = int(part)
+            if cid > 0:
+                ids.append(cid)
+        except ValueError:
+            pass
+    return ids
+
+_raw_corp_ids = os.getenv("EVE_CORP_IDS", "") or os.getenv("EVE_CORP_ID", "")
+ARC_APPROVED_CORP_IDS: List[int] = _parse_corp_ids(_raw_corp_ids)
+# Keep a single primary ID for legacy/spy-engine usage (first in the list)
+ARC_CORP_ID_ENV: Optional[int] = ARC_APPROVED_CORP_IDS[0] if ARC_APPROVED_CORP_IDS else None
 
 # ============================================================
 # ESI / SSO ENDPOINTS
@@ -191,13 +208,26 @@ def _default_data() -> Dict[str, Any]:
     return {
         "members":        {},   # str(discord_id) → member record
         "config": {
-            "arc_corp_id":         ARC_CORP_ID_ENV,
-            "hostile_corps":       [],   # List[int]  corp IDs
-            "hostile_alliances":   [],   # List[int]  alliance IDs
+            "arc_corp_id":            ARC_CORP_ID_ENV,          # primary corp (spy engine)
+            "arc_approved_corp_ids":  ARC_APPROVED_CORP_IDS,    # all approved corps (✅ check)
+            "hostile_corps":          [],   # List[int]  corp IDs
+            "hostile_alliances":      [],   # List[int]  alliance IDs
         },
         "oauth_states":   {},   # state_token → {discord_id, is_alt, expires}
         "skill_snapshots": {},  # str(discord_id) → {str(char_id) → [snapshots]}
     }
+
+
+def _is_approved_corp(corp_id: Optional[int], cfg: Dict[str, Any]) -> bool:
+    """
+    Returns True if corp_id is in the list of ARC-approved corporation IDs.
+    Approved corps are loaded from EVE_CORP_IDS env var (comma-separated).
+    Returns False if corp_id is None or the approved list is empty.
+    """
+    if not corp_id:
+        return False
+    approved: List[int] = cfg.get("arc_approved_corp_ids") or []
+    return corp_id in approved
 
 
 def _default_member(discord_id: int) -> Dict[str, Any]:
@@ -1462,12 +1492,9 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         if corp_history is not None:
             cache["corp_history"] = corp_history
 
-        # Check in-ARC-corp
-        cfg          = data.get("config", {})
-        arc_corp_id  = cfg.get("arc_corp_id")
-        char["in_arc_corp"] = (
-            bool(arc_corp_id) and char.get("corporation_id") == arc_corp_id
-        )
+        # Check in-ARC-corp (main corp OR approved subsidiary)
+        cfg = data.get("config", {})
+        char["in_arc_corp"] = _is_approved_corp(char.get("corporation_id"), cfg)
 
         # zkillboard — public
         zkm = await self._esi.zkill_character(char_id, page=1)
@@ -1607,7 +1634,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             pub = await self._esi.get(f"/characters/{char['character_id']}/")
             if pub:
                 char["corporation_id"] = pub.get("corporation_id")
-                char["in_arc_corp"]    = (char["corporation_id"] == arc_corp_id)
+                char["in_arc_corp"]    = _is_approved_corp(char["corporation_id"], cfg)
                 if char["in_arc_corp"]:
                     any_in_corp = True
 
