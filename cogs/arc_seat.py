@@ -1355,9 +1355,21 @@ class ArcSeatCog(commands.Cog, name="ArcSeat"):
         await self._setup()
 
     async def _setup(self) -> None:
-        # Load data and rebuild spy engine
-        data             = await load_seat_data()
-        cfg              = data.get("config", {})
+        # Load data
+        data = await load_seat_data()
+        cfg  = data.setdefault("config", {})
+
+        # ALWAYS overwrite corp IDs from env vars on every startup.
+        # This ensures arc_approved_corp_ids is present even in existing
+        # arc_seat.json files that were created before this field existed.
+        cfg["arc_corp_id"]           = ARC_CORP_ID_ENV
+        cfg["arc_approved_corp_ids"] = ARC_APPROVED_CORP_IDS
+        data["config"]               = cfg
+
+        # Persist updated config immediately so background tasks read it correctly
+        await save_seat_data(data)
+
+        # Rebuild spy engine with refreshed config
         self._spy_engine = SpyDetectionEngine(
             hostile_corps=     cfg.get("hostile_corps",     []),
             hostile_alliances= cfg.get("hostile_alliances", []),
@@ -1839,10 +1851,17 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             # Corp membership is a public ESI endpoint — no token needed
             pub = await self._esi.get(f"/characters/{char['character_id']}/")
             if pub:
-                char["corporation_id"] = pub.get("corporation_id")
-                char["in_arc_corp"]    = _is_approved_corp(char["corporation_id"], cfg)
+                new_corp_id            = pub.get("corporation_id")
+                char["corporation_id"] = new_corp_id
+                char["in_arc_corp"]    = _is_approved_corp(new_corp_id, cfg)
                 if char["in_arc_corp"]:
                     any_in_corp = True
+
+                # Resolve corp name if missing or corp changed
+                if new_corp_id and not char.get("corporation_name"):
+                    corp_info = await self._esi.get(f"/corporations/{new_corp_id}/")
+                    if corp_info:
+                        char["corporation_name"] = corp_info.get("name", str(new_corp_id))
 
         member["last_corp_check"] = _now_iso()
         data["members"][key]      = member
