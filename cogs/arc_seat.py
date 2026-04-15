@@ -1782,7 +1782,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             cache["industry_jobs"] = jobs
 
         char["last_esi_pull"] = _now_iso()
-        char["has_tokens"]    = (_overlay_get_token(discord_id) is not None)
+        char["has_tokens"]    = (_seat_get_token(discord_id, char_id) is not None)
         data["members"][key]  = member
         await save_seat_data(data)
         print(f"[ARC-SEAT] ESI pull complete: {char.get('character_name')} ({char_id})")

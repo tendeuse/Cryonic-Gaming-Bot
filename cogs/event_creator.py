@@ -1225,7 +1225,7 @@ class EditButtonCountModal(discord.ui.Modal, title="Edit Buttons — How Many?")
     """Step 1 of 2 for editing buttons: choose the new count."""
 
     count = discord.ui.TextInput(
-        label="How many RSVP buttons?  (1 – 5, or 0 = link-only)",
+        label="Number of buttons (0 = link-only, 1–5)",
         placeholder="e.g. 3",
         min_length=1, max_length=1, required=True,
     )
@@ -2479,6 +2479,383 @@ class EventCreator(commands.Cog):
                 file=discord.File(buf, filename="fleet_attendance_log.txt"),
                 ephemeral=True,
             )
+
+
+    # ----------------------------------------------------------------
+    # /retro_event_ap
+    # ----------------------------------------------------------------
+
+    @app_commands.command(
+        name="retro_event_ap",
+        description="[Admin] Retroactively award AP for an event that closed without finalizing.",
+    )
+    @app_commands.describe(
+        event_title="Exact or partial event title to search for.",
+        creator="The Discord member who created the event.",
+    )
+    async def retro_event_ap(
+        self,
+        interaction: discord.Interaction,
+        event_title: str,
+        creator:     discord.Member,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        # CEO / Director only
+        if not (
+            isinstance(interaction.user, discord.Member)
+            and (
+                interaction.user.guild_permissions.administrator
+                or any(
+                    r.name in {
+                        "ARC Security Corporation Leader",
+                        "ARC Security Administration Council",
+                    }
+                    for r in interaction.user.roles
+                )
+            )
+        ):
+            await interaction.followup.send("❌ Not authorised.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("Must be used in a server.", ephemeral=True)
+            return
+
+        # ── 1. Find the event record ──────────────────────────────────────────
+        data = await load_events()
+        search_title = event_title.strip().lower()
+
+        candidates = [
+            (eid, e) for eid, e in data.items()
+            if isinstance(e, dict)
+            and search_title in str(e.get("title", "")).lower()
+            and int(e.get("creator", -1)) == creator.id
+        ]
+
+        if not candidates:
+            await interaction.followup.send(
+                f"❌ No event matching **\"{event_title}\"** found for "
+                f"{creator.mention}.\n\n"
+                "Check that the title matches and the creator is correct. "
+                "Use `/event_log` to browse past events.",
+                ephemeral=True,
+            )
+            return
+
+        if len(candidates) > 1:
+            lines = "\n".join(
+                f"• `{eid[:8]}…` — **{e.get('title')}** "
+                f"(<t:{e.get('timestamp', 0)}:d>)"
+                for eid, e in candidates[:10]
+            )
+            await interaction.followup.send(
+                f"⚠️ Multiple events matched. Please be more specific:\n{lines}",
+                ephemeral=True,
+            )
+            return
+
+        event_id, event = candidates[0]
+        event           = normalize_event(event)
+        true_title      = str(event.get("title", "Event"))
+
+        # ── 2. Check if AP was already awarded ───────────────────────────────
+        if event.get("retro_ap_awarded"):
+            await interaction.followup.send(
+                f"⚠️ Retroactive AP for **\"{true_title}\"** was already awarded. "
+                "Run again would double-award. Aborting.",
+                ephemeral=True,
+            )
+            return
+
+        # ── 3. Read saved VC times ────────────────────────────────────────────
+        cum_raw: Dict[str, Any] = event.get("vc_cumulative_times") or {}
+
+        if not cum_raw:
+            await interaction.followup.send(
+                f"❌ No VC attendance data found for **\"{true_title}\"**.\n\n"
+                "The `vc_cumulative_times` field is empty — the save loop may not "
+                "have run before the VC was deleted. AP cannot be awarded automatically.\n"
+                "Use `/give_ap` to award AP manually if needed.",
+                ephemeral=True,
+            )
+            return
+
+        # ── 4. Determine qualified members (≥15 min) ─────────────────────────
+        qualified: List[Tuple[discord.Member, int]] = []   # (member, seconds)
+        unresolved: List[int] = []
+
+        for uid_str, secs in cum_raw.items():
+            try:
+                uid = int(uid_str)
+            except ValueError:
+                continue
+            m = guild.get_member(uid)
+            if m is None:
+                unresolved.append(uid)
+                continue
+            if int(secs) >= EVENT_VC_MIN_SECONDS:
+                qualified.append((m, int(secs)))
+
+        # ── 5. Check if creator is AP-excluded ───────────────────────────────
+        creator_excluded = has_any_role(creator, PRESENCE_BONUS_EXCLUDED_ROLES)
+        ap_per_participant = 5
+        total_ap = len(qualified) * ap_per_participant if not creator_excluded else 0
+
+        # ── 6. Build preview embed ────────────────────────────────────────────
+        preview = discord.Embed(
+            title=       f"📋 Retro AP Preview — \"{true_title}\"",
+            description= (
+                "Review the attendees below and confirm to award AP.\n"
+                "**No AP has been awarded yet.**"
+            ),
+            color=       discord.Color.orange(),
+            timestamp=   datetime.now(timezone.utc),
+        )
+        preview.add_field(name="Creator",   value=creator.mention,  inline=True)
+        preview.add_field(name="Event",     value=true_title,        inline=True)
+        preview.add_field(
+            name="AP per participant",
+            value=f"{ap_per_participant} AP" if not creator_excluded else "0 (excluded role)",
+            inline=True,
+        )
+
+        if qualified:
+            qual_lines = "\n".join(
+                f"• {m.display_name} — "
+                f"{s // 60} min {s % 60} s"
+                for m, s in sorted(qualified, key=lambda x: -x[1])
+            )
+            preview.add_field(
+                name=  f"✅ Qualified ({len(qualified)}) — ≥15 min",
+                value= qual_lines[:1024],
+                inline=False,
+            )
+        else:
+            preview.add_field(
+                name="✅ Qualified",
+                value="Nobody met the 15-minute threshold.",
+                inline=False,
+            )
+
+        # Show below-threshold members for transparency
+        below = [
+            (int(uid_str), int(secs))
+            for uid_str, secs in cum_raw.items()
+            if int(secs) < EVENT_VC_MIN_SECONDS
+        ]
+        if below:
+            below_lines = "\n".join(
+                f"• <@{uid}> — {s // 60} min {s % 60} s"
+                for uid, s in sorted(below, key=lambda x: -x[1])[:10]
+            )
+            preview.add_field(
+                name=  f"❌ Below threshold ({len(below)}) — <15 min",
+                value= below_lines[:512],
+                inline=False,
+            )
+
+        if unresolved:
+            preview.add_field(
+                name=  f"⚠️ {len(unresolved)} member(s) no longer in server",
+                value= "Their VC time was recorded but they cannot receive AP.",
+                inline=False,
+            )
+
+        preview.add_field(
+            name=  "Total AP to be awarded",
+            value= f"**{total_ap} AP** to {creator.mention}",
+            inline=False,
+        )
+        preview.set_footer(text="Press Confirm to proceed, or Cancel to abort.")
+
+        view = RetroApConfirmView(
+            invoker=    interaction.user,
+            cog=        self,
+            event_id=   event_id,
+            event_title=true_title,
+            creator=    creator,
+            qualified=  [m for m, _ in qualified],
+        )
+
+        msg = await interaction.followup.send(
+            embed=preview, view=view, ephemeral=True
+        )
+        view.preview_msg = msg
+
+
+class RetroApConfirmView(discord.ui.View):
+    """
+    Two-button confirmation shown to the invoking admin before retro AP is awarded.
+    Only the admin who ran /retro_event_ap can press the buttons.
+    """
+
+    def __init__(
+        self,
+        invoker:     discord.Member,
+        cog:         "EventCreator",
+        event_id:    str,
+        event_title: str,
+        creator:     discord.Member,
+        qualified:   List[discord.Member],
+    ) -> None:
+        super().__init__(timeout=300)   # 5 minutes to confirm
+        self.invoker     = invoker
+        self.cog         = cog
+        self.event_id    = event_id
+        self.event_title = event_title
+        self.creator     = creator
+        self.qualified   = qualified
+        self.preview_msg: Optional[discord.Message] = None
+
+    def _auth(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.invoker.id
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        self.stop()
+
+    @discord.ui.button(label="✅ Confirm — Award AP", style=discord.ButtonStyle.success)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._auth(interaction):
+            await interaction.response.send_message(
+                "❌ Only the admin who ran this command can confirm.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        self._disable_all()
+
+        guild       = interaction.guild
+        ap_count    = 0
+        failed:     List[str] = []
+        excluded    = has_any_role(self.creator, PRESENCE_BONUS_EXCLUDED_ROLES)
+
+        if not excluded:
+            for part_m in self.qualified:
+                try:
+                    await award_creator_5ap(
+                        guild, self.creator, part_m, self.event_title
+                    )
+                    await register_or_extend_boost(
+                        creator_id=     self.creator.id,
+                        participant_id= part_m.id,
+                        event_id=       self.event_id,
+                    )
+                    ap_count += 1
+                except Exception as e:
+                    print(
+                        f"[event_creator] retro AP failed for "
+                        f"{part_m.id}: {e}"
+                    )
+                    failed.append(part_m.display_name)
+
+        # Mark event so it can't be re-awarded
+        data = await load_events()
+        if self.event_id in data and isinstance(data[self.event_id], dict):
+            data[self.event_id]["retro_ap_awarded"] = True
+            data[self.event_id]["active"]           = False
+            data[self.event_id]["closed"]           = True
+            await save_events(data)
+
+        # Log to #arc-hierarchy-log
+        log_ch = await ensure_hierarchy_log_channel(guild)
+        if log_ch:
+            log_embed = discord.Embed(
+                title=     f"🔁 Retroactive AP Awarded — \"{self.event_title}\"",
+                color=     discord.Color.green(),
+                timestamp= datetime.now(timezone.utc),
+            )
+            log_embed.add_field(name="Creator",    value=self.creator.mention, inline=True)
+            log_embed.add_field(name="Actioned by",value=interaction.user.mention, inline=True)
+            log_embed.add_field(
+                name="AP awarded",
+                value=f"**{ap_count * 5} AP** ({ap_count} participants × 5 AP)",
+                inline=False,
+            )
+            if self.qualified:
+                log_embed.add_field(
+                    name="Qualified participants",
+                    value="\n".join(f"• {m.display_name}" for m in self.qualified)[:1024],
+                    inline=False,
+                )
+            if excluded:
+                log_embed.add_field(
+                    name="Note",
+                    value="Creator holds an excluded role — no AP awarded.",
+                    inline=False,
+                )
+            if failed:
+                log_embed.add_field(
+                    name="⚠️ Award failed for",
+                    value=", ".join(failed),
+                    inline=False,
+                )
+            try:
+                await log_ch.send(embed=log_embed)
+            except Exception:
+                pass
+
+        # Update the preview message
+        result_embed = discord.Embed(
+            title=     f"✅ Retro AP Awarded — \"{self.event_title}\"",
+            color=     discord.Color.green(),
+            timestamp= datetime.now(timezone.utc),
+        )
+        result_embed.add_field(name="Creator",  value=self.creator.mention, inline=True)
+        result_embed.add_field(name="AP sent",  value=f"**{ap_count * 5} AP** to creator", inline=True)
+        result_embed.add_field(name="Participants", value=str(ap_count), inline=True)
+        if failed:
+            result_embed.add_field(
+                name="⚠️ Failed", value=", ".join(failed), inline=False
+            )
+
+        if self.preview_msg:
+            try:
+                await self.preview_msg.edit(embed=result_embed, view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._auth(interaction):
+            await interaction.response.send_message(
+                "❌ Only the admin who ran this command can cancel.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        self._disable_all()
+
+        cancel_embed = discord.Embed(
+            title=       "🚫 Retro AP Cancelled",
+            description= "No AP was awarded.",
+            color=       discord.Color.greyple(),
+        )
+        if self.preview_msg:
+            try:
+                await self.preview_msg.edit(embed=cancel_embed, view=self)
+            except Exception:
+                pass
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
+        if self.preview_msg:
+            try:
+                timeout_embed = discord.Embed(
+                    title=       "⏰ Retro AP Timed Out",
+                    description= "No confirmation received within 5 minutes. No AP was awarded.",
+                    color=       discord.Color.orange(),
+                )
+                await self.preview_msg.edit(embed=timeout_embed, view=self)
+            except Exception:
+                pass
 
 
 async def setup(bot: commands.Bot):
