@@ -15,7 +15,7 @@
 #   1  Director       → ARC Security Administration Council
 #   2  General        → ARC General
 #   3  Fleet Commander→ ARC Commander
-#   4  Officer        → ARC Lieutenant
+#   4  Lieutenant     → ARC Lieutenant
 #   5  Petty Officer  → ARC Petty Officer
 
 import os
@@ -63,7 +63,7 @@ RANK_DISPLAY: List[str] = [
     "Director",
     "General",
     "Fleet Commander",
-    "Officer",
+    "Lieutenant",
     "Petty Officer",
 ]
 
@@ -147,7 +147,7 @@ def parse_rank_input(text: str) -> Optional[int]:
     """
     Accept a rank as:
       - A digit 1–6  (1 = CEO, 6 = Petty Officer)
-      - Display name (case-insensitive): "General", "Officer", etc.
+      - Display name (case-insensitive): "General", "Lieutenant", etc.
       - Role name    (case-insensitive): "ARC General", etc.
     Returns 0-based index or None if invalid.
     """
@@ -339,7 +339,7 @@ class CreateDirectiveModal(discord.ui.Modal, title="Create New Directive"):
     )
     rank_input = discord.ui.TextInput(
         label="Minimum Rank Required",
-        placeholder="1=CEO  2=Director  3=General  4=Fleet Cmdr  5=Officer  6=Petty Officer",
+        placeholder="1=CEO  2=Director  3=General  4=Fleet Cmdr  5=Lieutenant  6=Petty Officer",
         required=True,
         max_length=30,
     )

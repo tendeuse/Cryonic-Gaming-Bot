@@ -32,7 +32,7 @@
 # --------
 # 1.  /seat_add_char  — EVE SSO auth, stores token in own DB
 # 2.  /seat_sync      — import characters already in own DB (e.g. after restart)
-# 3.  Full ESI pull every 6 h per character
+# 3.  Full ESI pull every 30 days per character (initial pull fires immediately on add)
 #     • Corp membership, corp history, character info  (public)
 #     • Skills + skill queue, wallet, assets, contacts, standings,
 #       clones, implants, industry jobs  (authenticated)
@@ -181,7 +181,7 @@ RISK_MEDIUM_THRESHOLD = 3
 # ============================================================
 TOKEN_REFRESH_INTERVAL  = 900    # 15 min
 CORP_SYNC_INTERVAL      = 3600   # 1 h
-ESI_PULL_INTERVAL       = 21600  # 6 h
+ESI_PULL_INTERVAL       = 2592000  # 30 days (initial pull fires immediately on char add)
 SKILL_SNAPSHOT_INTERVAL = 86400  # 24 h
 
 # ============================================================
@@ -2243,13 +2243,42 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         await self.bot.wait_until_ready()
         await asyncio.sleep(120)   # allow bot to settle before first run
 
+    # Minimum seconds between scheduled ESI pulls per character.
+    # Belt-and-suspenders alongside ESI_PULL_INTERVAL — guards against the loop
+    # firing early after a Railway restart before the 30-day window elapses.
+    _ESI_MIN_PULL_INTERVAL: int = 2592000  # 30 days
+
     @tasks.loop(seconds=ESI_PULL_INTERVAL)
     async def _esi_pull_loop(self) -> None:
-        """Full ESI pull for every registered character (every 6 h)."""
+        """Full ESI pull for every registered character (at most once per 30 days).
+
+        The initial pull fires immediately when a character is added via the SSO
+        callback (_pull_character_esi is called inline there). This loop only
+        handles subsequent monthly refreshes. Skipping characters whose
+        last_esi_pull is less than 30 days old keeps API usage flat regardless
+        of how many members the corp grows to.
+        """
         data = await load_seat_data()
+        now_ts = time.time()
 
         for key, member in list(data.get("members", {}).items()):
             for char in member.get("characters", []):
+                # ── Staleness guard — skip if pulled within the last 30 days ──
+                last_pull_iso = char.get("last_esi_pull")
+                if last_pull_iso:
+                    try:
+                        last_pull_dt = datetime.fromisoformat(last_pull_iso)
+                        if last_pull_dt.tzinfo is not None:
+                            last_pull_ts = last_pull_dt.timestamp()
+                        else:
+                            last_pull_ts = last_pull_dt.replace(
+                                tzinfo=timezone.utc
+                            ).timestamp()
+                        if (now_ts - last_pull_ts) < self._ESI_MIN_PULL_INTERVAL:
+                            continue   # pulled recently — skip this cycle
+                    except (ValueError, OSError):
+                        pass   # malformed timestamp — fall through and pull anyway
+
                 try:
                     await self._pull_character_esi(int(key), char["character_id"])
                 except Exception as e:

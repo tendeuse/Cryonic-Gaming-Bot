@@ -718,7 +718,18 @@ class APCheckView(discord.ui.View):
     async def check_balance(self, interaction: discord.Interaction, _):
         # Defer immediately to prevent 10062 "Unknown interaction" errors when
         # the async load() call takes longer than Discord's 3-second ack window.
-        await interaction.response.defer(ephemeral=True)
+        #
+        # If the bot was mid-reconnect when the button was clicked the interaction
+        # token will have already expired. Catch NotFound (10062) silently — the
+        # user simply needs to click the button again once the bot is stable.
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.NotFound:
+            print(
+                f"[APCheckView] Interaction expired (10062) for user "
+                f"{interaction.user} — likely a reconnect race. Ignoring."
+            )
+            return
 
         if not isinstance(interaction.user, discord.Member):
             await interaction.followup.send("Could not resolve member.", ephemeral=True)
