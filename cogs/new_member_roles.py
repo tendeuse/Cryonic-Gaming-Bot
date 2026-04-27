@@ -39,6 +39,15 @@ CEO_ROLE = "ARC Security Corporation Leader"
 
 LOG_CHANNEL_NAME = "roles-log"
 
+NEW_MEMBER_DM = (
+    "You've been identified by this bot as a new member of discord server Cryonic Gaming. Welcome! "
+    " Since we don't know you yet, your chat access is temporarily suspended. You aren't in trouble, "
+    "but you are required to have a brief talk with a moderator to regain access and to receive information "
+    "needed for community safety and your convenience. 🙂\n"
+    "Click the link below to create a ticket. A human moderator will respond within 24 hours.\n"
+    "https://discord.com/channels/559041517663289344/1459204314882117662"
+)
+
 DELAY_SECONDS = 3600  # 1 hour
 NEW_PLAYER_WINDOW_DAYS = 14
 ROLE_OP_THROTTLE_SECONDS = 0.35
@@ -111,6 +120,9 @@ class NewMemberRoles(commands.Cog):
 
         # prevents spamming multiple security logs in rapid succession for same user
         self._security_log_guard: dict[int, float] = {}
+
+        # prevents sending duplicate DMs if role event fires more than once quickly
+        self._new_member_dm_guard: dict[int, float] = {}
 
         self.timer_task.start()
         self._boot_task = bot.loop.create_task(self.bootstrap_existing_members())
@@ -206,6 +218,39 @@ class NewMemberRoles(commands.Cog):
         except Exception:
             # never break other role flows
             return
+
+    # ---------- New Member DM ----------
+
+    async def _send_new_member_dm(self, member: discord.Member):
+        """
+        Send the welcome/suspension DM when 'New Member' role is assigned,
+        then log the outcome to #roles-log.
+        Includes a 5-second dedup guard to avoid double sends on rapid events.
+        """
+        now = time.time()
+        last = self._new_member_dm_guard.get(member.id, 0.0)
+        if (now - last) < 5.0:
+            return
+        self._new_member_dm_guard[member.id] = now
+
+        dm_status: str
+        try:
+            await _retry_discord_http(
+                lambda: member.send(NEW_MEMBER_DM),
+                attempts=3,
+                base_delay=1.0,
+                max_delay=10.0,
+            )
+            dm_status = "✅ DM sent successfully."
+        except discord.Forbidden:
+            dm_status = "⚠️ DM could not be sent (user has DMs disabled or has blocked the bot)."
+        except Exception as e:
+            dm_status = f"⚠️ DM failed ({type(e).__name__})."
+
+        await self.log(
+            member.guild,
+            f"📨 **New Member DM** → {member.mention}: {dm_status}",
+        )
 
     # ---------- New Player Detection ----------
 
@@ -356,6 +401,10 @@ class NewMemberRoles(commands.Cog):
 
         if (EVE_ROLE in after_roles) and (EVE_ROLE not in before_roles):
             await self.handle_eve_role_added(after, reason="EVE role added")
+
+        # NEW: send DM when New Member role is granted (auto timer or manual)
+        if (NEW_MEMBER_ROLE in after_roles) and (NEW_MEMBER_ROLE not in before_roles):
+            await self._send_new_member_dm(after)
 
         if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
             actor = "Unknown"
