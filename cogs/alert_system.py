@@ -185,6 +185,10 @@ def require_alert_sender_roles():
         return has_any_role(interaction.user, ALERT_SEND_ROLES)
     return app_commands.check(predicate)
 
+# =====================
+# ALERT MODAL
+# =====================
+
 class AlertMessageModal(Modal):
     def __init__(self, cog: "AlertSystemCog"):
         super().__init__(title="Send Alert to ARC Security (DM)")
@@ -200,6 +204,10 @@ class AlertMessageModal(Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await self.cog.handle_send_alert(interaction, str(self.msg.value))
+
+# =====================
+# ALERT PANEL VIEW
+# =====================
 
 class AlertPanelView(View):
     def __init__(self, cog: "AlertSystemCog"):
@@ -238,28 +246,99 @@ class AlertPanelView(View):
         await self.cog.set_opt_in(interaction.guild, interaction.user, False)
         await interaction.response.send_message("You are now opted-out of ARC Security DM alerts.", ephemeral=True)
 
+# =====================
+# WORMHOLE STATUS CONTEXT MODAL
+# =====================
+
+class WormholeStatusContextModal(discord.ui.Modal):
+    """
+    Opened by any WH status button other than Normal.
+    Collects a mandatory context/reason before applying the status change.
+    """
+
+    def __init__(self, cog: "AlertSystemCog", value: str, member: discord.Member, guild: discord.Guild):
+        super().__init__(title=f"Set Status: {value}")
+        self.cog    = cog
+        self.value  = value
+        self.member = member
+        self.guild  = guild
+
+        self.context = discord.ui.TextInput(
+            label="Context / Reason",
+            placeholder="e.g. Hostiles on scan, rolling op in progress...",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=300,
+        )
+        self.add_item(self.context)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        context_text = str(self.context.value).strip()
+        value        = normalize_status(self.value)
+
+        await self.cog.update_status(
+            guild=        self.guild,
+            value=        value,
+            updated_by=   f"{self.member} (ID: {self.member.id})",
+            ping_role=    True,
+            context_note= context_text,
+        )
+        await interaction.response.send_message(
+            f"Wormhole status set to `{value}`.\n**Context:** {context_text}",
+            ephemeral=True,
+        )
+
+# =====================
+# WORMHOLE STATUS VIEW
+# =====================
+
 class WormholeStatusView(View):
     def __init__(self, cog: "AlertSystemCog"):
         super().__init__(timeout=None)
         self.cog = cog
 
     async def _set(self, interaction: discord.Interaction, value: str):
+        """Direct set — used only by Normal (no context modal needed)."""
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This must be used in a server.", ephemeral=True)
             return
         if not has_any_role(interaction.user, WH_STATUS_ROLES):
-            await interaction.response.send_message("You do not have permission to update wormhole status.", ephemeral=True)
+            await interaction.response.send_message(
+                "You do not have permission to update wormhole status.", ephemeral=True
+            )
             return
 
         value = normalize_status(value)
         await self.cog.update_status(
-            guild=interaction.guild,
-            value=value,
-            updated_by=f"{interaction.user} (ID: {interaction.user.id})",
-            ping_role=True,
-            context_note="Manual status change",
+            guild=        interaction.guild,
+            value=        value,
+            updated_by=   f"{interaction.user} (ID: {interaction.user.id})",
+            ping_role=    True,
+            context_note= "Manual status change",
         )
-        await interaction.response.send_message(f"Wormhole status set to `{value}`.", ephemeral=True)
+        await interaction.response.send_message(
+            f"Wormhole status set to `{value}`.", ephemeral=True
+        )
+
+    async def _open_modal(self, interaction: discord.Interaction, value: str):
+        """Opens context modal — used by all non-Normal buttons."""
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This must be used in a server.", ephemeral=True)
+            return
+        if not has_any_role(interaction.user, WH_STATUS_ROLES):
+            await interaction.response.send_message(
+                "You do not have permission to update wormhole status.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(
+            WormholeStatusContextModal(
+                cog=    self.cog,
+                value=  value,
+                member= interaction.user,
+                guild=  interaction.guild,
+            )
+        )
 
     @discord.ui.button(label=f"{GREEN_LIGHT} Normal", style=discord.ButtonStyle.success, custom_id="wh_status:normal")
     async def normal(self, interaction: discord.Interaction, button: Button):
@@ -267,19 +346,19 @@ class WormholeStatusView(View):
 
     @discord.ui.button(label=f"{RED_LIGHT} Dangerous", style=discord.ButtonStyle.danger, custom_id="wh_status:dangerous")
     async def dangerous(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Dangerous")
-
-    @discord.ui.button(label=f"{RED_LIGHT} Enemy Fleet Spotted", style=discord.ButtonStyle.danger, custom_id="wh_status:enemy")
-    async def enemy(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Enemy Fleet Spotted")
+        await self._open_modal(interaction, "Dangerous")
 
     @discord.ui.button(label=f"{PURPLE_LIGHT} Lock-down", style=discord.ButtonStyle.primary, custom_id="wh_status:lockdown")
     async def lockdown(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Lock-down")
+        await self._open_modal(interaction, "Lock-down")
 
-    @discord.ui.button(label=f"{RED_LIGHT} Station Under attack", style=discord.ButtonStyle.danger, custom_id="wh_status:attack")
+    @discord.ui.button(label=f"{RED_LIGHT} Station Under Attack", style=discord.ButtonStyle.danger, custom_id="wh_status:attack")
     async def attack(self, interaction: discord.Interaction, button: Button):
-        await self._set(interaction, "Station Under attack")
+        await self._open_modal(interaction, "Station Under attack")
+
+# =====================
+# COG
+# =====================
 
 class AlertSystemCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -540,7 +619,6 @@ class AlertSystemCog(commands.Cog):
         self.state["guilds"][self._gkey(guild)] = gs
         await save_state(self.state)
 
-        # Ping message only if requested
         if ping_role:
             try:
                 await self._replace_status_ping_message(
@@ -653,14 +731,12 @@ class AlertSystemCog(commands.Cog):
         self.state["guilds"][self._gkey(guild)] = gs
         await save_state(self.state)
 
-        # Restart timer task
         old = self._danger_reset_tasks.get(guild.id)
         if old and not old.done():
             old.cancel()
         self._danger_reset_tasks[guild.id] = asyncio.create_task(self._auto_revert_after_delay(guild, reset_at))
 
         if not was_active:
-            # First trigger only: change status + ping
             await self.update_status(
                 guild=guild,
                 value=AUTO_DANGER_STATUS_VALUE,
@@ -669,8 +745,6 @@ class AlertSystemCog(commands.Cog):
                 context_note=f"Auto-trigger from killmail {killmail_id}",
             )
         else:
-            # Already in danger: only refresh status panel (no ping) and keep status as Dangerous
-            # (If someone manually set status away from Dangerous, we can force it back silently.)
             current = normalize_status((gs.get("status") or {}).get("value", "Normal"))
             if current != AUTO_DANGER_STATUS_VALUE:
                 await self.update_status(
@@ -681,7 +755,6 @@ class AlertSystemCog(commands.Cog):
                     context_note=f"Auto-trigger (timer extended) from killmail {killmail_id}",
                 )
             else:
-                # No status change; just refresh panel so timer info updates
                 await self.refresh_status_panel_debounced(guild)
 
     async def _auto_revert_after_delay(self, guild: discord.Guild, reset_at: datetime.datetime):
@@ -755,7 +828,7 @@ class AlertSystemCog(commands.Cog):
         self._danger_reset_tasks[guild.id] = asyncio.create_task(self._auto_revert_after_delay(guild, reset_at))
 
     # =====================
-    # Opt-in + Alerts (unchanged behavior)
+    # Opt-in + Alerts
     # =====================
 
     def opt_in_records(self, guild: discord.Guild) -> Dict[str, Any]:
@@ -803,9 +876,9 @@ class AlertSystemCog(commands.Cog):
         await save_state(self.state)
 
     async def handle_send_alert(self, interaction: discord.Interaction, message: str):
-        # Not shown again here to keep this copy-paste manageable; keep your existing implementation.
+        # Keep your existing alert DM implementation here.
         await interaction.response.send_message(
-            "This file copy includes the auto-danger anti-spam fix. Keep your existing alert DM implementation here.",
+            "This file copy includes the context modal update. Keep your existing alert DM implementation here.",
             ephemeral=True
         )
 
