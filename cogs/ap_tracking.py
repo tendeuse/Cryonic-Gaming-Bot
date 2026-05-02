@@ -4,33 +4,34 @@
 # - Persists to /data by default (Railway volume). Override with env var PERSIST_ROOT.
 # - Keeps ALL commands/reports from your posted script:
 #   /apclaim, /give_ap, /remove_ap, /transfer_ap, /ap_info, /export_ap, /point
-# - NEW: /ap_audit — full audit trail per player since last AP wipe
+# - /ap_audit       — full audit trail per player since last AP wipe
+# - /ap_list_backups   — list available backup files for this server
+# - /ap_restore_backup — restore AP from a backup and re-send the CSV report
 # - Maintains:
 #     AP check channel with persistent button
 #     Join bonus + distribution embed log channel
 #     Hierarchy log channel
 #     Voice + chat AP loops with bonuses
 #
-# BONUS POLICY (UPDATED):
+# BONUS POLICY:
 # - CEO(s): each gets +10% of base (NOT divided)
-# - Directors: total pool = 10% of base, split evenly among Directors (excluding CEOs to prevent double-dip)
+# - Directors: total pool = 10% of base, split evenly among Directors (excluding CEOs)
 # - Leadership bonus triggers only when earner has SECURITY_ROLE
 # - Unit tier bonuses are disabled in this version
 #
-# PERM POLICY (UPDATED PER YOUR REQUEST):
+# PERM POLICY:
 # - This cog WILL create required channels if missing
 # - It WILL NOT change @everyone permissions on an existing channel (ap-check)
-# - It WILL ensure the bot has the permissions it needs on ap-check (without touching @everyone)
+# - It WILL ensure the bot has the permissions it needs on ap-check
 #
-# EVENT PRESENCE BOOSTS (NEW):
+# EVENT PRESENCE BOOSTS:
 # - Reads /data/ap_boosts.json (via BOOSTS_FILE)
 # - When a participant earns AP, any active boost entries grant an additional % of base_amount
 #   to a beneficiary (event creator) for the next 24 hours.
 # - Boosts DO NOT stack: duplicate beneficiaries are deduped; only one award per beneficiary applies.
 #
 # AUDIT LOG:
-# - Every AP change (earn, give, remove, transfer, join bonus, leadership bonuses, boosts)
-#   is appended to each user's "audit" list inside ap_data.json.
+# - Every AP change is appended to each user's "audit" list inside ap_data.json.
 # - Audit lists are cleared when AP is wiped, so they always reflect the current cycle.
 # - /ap_audit [member] shows the log. Admins can view anyone; members see only themselves.
 #   If the log exceeds 25 entries it is also attached as a CSV file.
@@ -157,7 +158,6 @@ async def load() -> Dict[str, Any]:
                 return _default_ap_data()
             return data
         except json.JSONDecodeError:
-            # Keep a backup for inspection, then reset
             try:
                 bak = DATA_FILE.with_suffix(DATA_FILE.suffix + ".bak")
                 DATA_FILE.replace(bak)
@@ -701,7 +701,7 @@ async def wipe_ap_in_data(data: Dict[str, Any]) -> None:
     for _, rec in iter_member_records(data):
         rec["ap"]        = 0
         rec["last_chat"] = None
-        rec[AUDIT_KEY]   = []   # ← clear audit so next cycle starts fresh
+        rec[AUDIT_KEY]   = []   # clear audit so next cycle starts fresh
 
 # -------------------------
 # Persistent View
@@ -718,10 +718,6 @@ class APCheckView(discord.ui.View):
     async def check_balance(self, interaction: discord.Interaction, _):
         # Defer immediately to prevent 10062 "Unknown interaction" errors when
         # the async load() call takes longer than Discord's 3-second ack window.
-        #
-        # If the bot was mid-reconnect when the button was clicked the interaction
-        # token will have already expired. Catch NotFound (10062) silently — the
-        # user simply needs to click the button again once the bot is stable.
         try:
             await interaction.response.defer(ephemeral=True)
         except discord.NotFound:
@@ -755,7 +751,6 @@ class APClaimIGNModal(discord.ui.Modal):
         self.add_item(self.ign_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Pure validation first — these fire before any async I/O so send_message is safe.
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
             return
@@ -764,7 +759,6 @@ class APClaimIGNModal(discord.ui.Modal):
             await interaction.response.send_message("IGN cannot be empty.", ephemeral=True)
             return
 
-        # Defer now — async I/O below would exceed Discord's 3-second ack window (10062).
         await interaction.response.defer(ephemeral=True)
 
         data = await load()
@@ -1253,18 +1247,6 @@ class APTracking(commands.Cog):
         interaction: discord.Interaction,
         member: discord.Member | None = None
     ):
-        """
-        Permissions
-        -----------
-        - Admins (CEO / Lycan King): can view anyone's log.
-        - Everyone else: can only view their own log.
-
-        Output
-        ------
-        - Always sends an embed summary (ephemeral).
-        - If there are more than AUDIT_EMBED_MAX (25) entries the full list is
-          also attached as a CSV so nothing is lost.
-        """
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Could not resolve guild/member.", ephemeral=True)
             return
@@ -1272,7 +1254,6 @@ class APTracking(commands.Cog):
         caller   = interaction.user
         is_admin = is_authorized_admin(caller)
 
-        # Resolve target
         if member is None:
             target = caller
         elif member.id != caller.id and not is_admin:
@@ -1299,7 +1280,6 @@ class APTracking(commands.Cog):
         total_removed = sum(e.get("delta", 0) for e in entries if e.get("delta", 0) < 0)
         net           = total_gained + total_removed
 
-        # Build embed showing the most recent AUDIT_EMBED_MAX entries
         display = entries[-AUDIT_EMBED_MAX:] if total_count > AUDIT_EMBED_MAX else entries
 
         embed = discord.Embed(
@@ -1315,21 +1295,19 @@ class APTracking(commands.Cog):
         )
         embed.set_footer(text=f"User ID: {target.id}")
 
-        # One field per entry (concise)
         lines: List[str] = []
         for e in display:
             ts_raw = e.get("ts", "")
-            # Trim to HH:MM:SS date portion for readability
             try:
                 dt = datetime.datetime.fromisoformat(ts_raw)
                 ts_fmt = dt.strftime("%Y-%m-%d %H:%M UTC")
             except Exception:
                 ts_fmt = ts_raw
 
-            delta   = e.get("delta", 0)
-            sign    = "+" if delta >= 0 else ""
-            source  = e.get("source", "unknown")
-            reason  = e.get("reason", "")
+            delta    = e.get("delta", 0)
+            sign     = "+" if delta >= 0 else ""
+            source   = e.get("source", "unknown")
+            reason   = e.get("reason", "")
             actor_id = e.get("actor_id")
 
             line = f"`{ts_fmt}` **{sign}{delta:.2f} AP** via *{source}*"
@@ -1340,7 +1318,6 @@ class APTracking(commands.Cog):
                 line += f" (by {actor_m.display_name if actor_m else actor_id})"
             lines.append(line)
 
-        # Discord embed field values cap at 1024 chars; split into chunks if needed
         chunk, chunks = "", []
         for line in lines:
             candidate = (chunk + "\n" + line).lstrip("\n")
@@ -1359,7 +1336,6 @@ class APTracking(commands.Cog):
                 inline=False
             )
 
-        # Attach full CSV when log is long
         files: List[discord.File] = []
         if total_count > AUDIT_EMBED_MAX:
             csv_bytes = build_audit_csv(entries, target.display_name)
@@ -1373,6 +1349,219 @@ class APTracking(commands.Cog):
             )
 
         await interaction.response.send_message(embed=embed, files=files, ephemeral=True)
+
+    # -------------------------
+    # Backup restore helpers
+    # -------------------------
+
+    def _list_guild_backups(self, guild_id: int) -> List[Path]:
+        """
+        Return all backup JSON files for this guild, newest first.
+        Filename format: ap_backup_{guild_id}_{timestamp}.json
+        """
+        prefix = f"ap_backup_{guild_id}_"
+        files = sorted(
+            [p for p in EXPORT_DIR.glob(f"{prefix}*.json")],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return files
+
+    # -------------------------
+    # /ap_list_backups
+    # -------------------------
+
+    @app_commands.command(
+        name="ap_list_backups",
+        description="List available AP backup files for this server (CEO / Lycan King only)."
+    )
+    async def ap_list_backups(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
+            return
+        if not is_authorized_admin(interaction.user):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        backups = self._list_guild_backups(interaction.guild.id)
+
+        if not backups:
+            await interaction.response.send_message(
+                "No backup files found for this server.\n"
+                "Backups are created automatically each time `/export_ap` is run.",
+                ephemeral=True,
+            )
+            return
+
+        lines: List[str] = []
+        for i, path in enumerate(backups[:15]):  # cap display at 15
+            mtime = datetime.datetime.utcfromtimestamp(path.stat().st_mtime)
+            label = "  ← most recent" if i == 0 else ""
+            lines.append(f"`{path.name}` — `{mtime.strftime('%Y-%m-%d %H:%M UTC')}`{label}")
+
+        embed = discord.Embed(
+            title="AP Backup Files",
+            description="\n".join(lines),
+            timestamp=datetime.datetime.utcnow(),
+        )
+        embed.set_footer(
+            text="Use /ap_restore_backup to restore. Omit backup_name to use the most recent."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # -------------------------
+    # /ap_restore_backup
+    # -------------------------
+
+    @app_commands.command(
+        name="ap_restore_backup",
+        description="Restore AP balances from a backup and re-send the CSV report (CEO / Lycan King only)."
+    )
+    @app_commands.describe(
+        backup_name="Exact backup filename from /ap_list_backups. Leave blank to use the most recent."
+    )
+    async def ap_restore_backup(
+        self,
+        interaction: discord.Interaction,
+        backup_name: Optional[str] = None,
+    ):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
+            return
+        if not is_authorized_admin(interaction.user):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # ── 1. Locate backup file ─────────────────────────────────────────────
+        if backup_name:
+            backup_path = EXPORT_DIR / backup_name.strip()
+            if not backup_path.exists():
+                await interaction.followup.send(
+                    f"❌ Backup file `{backup_name}` not found.\n"
+                    "Use `/ap_list_backups` to see available files.",
+                    ephemeral=True,
+                )
+                return
+        else:
+            backups = self._list_guild_backups(interaction.guild.id)
+            if not backups:
+                await interaction.followup.send(
+                    "❌ No backup files found for this server.\n"
+                    "Backups are created automatically each time `/export_ap` is run.",
+                    ephemeral=True,
+                )
+                return
+            backup_path = backups[0]
+
+        # ── 2. Load backup ────────────────────────────────────────────────────
+        try:
+            backup_raw = backup_path.read_text(encoding="utf-8").strip()
+            backup_data: Dict[str, Any] = json.loads(backup_raw)
+            if not isinstance(backup_data, dict):
+                raise ValueError("Backup root is not a dict.")
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Failed to read backup file: `{e}`", ephemeral=True
+            )
+            return
+
+        mtime = datetime.datetime.utcfromtimestamp(backup_path.stat().st_mtime)
+        backup_label = f"`{backup_path.name}` (saved `{mtime.strftime('%Y-%m-%d %H:%M UTC')}`)"
+
+        # ── 3. Restore AP values into current data ────────────────────────────
+        # Only overwrites the `ap` field — preserves audit logs, claim fields,
+        # and join bonus flags on the current live record.
+        current_data = await load()
+        restored = 0
+        skipped  = 0
+
+        for uid_str, backup_rec in backup_data.items():
+            if uid_str == META_KEY:
+                continue
+            if not isinstance(backup_rec, dict):
+                continue
+
+            backup_ap = safe_float_ap(backup_rec.get("ap", 0))
+            if backup_ap <= 0:
+                skipped += 1
+                continue
+
+            # Merge: restore ap, preserve everything else in current record
+            current_rec = current_data.setdefault(
+                uid_str, {"ap": 0, "last_chat": None}
+            )
+            current_rec["ap"] = backup_ap
+
+            # Restore ign/game claim fields if the current record is missing them
+            for claim_key in (CLAIM_IGN_KEY, CLAIM_GAME_KEY):
+                if claim_key in backup_rec and claim_key not in current_rec:
+                    current_rec[claim_key] = backup_rec[claim_key]
+
+            # Audit trail entry so there is a paper trail of the restore
+            append_audit(
+                current_data,
+                int(uid_str),
+                backup_ap,
+                source="ap_restore_backup",
+                reason=f"Restored from {backup_path.name}",
+                actor_id=interaction.user.id,
+            )
+            restored += 1
+
+        await save(current_data)
+
+        # ── 4. Log to hierarchy channel ───────────────────────────────────────
+        try:
+            await log_hierarchy_ap(
+                interaction.guild,
+                f"AP restore executed by {interaction.user.mention}.\n"
+                f"Backup: {backup_label}\n"
+                f"Members restored: **{restored}** | Skipped (0 AP in backup): **{skipped}**",
+                mention_ids=[interaction.user.id],
+            )
+        except Exception:
+            pass
+
+        # ── 5. Re-generate and send the CSV report from backup data ───────────
+        try:
+            groups    = build_ap_rows_by_game(interaction.guild, backup_data)
+            csv_bytes = render_grouped_csv(groups)
+            ts        = mtime.strftime("%Y%m%d_%H%M%S")
+            filename  = f"ap_restored_report_{interaction.guild.id}_{ts}.csv"
+            file      = discord.File(io.BytesIO(csv_bytes), filename=filename)
+
+            wow_total     = sum(safe_int_ap(r[3]) for r in groups.get(GAME_WOW, []))
+            eve_total     = sum(safe_int_ap(r[3]) for r in groups.get(GAME_EVE, []))
+            unk_total     = sum(safe_int_ap(r[3]) for r in groups.get("Unclaimed / Unknown", []))
+            total_members = sum(len(v) for v in groups.values())
+
+            embed = discord.Embed(
+                title="✅ AP Restore Complete — Backup Report",
+                description=(
+                    f"**Backup file:** {backup_label}\n"
+                    f"**Members restored:** `{restored}`\n"
+                    f"**Skipped (0 AP in backup):** `{skipped}`\n\n"
+                    f"**{GAME_WOW}:** `{wow_total} AP`\n"
+                    f"**{GAME_EVE}:** `{eve_total} AP`\n"
+                    f"**Unclaimed / Unknown:** `{unk_total} AP`\n"
+                    f"**Total members in report:** `{total_members}`\n\n"
+                    "AP balances have been restored. CSV report attached."
+                ),
+                timestamp=datetime.datetime.utcnow(),
+            )
+            embed.set_footer(text=f"Restored by {interaction.user} — audit entries written per member.")
+            await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+
+        except Exception as e:
+            # Restore already saved — report partial success clearly
+            await interaction.followup.send(
+                f"✅ AP balances restored from {backup_label} "
+                f"({restored} members).\n"
+                f"⚠️ CSV generation failed: `{e}`",
+                ephemeral=True,
+            )
 
 
 async def setup(bot: commands.Bot):
