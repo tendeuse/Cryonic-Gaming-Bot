@@ -2240,6 +2240,265 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                 except Exception as e:
                     print(f"[ARC-SEAT] Overflow flags file failed: {e}")
 
+        # ── Tests & Certifications follow-up ─────────────────────────────────
+        if isinstance(existing_thread, discord.Thread):
+            try:
+                tests_embed = self._build_tests_embed(discord_member)
+                await existing_thread.send(embed=tests_embed)
+            except Exception as e:
+                print(f"[ARC-SEAT] Tests embed failed: {e}")
+
+        # ── Event participation follow-up ─────────────────────────────────────
+        if isinstance(existing_thread, discord.Thread):
+            try:
+                events_embed = self._build_events_embed(discord_member.id)
+                await existing_thread.send(embed=events_embed)
+            except Exception as e:
+                print(f"[ARC-SEAT] Events embed failed: {e}")
+
+    # ── Tests & certifications summary ────────────────────────────────────────
+
+    def _build_tests_embed(self, discord_member: discord.Member) -> discord.Embed:
+        """
+        Build an embed showing the member's status on all three in-bot tests.
+
+        Data sources (read-only, no cross-cog imports needed):
+        • Roles on the member  — role presence/absence is the canonical record
+          of test completion, because each test removes or grants a role on pass.
+        • signature_tagging_attempts.json  — attempt counts per day per user.
+          Located at ./signature_tagging_attempts.json (project root, as written
+          by signature_tagging_test.py).
+
+        Tests:
+        ┌──────────────────────────┬────────────────────────────┬─────────────┐
+        │ Test                     │ Pass evidence              │ Fail/pending│
+        ├──────────────────────────┼────────────────────────────┼─────────────┤
+        │ Onboarding Test          │ "Onboarding" role ABSENT   │ role PRESENT│
+        │ Corp Rules Test          │ "Newbro" role ABSENT       │ role PRESENT│
+        │ Signature Tagging Test   │ "Exploration Certified"    │ role ABSENT │
+        └──────────────────────────┴────────────────────────────┴─────────────┘
+        """
+        member_role_names = {r.name for r in discord_member.roles}
+
+        # ── Onboarding Test ───────────────────────────────────────────────────
+        has_onboarding = "Onboarding" in member_role_names
+        onboarding_status = "❌ Not yet passed  (`Onboarding` role still present)" \
+            if has_onboarding else "✅ Passed  (role removed)"
+
+        # ── Corp Rules Test ───────────────────────────────────────────────────
+        has_newbro = "Newbro" in member_role_names
+        corp_rules_status = "❌ Not yet passed  (`Newbro` role still present)" \
+            if has_newbro else "✅ Passed  (role removed)"
+
+        # ── Signature Tagging Test ────────────────────────────────────────────
+        has_cert = "Exploration Certified" in member_role_names
+        sig_status = "✅ Passed  (`Exploration Certified` granted)" \
+            if has_cert else "❌ Not yet passed"
+
+        # Total sig-tagging attempts from JSON (root-level file, no lock needed)
+        sig_attempts_total = 0
+        sig_attempts_detail: List[str] = []
+        attempts_path = Path("signature_tagging_attempts.json")
+        try:
+            if attempts_path.exists():
+                raw = json.loads(attempts_path.read_text(encoding="utf-8"))
+                uid_str = str(discord_member.id)
+                for day, day_data in sorted(raw.items(), reverse=True):
+                    if uid_str in day_data:
+                        count = int(day_data[uid_str])
+                        sig_attempts_total += count
+                        sig_attempts_detail.append(f"`{day}` — {count} attempt(s)")
+        except Exception:
+            pass  # file missing or malformed — silently skip
+
+        if sig_attempts_total > 0:
+            attempts_str = f"{sig_attempts_total} lifetime attempt(s)"
+            if sig_attempts_detail:
+                # Show last 5 days that had attempts
+                shown = sig_attempts_detail[:5]
+                attempts_str += "\n" + "\n".join(shown)
+                if len(sig_attempts_detail) > 5:
+                    attempts_str += f"\n_(+ {len(sig_attempts_detail) - 5} more day(s))_"
+        else:
+            attempts_str = "0 — no attempts recorded"
+
+        embed = discord.Embed(
+            title="📝 Test & Certification Status",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="🎓 Onboarding Test",
+            value=onboarding_status,
+            inline=False,
+        )
+        embed.add_field(
+            name="📋 Corp Rules Test",
+            value=corp_rules_status,
+            inline=False,
+        )
+        embed.add_field(
+            name="🗺️ Signature Tagging Test",
+            value=sig_status,
+            inline=False,
+        )
+        embed.add_field(
+            name="🗺️ Signature Tagging — Attempt History",
+            value=attempts_str,
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                "Pass evidence is inferred from Discord roles. "
+                "Onboarding/Corp Rules: role removed on pass. "
+                "Sig Tagging: role granted on pass."
+            )
+        )
+        return embed
+
+    # ── Event participation summary ───────────────────────────────────────────
+
+    def _build_events_embed(self, discord_id: int) -> discord.Embed:
+        """
+        Build an embed showing the member's event RSVP and attendance history.
+
+        Data source: /data/events.json (written by event_creator.py).
+        Read-only; no lock required.
+
+        For each event the member appeared in (any RSVP or vc_qualified):
+        • Shows title, scheduled time (<t:unix:d>), and their RSVP button(s).
+        • Marks with ✅ if they are in vc_qualified (attended ≥ 15 min in VC).
+        • Marks with 📋 if they RSVPd but did not qualify (or event is still active).
+        • Sorted newest-first; capped at 25 events to stay under embed limits.
+        """
+        uid     = discord_id
+        uid_str = str(uid)
+
+        # Read events.json synchronously — this is an internal read with no writes
+        events_data: Dict[str, Any] = {}
+        events_path = Path("/data/events.json")
+        try:
+            if events_path.exists():
+                raw = events_path.read_text(encoding="utf-8").strip()
+                if raw:
+                    events_data = json.loads(raw)
+        except Exception:
+            pass
+
+        # Collect events this member is involved in
+        Member_events: List[Dict[str, Any]] = []
+
+        for event_id, event in events_data.items():
+            if not isinstance(event, dict):
+                continue
+
+            ts        = int(event.get("timestamp", 0) or 0)
+            title     = str(event.get("title", "Untitled"))
+            qualified = event.get("vc_qualified") or []
+            roles     = event.get("roles") or {}
+
+            # Determine RSVP buttons this member clicked (excluding Decline)
+            rsvp_buttons: List[str] = []
+            for btn_name, btn_users in roles.items():
+                if btn_name.lower() == "decline":
+                    continue
+                if isinstance(btn_users, list) and uid in btn_users:
+                    rsvp_buttons.append(btn_name)
+
+            # Was this member in vc_qualified?
+            is_qualified = uid in qualified
+
+            # Only include if they appear anywhere
+            if not rsvp_buttons and not is_qualified:
+                continue
+
+            # Cumulative VC time for display
+            cum_times  = event.get("vc_cumulative_times") or {}
+            vc_secs    = int(cum_times.get(uid_str, cum_times.get(uid, 0)) or 0)
+            vc_time_str = ""
+            if vc_secs > 0:
+                mins = vc_secs // 60
+                secs = vc_secs % 60
+                vc_time_str = f" ({mins}m {secs}s in VC)"
+
+            Member_events.append({
+                "ts":          ts,
+                "title":       title,
+                "qualified":   is_qualified,
+                "rsvp":        rsvp_buttons,
+                "vc_time_str": vc_time_str,
+                "active":      bool(event.get("active", True)) and not bool(event.get("closed", False)),
+            })
+
+        # Sort newest-first
+        Member_events.sort(key=lambda e: e["ts"], reverse=True)
+        Member_events = Member_events[:25]
+
+        embed = discord.Embed(
+            title="⚔️ Event Participation History",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        if not Member_events:
+            embed.description = "_No event participation recorded._"
+            embed.set_footer(text="Source: /data/events.json")
+            return embed
+
+        qualified_count = sum(1 for e in Member_events if e["qualified"])
+        rsvp_count      = len(Member_events)
+
+        embed.description = (
+            f"**Events found:** {rsvp_count}  |  "
+            f"**Qualified (≥15 min VC):** {qualified_count}"
+        )
+
+        # Build field lines — pack into chunks so we stay under field limit
+        lines: List[str] = []
+        for ev in Member_events:
+            ts_str   = f"<t:{ev['ts']}:d>" if ev["ts"] else "?"
+            icon     = "✅" if ev["qualified"] else ("📋" if not ev["active"] else "📌")
+            rsvp_str = ", ".join(ev["rsvp"]) if ev["rsvp"] else "No RSVP"
+            lines.append(
+                f"{icon} **{ev['title']}** — {ts_str}\n"
+                f"  RSVP: {rsvp_str}{ev['vc_time_str']}"
+            )
+
+        # Pack lines into embed fields (≤ 1 000 chars each)
+        FIELD_LIMIT = 1000
+        buf = ""
+        field_idx = 0
+        for line in lines:
+            sep       = "\n\n" if buf else ""
+            candidate = buf + sep + line
+            if len(candidate) > FIELD_LIMIT:
+                if buf:
+                    embed.add_field(
+                        name=  "Events" if field_idx == 0 else "Events (cont.)",
+                        value= buf,
+                        inline=False,
+                    )
+                    field_idx += 1
+                buf = line
+            else:
+                buf = candidate
+        if buf:
+            embed.add_field(
+                name=  "Events" if field_idx == 0 else "Events (cont.)",
+                value= buf,
+                inline=False,
+            )
+
+        embed.set_footer(
+            text=(
+                "✅ = Qualified (≥15 min in event VC)  "
+                "📋 = RSVPd, event closed  "
+                "📌 = RSVPd, event still active  "
+                "| Source: /data/events.json"
+            )
+        )
+        return embed
+
     @staticmethod
     def _risk_colour(level: str) -> discord.Color:
         return {
