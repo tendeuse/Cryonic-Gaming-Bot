@@ -2014,6 +2014,13 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         """
         Create or update the watch-list forum thread for a flagged member.
         Thread title = member's display name.
+
+        ALL flags are shown — no cap:
+        • Flags that fit inside the embed (≤ 5 800 total chars) are added as
+          successive fields of ≤ 1 000 chars each.
+        • Any flags that would push the embed over budget are posted as a
+          follow-up message in the same thread (plain text, or a .txt file
+          attachment if even the message would exceed 1 900 chars).
         """
         ch = await self._ensure_watchlist_channel(guild, data)
         if not isinstance(ch, discord.ForumChannel):
@@ -2024,7 +2031,19 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         risk_score = member_rec.get("risk_score", 0)
         risk_emoji = SpyDetectionEngine.risk_emoji(risk_level)
 
-        # Build embed
+        # ── Embed char-budget helper ──────────────────────────────────────────
+        EMBED_CHAR_BUDGET = 5800
+        FIELD_CHAR_LIMIT  = 1000
+
+        def _embed_len(e: discord.Embed) -> int:
+            total = len(e.title or "") + len(e.description or "")
+            for f in e.fields:
+                total += len(f.name or "") + len(f.value or "")
+            if e.footer and e.footer.text:
+                total += len(e.footer.text)
+            return total
+
+        # ── Build base embed ──────────────────────────────────────────────────
         embed = discord.Embed(
             title=     f"{risk_emoji} {discord_member.display_name}  —  Risk: {risk_level}",
             color=     self._risk_colour(risk_level),
@@ -2042,7 +2061,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         )
         embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-        # Characters
+        # ── Characters ───────────────────────────────────────────────────────
         chars = member_rec.get("characters", [])
         for char in chars:
             in_corp = char.get("in_arc_corp", False)
@@ -2057,18 +2076,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                 inline=True,
             )
 
-        # Flags
-        if flags:
-            flag_lines = []
-            for fl in flags[:15]:   # cap at 15 to stay under embed limits
-                sev_icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(fl["severity"], "⬜")
-                flag_lines.append(f"{sev_icon} **{fl['title']}**\n{fl['detail']}")
-            embed.add_field(
-                name=  f"⚠️ Flags Detected ({len(flags)})",
-                value= "\n\n".join(flag_lines)[:1024],
-                inline=False,
-            )
-
+        # ── Corp fail notice ──────────────────────────────────────────────────
         if corp_fail:
             embed.add_field(
                 name=  "🚨 Corp Check Failed — Pending Review",
@@ -2084,21 +2092,103 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                 inline=False,
             )
 
-        embed.set_footer(text=f"Discord ID: {discord_member.id} | Last scan: {_now_iso()[:19]} UTC")
+        # ── Flags — pack into embed fields; collect overflow ──────────────────
+        #
+        # Strategy:
+        #   1. Build one string per flag: "<icon> **<title>**\n<detail>"
+        #   2. Pack strings into field-value chunks of ≤ FIELD_CHAR_LIMIT chars.
+        #   3. Add each chunk to the embed as long as the running total stays
+        #      under EMBED_CHAR_BUDGET (leaving room for the footer).
+        #   4. Any chunks that don't fit → overflow_text posted after the embed.
 
-        # Check for existing thread
+        SEV_ICON = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
+        overflow_text: str = ""
+
+        if not flags:
+            embed.add_field(
+                name="✅ No Flags",
+                value="Spy detection found no issues.",
+                inline=False,
+            )
+        else:
+            # Build per-flag strings
+            flag_strings: List[str] = []
+            for fl in flags:
+                icon   = SEV_ICON.get(fl.get("severity", ""), "⬜")
+                title  = fl.get("title", "")
+                detail = fl.get("detail", "")
+                flag_strings.append(f"{icon} **{title}**\n{detail}")
+
+            # Pack into field-value-sized chunks
+            field_chunks: List[str] = []
+            buf = ""
+            for fs in flag_strings:
+                # Hard-truncate a single entry that is itself too long
+                if len(fs) > FIELD_CHAR_LIMIT:
+                    fs = fs[:FIELD_CHAR_LIMIT - 1] + "…"
+                separator = "\n\n" if buf else ""
+                candidate = buf + separator + fs
+                if len(candidate) > FIELD_CHAR_LIMIT:
+                    if buf:
+                        field_chunks.append(buf)
+                    buf = fs
+                else:
+                    buf = candidate
+            if buf:
+                field_chunks.append(buf)
+
+            # Footer text length (approximate — set later)
+            footer_reserve = len(f"Discord ID: {discord_member.id} | Last scan: {_now_iso()[:19]} UTC")
+
+            # Determine which chunks fit in the embed and which overflow
+            first_overflow_chunk: Optional[int] = None
+            for idx, chunk in enumerate(field_chunks):
+                field_name = (
+                    f"⚠️ Flags Detected ({len(flags)})"
+                    if idx == 0
+                    else "⚠️ Flags (continued)"
+                )
+                addition = len(field_name) + len(chunk)
+                if _embed_len(embed) + addition + footer_reserve > EMBED_CHAR_BUDGET:
+                    first_overflow_chunk = idx
+                    break
+                embed.add_field(name=field_name, value=chunk, inline=False)
+
+            # Build overflow text from remaining chunks
+            if first_overflow_chunk is not None:
+                remaining_chunks = field_chunks[first_overflow_chunk:]
+                overflow_lines = [
+                    f"📋 **Remaining flags "
+                    f"({len(flags)} total — overflow from embed):**\n"
+                ]
+                overflow_lines.extend(remaining_chunks)
+                overflow_text = "\n\n".join(overflow_lines)
+
+        # Footer must be set AFTER all fields to keep _embed_len accurate above
+        embed.set_footer(
+            text=f"Discord ID: {discord_member.id} | Last scan: {_now_iso()[:19]} UTC"
+        )
+
+        # ── Resolve existing thread ───────────────────────────────────────────
         thread_id = member_rec.get("watch_list_thread_id")
-        existing_thread = None
+        existing_thread: Optional[discord.Thread] = None
         if thread_id:
             try:
                 existing_thread = guild.get_thread(thread_id)
                 if existing_thread is None:
-                    existing_thread = await guild.fetch_channel(thread_id)
+                    existing_thread = await guild.fetch_channel(thread_id)  # type: ignore[assignment]
             except Exception:
                 existing_thread = None
 
         if isinstance(existing_thread, discord.Thread):
-            # Update the first post
+            # Un-archive if needed so we can post
+            if existing_thread.archived:
+                try:
+                    await existing_thread.edit(archived=False)
+                except Exception:
+                    pass
+
+            # Update the first (pinned) post
             try:
                 async for msg in existing_thread.history(limit=1, oldest_first=True):
                     await msg.edit(embed=embed)
@@ -2107,6 +2197,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                     await existing_thread.send(embed=embed)
             except Exception as e:
                 print(f"[ARC-SEAT] Watch-list thread update failed: {e}")
+
         else:
             # Create new thread
             thread_name = (
@@ -2114,16 +2205,40 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                 f"  [{risk_level}]"
             )[:100]
             try:
-                thread, _ = await ch.create_thread(
+                existing_thread, _ = await ch.create_thread(
                     name=    thread_name,
                     content= discord_member.mention,
                     embed=   embed,
                 )
-                member_rec["watch_list_thread_id"] = thread.id
+                member_rec["watch_list_thread_id"] = existing_thread.id
                 data["members"][str(discord_member.id)] = member_rec
                 await save_seat_data(data)
             except Exception as e:
                 print(f"[ARC-SEAT] Could not create watch-list thread: {e}")
+                return   # can't post overflow without a thread
+
+        # ── Post overflow flags as a follow-up in the thread ─────────────────
+        if overflow_text and isinstance(existing_thread, discord.Thread):
+            if len(overflow_text) <= 1900:
+                try:
+                    await existing_thread.send(overflow_text)
+                except Exception as e:
+                    print(f"[ARC-SEAT] Overflow flags message failed: {e}")
+            else:
+                # Too long even for a message — attach as .txt
+                try:
+                    file_bytes = overflow_text.encode("utf-8")
+                    overflow_count = overflow_text.count("🔴") + overflow_text.count("🟡") + overflow_text.count("🟢") + overflow_text.count("⬜")
+                    attachment = discord.File(
+                        fp=io.BytesIO(file_bytes),
+                        filename=f"flags_{discord_member.id}.txt",
+                    )
+                    await existing_thread.send(
+                        content=f"📎 **{overflow_count} additional flag(s)** did not fit in the embed — see attached file.",
+                        file=attachment,
+                    )
+                except Exception as e:
+                    print(f"[ARC-SEAT] Overflow flags file failed: {e}")
 
     @staticmethod
     def _risk_colour(level: str) -> discord.Color:
