@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 # ============================================================
@@ -37,6 +37,9 @@ from discord import app_commands
 RECRUITER_ROLE = "Recruiter"
 ONBOARDER_ROLE = "Onboarder"
 GENESIS_ROLE   = "ARC Genesis"   # required alongside Onboarder for Onboarder shifts
+
+MAX_SHIFT_SECONDS    = 8 * 3600          # 8-hour hard cap on logged shift time
+OVERTIME_ALERT_USER_ID = 559041382573015060  # DM recipient when a shift exceeds 8 h
 
 APPROVAL_ROLES: set[str] = {
     "ARC Lieutenant",
@@ -417,6 +420,7 @@ class SchedulingCog(commands.Cog):
 
     async def cog_load(self):
         self.bot.loop.create_task(self._post_ready_init())
+        self._overtime_check.start()
 
     async def _post_ready_init(self):
         await self.bot.wait_until_ready()
@@ -427,6 +431,7 @@ class SchedulingCog(commands.Cog):
                 print(f"[scheduling] Setup failed for {guild.name} ({guild.id}): {exc}")
 
     async def cog_unload(self):
+        self._overtime_check.cancel()
         async with self._lock:
             atomic_write(STATE_FILE, self._state)
 
@@ -611,6 +616,65 @@ class SchedulingCog(commands.Cog):
         except Exception:
             pass
 
+    # ── Overtime helpers ───────────────────────────────────────────────────
+
+    async def _send_overtime_dm(self, member: discord.Member, shift_type: str, duration: int):
+        """DM the designated admin when a shift exceeds MAX_SHIFT_SECONDS."""
+        label = "Recruiter" if shift_type == "recruiter" else "Onboarder"
+        try:
+            alert_user = await self.bot.fetch_user(OVERTIME_ALERT_USER_ID)
+            await alert_user.send(
+                f"⚠️ **Overtime Alert**\n"
+                f"{member.mention} (`{member}`) exceeded the 8-hour shift cap on a "
+                f"**{label}** shift in **{member.guild.name}**.\n"
+                f"Actual duration: **{fmt_duration(duration)}** — logged as **{fmt_duration(MAX_SHIFT_SECONDS)}**."
+            )
+        except Exception as exc:
+            print(f"[scheduling] Could not DM overtime alert: {exc}")
+
+    @tasks.loop(minutes=5)
+    async def _overtime_check(self):
+        """Auto-end any shift that has silently passed the 8-hour mark."""
+        now = utcnow_ts()
+        for guild in self.bot.guilds:
+            gs = self._gs(guild.id)
+            for shift_type in ("recruiter", "onboarder"):
+                slot = gs["on_duty"].get(shift_type, {})
+                expired = [uid for uid, start_ts in slot.items()
+                           if (now - start_ts) >= MAX_SHIFT_SECONDS]
+                for uid in expired:
+                    start_ts = slot.pop(uid)
+                    duration  = now - start_ts
+                    gs["on_duty"][shift_type] = slot
+                    async with self._lock:
+                        self._save()
+
+                    label  = "Recruiter" if shift_type == "recruiter" else "Onboarder"
+                    member = guild.get_member(int(uid))
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(int(uid))
+                        except Exception:
+                            member = None
+
+                    # Notify the user their shift was auto-ended
+                    if member:
+                        try:
+                            await member.send(
+                                f"⏰ Your **{label}** shift in **{guild.name}** was automatically ended "
+                                f"after reaching the 8-hour maximum. "
+                                f"Duration logged: **{fmt_duration(MAX_SHIFT_SECONDS)}**."
+                            )
+                        except Exception:
+                            pass
+                        await self._send_overtime_dm(member, shift_type, duration)
+
+                    await self._refresh_on_duty(guild)
+
+    @_overtime_check.before_loop
+    async def _before_overtime_check(self):
+        await self.bot.wait_until_ready()
+
     # ── Shift handlers ─────────────────────────────────────────────────────
 
     async def handle_start_shift(self, interaction: discord.Interaction, shift_type: str):
@@ -671,9 +735,16 @@ class SchedulingCog(commands.Cog):
             self._save()
 
         duration = utcnow_ts() - start_ts
+        overtime = duration > MAX_SHIFT_SECONDS
+        logged_duration = min(duration, MAX_SHIFT_SECONDS)
+
         await interaction.response.send_message(
-            f"🔴 **{label}** shift ended. Duration: **{fmt_duration(duration)}**", ephemeral=True
+            f"🔴 **{label}** shift ended. Duration: **{fmt_duration(logged_duration)}**"
+            + (" *(capped at 8 h max)*" if overtime else ""),
+            ephemeral=True,
         )
+        if overtime:
+            await self._send_overtime_dm(member, shift_type, duration)
         await self._refresh_on_duty(guild)
 
     # ── Role request handlers ──────────────────────────────────────────────
