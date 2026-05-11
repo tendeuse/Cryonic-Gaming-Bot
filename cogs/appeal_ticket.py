@@ -13,6 +13,7 @@
 # - All data persists to /data/appeal_tickets.json
 
 import asyncio
+import io
 import json
 import os
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from discord import app_commands
 
 APPEAL_CHANNEL_NAME  = "appeal"
 TICKET_CATEGORY_NAME = "Tickets"
+ADMIN_LOG_CHANNEL_NAME = "administration"
 
 # Roles with access to every ticket
 STAFF_ROLES: tuple[str, ...] = (
@@ -212,6 +214,64 @@ class TicketView(discord.ui.View):
             )
             return
         await cog._handle_close_ticket(interaction, self.channel_id)
+
+
+# ============================================================
+# TRANSCRIPT HELPER
+# ============================================================
+
+async def _build_transcript(channel: discord.TextChannel, ticket: Dict[str, Any]) -> str:
+    """
+    Scrape all messages in *channel* and return a formatted plain-text transcript.
+    Messages are returned oldest-first.
+    """
+    lines: List[str] = [
+        "=" * 60,
+        f"  APPEAL TICKET TRANSCRIPT",
+        f"  Player  : {ticket.get('creator_name', 'Unknown')} (ID: {ticket.get('creator_id', '?')})",
+        f"  Channel : #{channel.name}",
+        f"  Opened  : {ticket.get('opened_at', 'Unknown')}",
+        f"  Closed  : {_utcnow()}",
+        "=" * 60,
+        "",
+    ]
+
+    messages: List[discord.Message] = []
+    async for msg in channel.history(limit=None, oldest_first=True):
+        messages.append(msg)
+
+    for msg in messages:
+        timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        author = f"{msg.author.display_name} ({msg.author})"
+
+        # Message content
+        content = msg.content or ""
+
+        # Embeds — summarise inline
+        for embed in msg.embeds:
+            parts = []
+            if embed.title:
+                parts.append(f"[Embed Title: {embed.title}]")
+            if embed.description:
+                parts.append(f"[Embed: {embed.description}]")
+            if parts:
+                content = (content + "\n" + "\n".join(parts)).strip()
+
+        # Attachments
+        for att in msg.attachments:
+            content = (content + f"\n[Attachment: {att.filename} — {att.url}]").strip()
+
+        if not content:
+            content = "<no text content>"
+
+        lines.append(f"[{timestamp}] {author}")
+        lines.append(f"  {content}")
+        lines.append("")
+
+    lines.append("=" * 60)
+    lines.append("  END OF TRANSCRIPT")
+    lines.append("=" * 60)
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -572,15 +632,53 @@ class AppealTicketCog(commands.Cog, name="AppealTicketCog"):
             "🔒 Closing this ticket in **5 seconds**…", ephemeral=False
         )
 
-        # Clean up persistence before deleting the channel
-        tickets.pop(str(channel_id), None)
-        data["tickets"] = tickets
-        await _save(data)
-
         await asyncio.sleep(5)
 
         channel = guild.get_channel(channel_id)
         if isinstance(channel, discord.TextChannel):
+            # ── Build & upload transcript to #administration ───────────────────
+            try:
+                transcript_text = await _build_transcript(channel, ticket or {})
+
+                # Determine a safe filename from the creator's name
+                creator_name: str = (ticket or {}).get("creator_name", "unknown")
+                safe_filename = "".join(
+                    c if (c.isalnum() or c in "-_.") else "_"
+                    for c in creator_name
+                ).strip("_")[:50] or "unknown"
+                filename = f"{safe_filename}.txt"
+
+                transcript_bytes = transcript_text.encode("utf-8")
+                transcript_file  = discord.File(
+                    fp=io.BytesIO(transcript_bytes),
+                    filename=filename,
+                )
+
+                admin_channel = discord.utils.get(
+                    guild.text_channels, name=ADMIN_LOG_CHANNEL_NAME
+                )
+                if admin_channel is not None:
+                    await admin_channel.send(
+                        content=(
+                            f"📋 **Appeal transcript** — `{creator_name}` "
+                            f"(closed by {member.mention})"
+                        ),
+                        file=transcript_file,
+                    )
+                else:
+                    print(
+                        f"[appeal_ticket] Could not find #{ADMIN_LOG_CHANNEL_NAME} "
+                        f"in '{guild.name}' — transcript not saved."
+                    )
+            except Exception as e:
+                print(f"[appeal_ticket] Transcript error: {e}")
+
+            # ── Clean up persistence ───────────────────────────────────────────
+            tickets.pop(str(channel_id), None)
+            data["tickets"] = tickets
+            await _save(data)
+
+            # ── Delete the ticket channel ──────────────────────────────────────
             try:
                 await channel.delete(
                     reason=f"Appeal ticket closed by {member} ({member.id})"
@@ -590,6 +688,11 @@ class AppealTicketCog(commands.Cog, name="AppealTicketCog"):
                 pass
             except discord.HTTPException as e:
                 print(f"[appeal_ticket] Channel delete error: {e}")
+        else:
+            # Channel already gone — still clean up the record
+            tickets.pop(str(channel_id), None)
+            data["tickets"] = tickets
+            await _save(data)
 
     # ----------------------------------------------------------------
     # /appeal_setup — manual panel refresh
