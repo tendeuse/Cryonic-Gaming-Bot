@@ -1757,9 +1757,15 @@ class EventCreator(commands.Cog):
         # _vc_cumulative:  {event_id: {user_id: total_seconds_so_far}}
         #   Accumulated VC time since tracking began.
         #   Persisted to disk every 2 min by _vc_save_loop.
+        #
+        # _vc_pulled:      {event_id: set(user_id, ...)}
+        #   Members who have already been pulled into the event VC once.
+        #   Once a member is in this set they are NEVER force-moved again,
+        #   so leaving the event VC is always voluntary.
         self._vc_event_map:  Dict[int, str]            = {}
         self._vc_join_times: Dict[str, Dict[int, int]] = {}
         self._vc_cumulative: Dict[str, Dict[int, int]] = {}
+        self._vc_pulled:     Dict[str, Set[int]]       = {}
 
         if not self.presence_loop.is_running():
             self.presence_loop.start()
@@ -1979,6 +1985,7 @@ class EventCreator(commands.Cog):
             # ── 5. Pull RSVP'd members who are already in a VC ──────────────
             participants = compute_participants(event)
             pulled       = 0
+            pulled_set   = self._vc_pulled.setdefault(event_id, set())
             for pid in participants:
                 member = guild.get_member(pid)
                 if not member:
@@ -1989,6 +1996,7 @@ class EventCreator(commands.Cog):
                             event_vc,
                             reason="Event started — moved to event VC",
                         )
+                        pulled_set.add(pid)
                         pulled += 1
                     except Exception:
                         pass  # member may have left VC between check and move
@@ -2085,8 +2093,9 @@ class EventCreator(commands.Cog):
             return   # Nothing else to do
 
         # ── C: RSVP'd member joined a NON-event VC ───────────────────────────
-        # Pull them into the event VC for their guild (if exactly one active
-        # event VC exists in this guild and they have a valid RSVP).
+        # Pull them into the event VC for their guild ONLY if they have not
+        # been pulled before. Once pulled (at event start or first join),
+        # the member is free to leave voluntarily without being dragged back.
         if after.channel and not joined_event_vc:
             guild = member.guild
             # Find any event VC in this guild
@@ -2094,6 +2103,11 @@ class EventCreator(commands.Cog):
                 event_vc = guild.get_channel(vc_id)
                 if not isinstance(event_vc, discord.VoiceChannel):
                     continue
+
+                # Skip if this member has already been pulled for this event
+                pulled_set = self._vc_pulled.setdefault(event_id, set())
+                if member.id in pulled_set:
+                    break
 
                 data  = await load_events()
                 event = data.get(event_id)
@@ -2107,8 +2121,9 @@ class EventCreator(commands.Cog):
                     try:
                         await member.move_to(
                             event_vc,
-                            reason="Event in progress — RSVP'd member joined a VC",
+                            reason="Event in progress — RSVP'd member joined a VC (first pull only)",
                         )
+                        pulled_set.add(member.id)
                     except Exception:
                         pass
                     # The resulting on_voice_state_update for the move into
@@ -2301,6 +2316,7 @@ class EventCreator(commands.Cog):
         self._vc_event_map.pop(vc_id, None)
         self._vc_join_times.pop(event_id, None)
         self._vc_cumulative.pop(event_id, None)
+        self._vc_pulled.pop(event_id, None)
 
         print(
             f"[event_creator] Event '{event_title}' finalized. "
@@ -2480,6 +2496,127 @@ class EventCreator(commands.Cog):
                 ephemeral=True,
             )
 
+
+    # ----------------------------------------------------------------
+    # /close_event
+    # ----------------------------------------------------------------
+
+    # Roles permitted to forcibly close any event (in addition to server admins)
+    CLOSE_EVENT_ROLES: Set[str] = {
+        "ARC Security Corporation Leader",
+        "ARC Security Administration Council",
+        "ARC General",
+    }
+
+    @app_commands.command(
+        name="close_event",
+        description="[Leadership] Finalize and close an active event, awarding AP to qualified attendees.",
+    )
+    @app_commands.describe(
+        event_title="Exact or partial title of the event to close.",
+    )
+    async def close_event(
+        self,
+        interaction: discord.Interaction,
+        event_title: str,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        # ── Authorization check ───────────────────────────────────────────────
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.followup.send("Must be used in a server.", ephemeral=True)
+            return
+
+        is_admin       = interaction.user.guild_permissions.administrator
+        has_close_role = any(
+            r.name in self.CLOSE_EVENT_ROLES for r in interaction.user.roles
+        )
+        if not (is_admin or has_close_role):
+            await interaction.followup.send(
+                "❌ You are not authorised to close events.\n"
+                "Required roles: **ARC Security Corporation Leader**, "
+                "**ARC Security Administration Council**, or **ARC General**.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("Must be used in a server.", ephemeral=True)
+            return
+
+        # ── Find the event ────────────────────────────────────────────────────
+        data         = await load_events()
+        search_lower = event_title.strip().lower()
+
+        candidates = [
+            (eid, e)
+            for eid, e in data.items()
+            if isinstance(e, dict)
+            and search_lower in str(e.get("title", "")).lower()
+            and (e.get("active", True) and not e.get("closed", False))
+        ]
+
+        if not candidates:
+            await interaction.followup.send(
+                f"❌ No **active** event matching **\"{event_title}\"** was found.\n"
+                "Check the title spelling or use `/event_log` to browse events.",
+                ephemeral=True,
+            )
+            return
+
+        if len(candidates) > 1:
+            lines = "\n".join(
+                f"• `{eid[:8]}…` — **{e.get('title')}** "
+                f"(<t:{e.get('timestamp', 0)}:d>)"
+                for eid, e in candidates[:10]
+            )
+            await interaction.followup.send(
+                f"⚠️ Multiple active events matched. Please be more specific:\n{lines}",
+                ephemeral=True,
+            )
+            return
+
+        event_id, event = candidates[0]
+        event           = normalize_event(event)
+        true_title      = str(event.get("title", "Event"))
+
+        # ── Confirm intent before finalizing ─────────────────────────────────
+        confirm_view = _CloseEventConfirmView(
+            invoker=    interaction.user,
+            cog=        self,
+            event_id=   event_id,
+            event_title=true_title,
+        )
+
+        creator_id = event.get("creator")
+        creator_m  = guild.get_member(creator_id) if isinstance(creator_id, int) else None
+        ts         = event.get("timestamp", 0)
+
+        confirm_embed = discord.Embed(
+            title=       f"⚠️ Close Event — Confirm",
+            description= (
+                f"You are about to **finalize and close** this event.\n\n"
+                f"**Title:** {true_title}\n"
+                f"**Creator:** {creator_m.mention if creator_m else f'<@{creator_id}>'}\n"
+                f"**Scheduled:** <t:{ts}:F>\n\n"
+                "This will:\n"
+                "• Lock in all VC attendance times\n"
+                "• Award AP to qualified members (≥15 min)\n"
+                "• Move remaining members to **ARC Main**\n"
+                "• Delete the event voice channel\n"
+                "• Mark the event as **Closed**\n\n"
+                "**This cannot be undone.**"
+            ),
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        confirm_embed.set_footer(text=f"Event ID: {event_id}")
+
+        msg = await interaction.followup.send(
+            embed=confirm_embed, view=confirm_view, ephemeral=True
+        )
+        confirm_view.preview_msg = msg
 
     # ----------------------------------------------------------------
     # /retro_event_ap
@@ -2683,6 +2820,98 @@ class EventCreator(commands.Cog):
             embed=preview, view=view, ephemeral=True
         )
         view.preview_msg = msg
+
+
+class _CloseEventConfirmView(discord.ui.View):
+    """
+    Two-button confirmation shown ephemerally when a leadership member runs
+    /close_event.  Only the invoking member can press the buttons.
+    Timeout = 5 minutes.
+    """
+
+    def __init__(
+        self,
+        invoker:     discord.Member,
+        cog:         "EventCreator",
+        event_id:    str,
+        event_title: str,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.invoker     = invoker
+        self.cog         = cog
+        self.event_id    = event_id
+        self.event_title = event_title
+        self.preview_msg: Optional[discord.Message] = None
+
+    def _auth(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.invoker.id
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        self.stop()
+
+    @discord.ui.button(label="✅ Confirm — Close Event", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._auth(interaction):
+            await interaction.response.send_message(
+                "❌ Only the member who ran this command can confirm.", ephemeral=True
+            )
+            return
+
+        button.disabled = True
+        button.label    = "⏳ Closing…"
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception:
+            await interaction.response.defer()
+
+        self._disable_all()
+
+        # Delegate to the shared finalization helper
+        await self.cog._finalize_event(
+            interaction=interaction,
+            event_id=   self.event_id,
+        )
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._auth(interaction):
+            await interaction.response.send_message(
+                "❌ Only the member who ran this command can cancel.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        self._disable_all()
+
+        cancel_embed = discord.Embed(
+            title=       "🚫 Close Event Cancelled",
+            description= "No changes were made.",
+            color=       discord.Color.greyple(),
+        )
+        if self.preview_msg:
+            try:
+                await self.preview_msg.edit(embed=cancel_embed, view=self)
+            except Exception:
+                pass
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
+        if self.preview_msg:
+            try:
+                timeout_embed = discord.Embed(
+                    title=       "⏰ Close Event Timed Out",
+                    description= "No confirmation received within 5 minutes. The event was not closed.",
+                    color=       discord.Color.orange(),
+                )
+                await self.preview_msg.edit(embed=timeout_embed, view=self)
+            except Exception:
+                pass
 
 
 class RetroApConfirmView(discord.ui.View):
