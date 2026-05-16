@@ -793,15 +793,115 @@ class APClaimGameView(discord.ui.View):
         await interaction.response.send_modal(APClaimIGNModal(game_value=GAME_WOW))
 
 # -------------------------
+# Batch-award helper (no I/O — caller owns load/save)
+# -------------------------
+def _apply_ap_to_data(
+    data: Dict[str, Any],
+    earner: discord.Member,
+    base_amount: float,
+    source: str,
+    reason: Optional[str],
+    ceo_id_list: List[int],
+    director_id_list: List[int],
+    boosts: Dict[str, Any],
+) -> Tuple[List[int], List[Tuple[int, float, str]], bool]:
+    """
+    Apply one AP award (base + leadership bonuses + event boosts) directly to
+    *data* without any file I/O.  The caller is responsible for a single
+    load() before the batch and a single save() afterwards.
+
+    Returns:
+        mention_ids   – list of member IDs involved in the transaction
+        boost_awards  – list of (beneficiary_id, bonus_amount, event_id)
+        boosts_changed – whether *boosts* was mutated (caller should save it)
+    """
+    if base_amount <= 0:
+        return ([], [], False)
+
+    rec = data.setdefault(str(earner.id), {"ap": 0, "last_chat": None})
+    rec["ap"] = safe_float_ap(rec.get("ap", 0)) + float(base_amount)
+    append_audit(data, earner.id, base_amount, source, reason=reason)
+
+    mention_ids: List[int] = [earner.id]
+
+    if has_role_name(earner, SECURITY_ROLE):
+        ceo_set = set(ceo_id_list)
+        eligible_directors = [uid for uid in director_id_list if uid not in ceo_set]
+
+        # CEO: +10% each (not divided)
+        if ceo_id_list:
+            ceo_bonus = base_amount * 0.10
+            ceo_src   = f"leadership bonus (CEO) from {earner.display_name} via {source}"
+            for uid in ceo_id_list:
+                r = data.setdefault(str(uid), {"ap": 0, "last_chat": None})
+                r["ap"] = safe_float_ap(r.get("ap", 0)) + ceo_bonus
+                append_audit(data, uid, ceo_bonus, ceo_src, reason=reason, actor_id=earner.id)
+            mention_ids.extend(ceo_id_list)
+
+        # Directors: 10% pool split evenly
+        if eligible_directors:
+            dir_each = (base_amount * 0.10) / float(len(eligible_directors))
+            dir_src  = f"leadership bonus (Director) from {earner.display_name} via {source}"
+            for uid in eligible_directors:
+                r = data.setdefault(str(uid), {"ap": 0, "last_chat": None})
+                r["ap"] = safe_float_ap(r.get("ap", 0)) + dir_each
+                append_audit(data, uid, dir_each, dir_src, reason=reason, actor_id=earner.id)
+            mention_ids.extend(eligible_directors)
+
+    # Event presence boosts
+    boost_awards, boosts_changed = _apply_participant_boosts(
+        boosts,
+        participant_id=earner.id,
+        base_amount=float(base_amount),
+    )
+    for beneficiary_id, bonus_amount, event_id in boost_awards:
+        r = data.setdefault(str(beneficiary_id), {"ap": 0, "last_chat": None})
+        r["ap"] = safe_float_ap(r.get("ap", 0)) + float(bonus_amount)
+        append_audit(
+            data, beneficiary_id, float(bonus_amount),
+            f"event boost (event {event_id}) from participant {earner.display_name}",
+            actor_id=earner.id,
+        )
+        mention_ids.append(beneficiary_id)
+
+    return (mention_ids, boost_awards, boosts_changed)
+
+
+# -------------------------
 # Cog
 # -------------------------
 class APTracking(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # Cache of {guild_id: (ceo_id_list, director_id_list)}.
+        # Built on ready and refreshed whenever a member's roles change.
+        # Avoids iterating all guild members on every voice/chat tick.
+        self._leadership_cache: Dict[int, Tuple[List[int], List[int]]] = {}
         if not self.voice_loop.is_running():
             self.voice_loop.start()
         if not self.chat_loop.is_running():
             self.chat_loop.start()
+
+    # -------------------------
+    # Leadership ID cache helpers
+    # -------------------------
+    def _refresh_leadership_cache(self, guild: discord.Guild) -> None:
+        """Recompute CEO / Director ID lists for *guild* and store in cache."""
+        ceos = [
+            m.id for m in guild.members
+            if isinstance(m, discord.Member) and has_role_name(m, CEO_ROLE)
+        ]
+        dirs = [
+            m.id for m in guild.members
+            if isinstance(m, discord.Member) and has_role_name(m, DIRECTORS_ROLE)
+        ]
+        self._leadership_cache[guild.id] = (ceos, dirs)
+
+    def _get_leadership_ids(self, guild: discord.Guild) -> Tuple[List[int], List[int]]:
+        """Return (ceo_ids, director_ids) for *guild*, populating cache on first call."""
+        if guild.id not in self._leadership_cache:
+            self._refresh_leadership_cache(guild)
+        return self._leadership_cache[guild.id]
 
     async def _patch_channel_overwrites_preserve_everyone(
         self,
@@ -885,9 +985,16 @@ class APTracking(commands.Cog):
         await save(data)
 
     @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        """Invalidate the leadership cache whenever a member's roles change."""
+        if before.roles != after.roles and after.guild:
+            self._refresh_leadership_cache(after.guild)
+
+    @commands.Cog.listener()
     async def on_ready(self):
         self.bot.add_view(APCheckView())
         for g in self.bot.guilds:
+            self._refresh_leadership_cache(g)
             await self.ensure_ap_check_message(g)
             await ensure_hierarchy_log_channel(g)
             await ensure_ap_distribution_channel(g)
@@ -937,7 +1044,14 @@ class APTracking(commands.Cog):
 
     @tasks.loop(seconds=VOICE_INTERVAL)
     async def voice_loop(self):
+        # Single load/save per tick; yield to the event loop between members
+        # so the Discord heartbeat is never starved.
+        boosts: Dict[str, Any] = _load_boosts_file()
+        boosts_changed = False
+        data = await load()
+
         for guild in self.bot.guilds:
+            ceos, dirs = self._get_leadership_ids(guild)
             for vc in guild.voice_channels:
                 if vc == guild.afk_channel:
                     continue
@@ -953,21 +1067,26 @@ class APTracking(commands.Cog):
                 if len(members) < 2:
                     continue
                 for m in members:
-                    await award_ap_with_bonuses(
-                        guild=guild,
-                        earner=m,
-                        base_amount=float(VOICE_AP),
-                        source="voice",
-                        reason=None,
-                        log=False
+                    _apply_ap_to_data(
+                        data, m, float(VOICE_AP), "voice", None,
+                        ceos, dirs, boosts,
                     )
+                    await asyncio.sleep(0)   # yield so heartbeat isn't blocked
+
+        await save(data)
+        if boosts_changed:
+            _save_boosts_file(boosts)
 
     @tasks.loop(seconds=CHAT_INTERVAL)
     async def chat_loop(self):
-        now  = datetime.datetime.utcnow()
-        data = await load()
+        now    = datetime.datetime.utcnow()
+        boosts: Dict[str, Any] = _load_boosts_file()
+        boosts_changed = False
+        data   = await load()
+
         for guild in self.bot.guilds:
-            for m in guild.members:
+            ceos, dirs = self._get_leadership_ids(guild)
+            for i, m in enumerate(guild.members):
                 if not isinstance(m, discord.Member) or m.bot:
                     continue
                 if is_alt_account(m):
@@ -983,14 +1102,19 @@ class APTracking(commands.Cog):
                 except ValueError:
                     continue
                 if (now - last).total_seconds() <= CHAT_INTERVAL:
-                    await award_ap_with_bonuses(
-                        guild=guild,
-                        earner=m,
-                        base_amount=float(CHAT_AP),
-                        source="chat",
-                        reason=None,
-                        log=False
+                    _, _, changed = _apply_ap_to_data(
+                        data, m, float(CHAT_AP), "chat", None,
+                        ceos, dirs, boosts,
                     )
+                    if changed:
+                        boosts_changed = True
+                # Yield every 50 members to stay cooperative
+                if i % 50 == 0:
+                    await asyncio.sleep(0)
+
+        await save(data)
+        if boosts_changed:
+            _save_boosts_file(boosts)
 
     # -------------------------
     # Slash Commands
