@@ -3,8 +3,8 @@
 # ARC Security Corp Transfer Application Ticket System
 # =====================================================
 # - Posts a persistent "Apply to ARC Security" button panel in #corp-transfer
-# - Clicking "Apply" walks the applicant through 4 modal dialogs (Discord
-#   allows a maximum of 5 fields per modal, so 16 fields span 4 modals)
+# - Clicking "Apply" opens a DM conversation where the bot asks each of the
+#   16 application questions one at a time; the applicant replies to each
 # - After all answers are submitted a private ticket channel is created,
 #   visible only to:
 #     • The applicant
@@ -120,12 +120,37 @@ def _staff_roles(guild: discord.Guild) -> List[discord.Role]:
 
 
 # ============================================================
+# APPLICATION QUESTIONS
+# ============================================================
+# Ordered list of (answer_key, prompt) tuples — one DM per question.
+
+APPLICATION_QUESTIONS: List[tuple[str, str]] = [
+    ("char_name", "**[1 / 16]** What is your **Main Character / Discord Name**?"),
+    ("q1",  "**[2 / 16]** How long have you been playing EVE?"),
+    ("q2",  "**[3 / 16]** How long have you been a member of **ARC Subsidized**?"),
+    ("q3",  "**[4 / 16]** What is your **Timezone / Play schedule** like?"),
+    ("q4",  "**[5 / 16]** Do you have a history in any other corporations in EVE?\n*(List any previous corps and briefly explain)*"),
+    ("q5",  "**[6 / 16]** Have you completed the **Required Skill Plan(s)** to enter ARC Security?\n*(Yes / No / Partially — please explain)*"),
+    ("q6",  "**[7 / 16]** Have you attended any of our **organised classes and/or fleets**?\n*(Which ones? How many?)*"),
+    ("q7",  "**[8 / 16]** Why do you want to join a **Wormhole corporation**?"),
+    ("q8",  "**[9 / 16]** What makes you think **ARC Security** is the right Wormhole Corporation for you?"),
+    ("q9",  "**[10 / 16]** Tell us what you **bring to the table** as a member of ARC Security."),
+    ("q10", "**[11 / 16]** What are your **goals** personally in EVE and the Corporation?"),
+    ("q11", "**[12 / 16]** Tell us about an **exciting or educational experience** you had in ARC Subsidized."),
+    ("q12", "**[13 / 16]** Do you have members of ARC Security who would **support your move**?\n*(Names, or \"None that I'm aware of\")*"),
+    ("q13", "**[14 / 16]** Are you willing to come to the **defense of our home system / alliance** when needed?\n*(Yes / No / Comments — real life first is understood)*"),
+    ("q14", "**[15 / 16]** Are you willing to **delay personal skill goals** for corp PvP fits?\n*(Yes / No / Comments)*"),
+    ("q15", "**[16 / 16]** Share a little about **yourself outside of EVE** — as much or as little as you'd like. 🙂"),
+]
+
+# ============================================================
 # IN-MEMORY APPLICATION STATE
 # ============================================================
-# Stores partial modal answers while the user works through all 4 modals.
-# Keyed by Discord user ID.  Cleared once the ticket is created (or on error).
+# Keyed by Discord user ID.
+# Each entry: {"step": int, "guild_id": int, "answers": {key: str}}
+# Cleared once the ticket is created (or on error).
 
-_pending_applications: Dict[int, Dict[str, str]] = {}
+_pending_applications: Dict[int, Dict[str, Any]] = {}
 
 
 # ============================================================
@@ -138,9 +163,11 @@ def _build_panel_embed() -> discord.Embed:
         description=(
             "Ready to make the jump into wormhole space with ARC Security? "
             "Click the **Apply** button below to begin your application.\n\n"
-            "A short series of questions will appear — please answer each one "
-            "honestly and thoughtfully. Once submitted, a private application "
-            "ticket will be opened for review by **ARC Security leadership**.\n\n"
+            "The bot will **send you a DM** and ask you **16 short questions** "
+            "one at a time — simply reply to each message. Once all questions are "
+            "answered a private application ticket will be opened for review by "
+            "**ARC Security leadership**.\n\n"
+            "⚠️ Make sure your **DMs are open** for members of this server.\n"
             "⚠️ You may only have **one open application** at a time."
         ),
         color=discord.Color.orange(),
@@ -203,233 +230,6 @@ def _build_ticket_embed(
         embed.add_field(name=label, value=value, inline=False)
 
     return embed
-
-
-# ============================================================
-# MODALS  (4 modals × ≤5 fields each = 16 fields total)
-# ============================================================
-
-class ApplicationModal1(discord.ui.Modal, title="ARC Security Application — Part 1 of 4"):
-    """Character name + Questions 1–4."""
-
-    char_name = discord.ui.TextInput(
-        label="Main Character / Discord Name",
-        placeholder="Your EVE main character name and/or Discord username",
-        style=discord.TextStyle.short,
-        max_length=200,
-        required=True,
-    )
-    q1 = discord.ui.TextInput(
-        label="1. How long have you been playing EVE?",
-        placeholder="e.g. 3 years, since 2019 …",
-        style=discord.TextStyle.short,
-        max_length=300,
-        required=True,
-    )
-    q2 = discord.ui.TextInput(
-        label="2. How long in ARC Subsidized?",
-        placeholder="e.g. 6 months",
-        style=discord.TextStyle.short,
-        max_length=300,
-        required=True,
-    )
-    q3 = discord.ui.TextInput(
-        label="3. Timezone / Play schedule?",
-        placeholder="e.g. EU TZ, evenings weekdays + weekends",
-        style=discord.TextStyle.short,
-        max_length=300,
-        required=True,
-    )
-    q4 = discord.ui.TextInput(
-        label="4. History in other EVE corporations?",
-        placeholder="List any previous corps and briefly explain",
-        style=discord.TextStyle.paragraph,
-        max_length=1000,
-        required=True,
-    )
-
-    def __init__(self, cog: "CorpTransferCog") -> None:
-        super().__init__()
-        self._cog = cog
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        uid = interaction.user.id
-        _pending_applications[uid] = {
-            "char_name": self.char_name.value,
-            "q1": self.q1.value,
-            "q2": self.q2.value,
-            "q3": self.q3.value,
-            "q4": self.q4.value,
-        }
-        # Immediately open the next modal
-        await interaction.response.send_modal(ApplicationModal2(self._cog))
-
-    async def on_error(
-        self, interaction: discord.Interaction, error: Exception
-    ) -> None:
-        print(f"[corp_transfer] Modal1 error: {error}")
-        await interaction.response.send_message(
-            "❌ An error occurred processing Part 1. Please try again.", ephemeral=True
-        )
-
-
-class ApplicationModal2(discord.ui.Modal, title="ARC Security Application — Part 2 of 4"):
-    """Questions 5–9."""
-
-    q5 = discord.ui.TextInput(
-        label="5. Completed the Required Skill Plan(s)?",
-        placeholder="Yes / No / Partially — please explain",
-        style=discord.TextStyle.short,
-        max_length=500,
-        required=True,
-    )
-    q6 = discord.ui.TextInput(
-        label="6. Attended organised classes / fleets?",
-        placeholder="Which ones? How many?",
-        style=discord.TextStyle.paragraph,
-        max_length=500,
-        required=True,
-    )
-    q7 = discord.ui.TextInput(
-        label="7. Why do you want to join a Wormhole corp?",
-        style=discord.TextStyle.paragraph,
-        max_length=800,
-        required=True,
-    )
-    q8 = discord.ui.TextInput(
-        label="8. Why is ARC Security the right Wormhole corp?",
-        style=discord.TextStyle.paragraph,
-        max_length=800,
-        required=True,
-    )
-    q9 = discord.ui.TextInput(
-        label="9. What do you bring to ARC Security?",
-        style=discord.TextStyle.paragraph,
-        max_length=800,
-        required=True,
-    )
-
-    def __init__(self, cog: "CorpTransferCog") -> None:
-        super().__init__()
-        self._cog = cog
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        uid = interaction.user.id
-        existing = _pending_applications.setdefault(uid, {})
-        existing.update({
-            "q5": self.q5.value,
-            "q6": self.q6.value,
-            "q7": self.q7.value,
-            "q8": self.q8.value,
-            "q9": self.q9.value,
-        })
-        await interaction.response.send_modal(ApplicationModal3(self._cog))
-
-    async def on_error(
-        self, interaction: discord.Interaction, error: Exception
-    ) -> None:
-        print(f"[corp_transfer] Modal2 error: {error}")
-        await interaction.response.send_message(
-            "❌ An error occurred processing Part 2. Please try again.", ephemeral=True
-        )
-
-
-class ApplicationModal3(discord.ui.Modal, title="ARC Security Application — Part 3 of 4"):
-    """Questions 10–14."""
-
-    q10 = discord.ui.TextInput(
-        label="10. Goals in EVE and the Corporation?",
-        style=discord.TextStyle.paragraph,
-        max_length=800,
-        required=True,
-    )
-    q11 = discord.ui.TextInput(
-        label="11. Exciting / educational ARC Subsidized experience?",
-        style=discord.TextStyle.paragraph,
-        max_length=800,
-        required=True,
-    )
-    q12 = discord.ui.TextInput(
-        label="12. ARC Security members who'd support your move?",
-        placeholder="Names, or 'None that I'm aware of'",
-        style=discord.TextStyle.paragraph,
-        max_length=500,
-        required=True,
-    )
-    q13 = discord.ui.TextInput(
-        label="13. Willing to defend home / alliance as needed?",
-        placeholder="Yes / No / Comments (real life first is understood)",
-        style=discord.TextStyle.short,
-        max_length=300,
-        required=True,
-    )
-    q14 = discord.ui.TextInput(
-        label="14. Willing to delay personal skills for corp PvP fits?",
-        placeholder="Yes / No / Comments",
-        style=discord.TextStyle.short,
-        max_length=300,
-        required=True,
-    )
-
-    def __init__(self, cog: "CorpTransferCog") -> None:
-        super().__init__()
-        self._cog = cog
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        uid = interaction.user.id
-        existing = _pending_applications.setdefault(uid, {})
-        existing.update({
-            "q10": self.q10.value,
-            "q11": self.q11.value,
-            "q12": self.q12.value,
-            "q13": self.q13.value,
-            "q14": self.q14.value,
-        })
-        await interaction.response.send_modal(ApplicationModal4(self._cog))
-
-    async def on_error(
-        self, interaction: discord.Interaction, error: Exception
-    ) -> None:
-        print(f"[corp_transfer] Modal3 error: {error}")
-        await interaction.response.send_message(
-            "❌ An error occurred processing Part 3. Please try again.", ephemeral=True
-        )
-
-
-class ApplicationModal4(discord.ui.Modal, title="ARC Security Application — Part 4 of 4"):
-    """Question 15 — final modal, triggers ticket creation."""
-
-    q15 = discord.ui.TextInput(
-        label="15. Tell us about yourself outside of EVE.",
-        placeholder="Share as much or as little as you'd like us to know.",
-        style=discord.TextStyle.paragraph,
-        max_length=1000,
-        required=True,
-    )
-
-    def __init__(self, cog: "CorpTransferCog") -> None:
-        super().__init__()
-        self._cog = cog
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        uid = interaction.user.id
-        existing = _pending_applications.setdefault(uid, {})
-        existing["q15"] = self.q15.value
-
-        # All answers collected — hand off to the cog to create the ticket
-        answers = dict(existing)
-        _pending_applications.pop(uid, None)
-
-        await interaction.response.defer(ephemeral=True)
-        await self._cog._create_ticket(interaction, answers)
-
-    async def on_error(
-        self, interaction: discord.Interaction, error: Exception
-    ) -> None:
-        print(f"[corp_transfer] Modal4 error: {error}")
-        await interaction.response.send_message(
-            "❌ An error occurred processing Part 4. Please try again.", ephemeral=True
-        )
 
 
 # ============================================================
@@ -700,7 +500,7 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
             )
 
     # ----------------------------------------------------------------
-    # "Apply" button handler — opens Modal 1
+    # "Apply" button handler — starts the DM interview
     # ----------------------------------------------------------------
 
     async def _handle_open_application(
@@ -739,27 +539,133 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
                 await _save(data)
                 break
 
-        # Open the first modal (the interaction response must be a modal)
-        await interaction.response.send_modal(ApplicationModal1(self))
-
-    # ----------------------------------------------------------------
-    # Ticket creation — called after all 4 modals are submitted
-    # ----------------------------------------------------------------
-
-    async def _create_ticket(
-        self,
-        interaction: discord.Interaction,
-        answers: Dict[str, str],
-    ) -> None:
-        """Create the private ticket channel and post the application inside it."""
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.followup.send(
-                "❌ This must be used inside the server.", ephemeral=True
+        # ── Guard: already in progress ────────────────────────────────────────
+        if member.id in _pending_applications:
+            await interaction.response.send_message(
+                "⚠️ You already have an application in progress in your DMs! "
+                "Please finish answering there, or type `cancel` to start over.",
+                ephemeral=True,
             )
             return
 
-        guild  = interaction.guild
-        member = interaction.user
+        # ── Open a DM and send the first question ─────────────────────────────
+        try:
+            dm = await member.create_dm()
+            await dm.send(
+                "👋 **Welcome to the ARC Security Corp Transfer Application!**\n\n"
+                "I'll ask you **16 questions** one at a time. Simply reply to each "
+                "message here in this DM.\n"
+                "Type `cancel` at any time to abort the application.\n\n"
+                "─────────────────────────────\n"
+                + APPLICATION_QUESTIONS[0][1]
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I couldn't send you a DM. Please **enable DMs from server members** "
+                "(User Settings → Privacy & Safety) and try again.",
+                ephemeral=True,
+            )
+            return
+
+        # Initialise state
+        _pending_applications[member.id] = {
+            "step":     0,
+            "guild_id": guild.id,
+            "answers":  {},
+        }
+
+        await interaction.response.send_message(
+            "📬 Check your DMs — I've sent you the first question!",
+            ephemeral=True,
+        )
+
+    # ----------------------------------------------------------------
+    # DM listener — advances the application one question at a time
+    # ----------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Handle applicant replies inside DMs."""
+        # Only care about DMs from real users
+        if message.guild is not None:
+            return
+        if message.author.bot:
+            return
+
+        uid = message.author.id
+        state = _pending_applications.get(uid)
+        if state is None:
+            return  # not an active applicant
+
+        # ── Cancel ───────────────────────────────────────────────────────────
+        if message.content.strip().lower() == "cancel":
+            _pending_applications.pop(uid, None)
+            await message.channel.send(
+                "❌ Application cancelled. You can start over by clicking **Apply** "
+                "in the server whenever you're ready."
+            )
+            return
+
+        # ── Record the answer for the current step ────────────────────────────
+        step    = state["step"]
+        key, _  = APPLICATION_QUESTIONS[step]
+        answer  = message.content.strip()
+
+        if not answer:
+            await message.channel.send("⚠️ Please send a non-empty reply.")
+            return
+
+        state["answers"][key] = answer
+        next_step = step + 1
+        state["step"] = next_step
+
+        # ── More questions? ───────────────────────────────────────────────────
+        if next_step < len(APPLICATION_QUESTIONS):
+            _, prompt = APPLICATION_QUESTIONS[next_step]
+            await message.channel.send(prompt)
+            return
+
+        # ── All questions answered — create the ticket ────────────────────────
+        answers = dict(state["answers"])
+        guild_id = state["guild_id"]
+        _pending_applications.pop(uid, None)
+
+        await message.channel.send(
+            "✅ All questions answered! Creating your application ticket now — "
+            "please wait a moment…"
+        )
+
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await message.channel.send(
+                "❌ Could not find the server. Please contact an admin."
+            )
+            return
+
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except discord.HTTPException:
+                await message.channel.send(
+                    "❌ Could not find you in the server. Please contact an admin."
+                )
+                return
+
+        await self._create_ticket_from_dm(member, guild, answers, message.channel)
+
+    # ----------------------------------------------------------------
+    # Ticket creation — called after all DM questions are answered
+    # ----------------------------------------------------------------
+
+    async def _create_ticket_from_dm(
+        self,
+        member: discord.Member,
+        guild: discord.Guild,
+        answers: Dict[str, str],
+        dm_channel: discord.DMChannel,
+    ) -> None:
+        """Create the private ticket channel and post the application inside it."""
 
         # ── Build permission overwrites ───────────────────────────────────────
         bot_member = guild.get_member(self.bot.user.id) if self.bot.user else None
@@ -821,17 +727,13 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
                 reason=f"Corp transfer application by {member} ({member.id})",
             )
         except discord.Forbidden:
-            await interaction.followup.send(
+            await dm_channel.send(
                 "❌ I don't have permission to create ticket channels. "
-                "Please contact an admin.",
-                ephemeral=True,
+                "Please contact an admin."
             )
             return
         except discord.HTTPException as e:
-            await interaction.followup.send(
-                f"❌ Failed to create ticket channel: `{e}`",
-                ephemeral=True,
-            )
+            await dm_channel.send(f"❌ Failed to create ticket channel: `{e}`")
             return
 
         # ── Post the ticket embed + Close button ──────────────────────────────
@@ -869,10 +771,9 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
         data["tickets"] = tickets
         await _save(data)
 
-        await interaction.followup.send(
-            f"✅ Your application ticket has been created: {ticket_channel.mention}\n"
-            "Leadership will review it and get back to you there.",
-            ephemeral=True,
+        await dm_channel.send(
+            f"✅ Your application ticket has been created: **#{ticket_channel.name}**\n"
+            "ARC Security leadership will review it and get back to you there."
         )
 
     # ----------------------------------------------------------------
