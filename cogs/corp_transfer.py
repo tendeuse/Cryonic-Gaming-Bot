@@ -1,677 +1,1308 @@
 # cogs/corp_transfer.py
 #
-# Corporation Transfer Application System
-# ========================================
-#
-# FEATURES
-# --------
-# 1. /post_transfer_panel  — leadership posts a persistent embed + "Apply" button
-#    in #wormhole-transfer-request.
-#
-# 2. Apply button  — starts an ephemeral Yes/No questionnaire for the member.
-#    Five questions asked one at a time; the ephemeral message is edited in place
-#    between questions so nothing spills into the channel.
-#
-# 3. On completion  — the full set of answers is logged as an embed to
-#    #transfer-application with three action buttons for leadership:
-#      • 📞 Reached Out  — records who reached out and when (repeatable)
-#      • ✅ Accepted      — final decision; disables all 3 buttons
-#      • ❌ Rejected      — final decision; disables all 3 buttons
-#
-# PERSISTENCE
-# -----------
-# • The "Apply" panel button is persistent (timeout=None) — re-registered on
-#   every on_ready so it survives bot restarts.
-# • Each application log message has its own persistent action view, keyed by
-#   message_id, re-registered from /data/transfer_applications.json on on_ready.
-# • In-progress Yes/No sessions are in-memory only.  If the bot restarts mid-
-#   session the member simply clicks Apply again.
-#
-# SERVER SETUP COMPATIBILITY
-# --------------------------
-# REQUIRED_CHANNELS is declared at module level so server_setup.py auto-creates
-# the two channels if they don't already exist.
+# ARC Security Corp Transfer Application Ticket System
+# =====================================================
+# - Posts a persistent "Apply to ARC Security" button panel in #corp-transfer
+# - Clicking "Apply" walks the applicant through 4 modal dialogs (Discord
+#   allows a maximum of 5 fields per modal, so 16 fields span 4 modals)
+# - After all answers are submitted a private ticket channel is created,
+#   visible only to:
+#     • The applicant
+#     • ARC Security Administration Council
+#     • ARC Security Corporation Leader
+#     • ARC General                          ← added vs appeal_ticket.py
+# - The ticket auto-posts the applicant's event-participation history and
+#   test/certification status by reading the same data files arc_seat.py
+#   writes to (roles on the member, signature_tagging_attempts.json,
+#   /data/events.json) — no cross-cog dependency required
+# - Each user may only have one open ticket at a time
+# - Tickets have a Close button (creator or staff only)
+# - Panel survives restarts (stored message ID; no duplicate on reconnect)
+# - All data persists to /data/corp_transfer_tickets.json
 
 import asyncio
-import os
+import io
 import json
+import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import discord
-from discord.ext import commands
 from discord import app_commands
-
+from discord.ext import commands
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-REQUEST_CHANNEL = "wormhole-transfer-request"   # where the panel lives
-LOG_CHANNEL     = "transfer-application"         # where applications are logged
+TRANSFER_CHANNEL_NAME  = "corp-transfer"
+TICKET_CATEGORY_NAME   = "Tickets"
+ADMIN_LOG_CHANNEL_NAME = "transfer-application"
 
-APPS_PATH       = "/data/transfer_applications.json"
-
-# Stable custom_id for the persistent Apply button
-PANEL_CUSTOM_ID = "corp_transfer_apply"
-
-# Roles that may post / repost the application panel
-PANEL_POSTER_ROLES: Set[str] = {
-    "ARC Petty Officer",
-    "ARC Lieutenant",
-    "ARC Commander",
-    "ARC General",
+# Roles with access to every ticket
+STAFF_ROLES: tuple[str, ...] = (
     "ARC Security Administration Council",
     "ARC Security Corporation Leader",
-}
+    "ARC General",
+)
 
-# Eligibility questions — order matters
-QUESTIONS: List[str] = [
-    "Have you attended the Scanning classes?",
-    "Have you attended the WH Rolling classes?",
-    "Have you attended 2 Faction Warfare Fleets?",
-    "Have you attended a WH introduction class?",
-    "Are you currently skilling into the Caracal Navy Issue Corporation fit ⓒ.SA.CNI?",
-]
+# Roles allowed to run /transfer_setup
+SETUP_ROLES: tuple[str, ...] = (
+    "ARC Security Administration Council",
+    "ARC Security Corporation Leader",
+)
 
-# Picked up by server_setup.py auto-scanner
-REQUIRED_CHANNELS: List[str] = [REQUEST_CHANNEL, LOG_CHANNEL]
+# ============================================================
+# PERSISTENCE
+# ============================================================
+
+PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
+DATA_FILE = PERSIST_ROOT / "corp_transfer_tickets.json"
+
+_file_lock: Optional[asyncio.Lock] = None
+
+
+def _get_lock() -> asyncio.Lock:
+    global _file_lock
+    if _file_lock is None:
+        _file_lock = asyncio.Lock()
+    return _file_lock
+
+
+def _atomic_write(data: Dict[str, Any]) -> None:
+    PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = DATA_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    tmp.replace(DATA_FILE)
+
+
+async def _load() -> Dict[str, Any]:
+    async with _get_lock():
+        if not DATA_FILE.exists():
+            return {"panels": {}, "tickets": {}}
+        try:
+            with open(DATA_FILE, encoding="utf-8") as f:
+                raw = f.read().strip()
+            if not raw:
+                return {"panels": {}, "tickets": {}}
+            data = json.loads(raw)
+            data.setdefault("panels", {})
+            data.setdefault("tickets", {})
+            return data
+        except Exception as e:
+            print(f"[corp_transfer] Data load error: {e} — using defaults")
+            return {"panels": {}, "tickets": {}}
+
+
+async def _save(data: Dict[str, Any]) -> None:
+    async with _get_lock():
+        _atomic_write(data)
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def _has_any_role(member: discord.Member, role_names: Set[str]) -> bool:
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _has_any_role(member: discord.Member, role_names: tuple[str, ...]) -> bool:
     return any(r.name in role_names for r in member.roles)
 
 
-def _yn(value: bool) -> str:
-    return "✅ Yes" if value else "❌ No"
-
-
-def _ts_display(iso_str: str) -> str:
-    """Convert a stored ISO timestamp to a Discord full timestamp string."""
-    try:
-        unix = int(datetime.fromisoformat(iso_str).timestamp())
-        return f"<t:{unix}:f>"
-    except Exception:
-        return iso_str[:16] if iso_str else "?"
+def _staff_roles(guild: discord.Guild) -> List[discord.Role]:
+    """Resolve staff role objects from the guild — no hardcoded IDs."""
+    return [r for r in guild.roles if r.name in STAFF_ROLES]
 
 
 # ============================================================
-# STORAGE
+# IN-MEMORY APPLICATION STATE
 # ============================================================
+# Stores partial modal answers while the user works through all 4 modals.
+# Keyed by Discord user ID.  Cleared once the ticket is created (or on error).
 
-_apps_lock: Optional[asyncio.Lock] = None
-
-
-def _get_apps_lock() -> asyncio.Lock:
-    global _apps_lock
-    if _apps_lock is None:
-        _apps_lock = asyncio.Lock()
-    return _apps_lock
-
-
-def _atomic_write(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
-
-
-async def _load_apps() -> Dict[str, Any]:
-    async with _get_apps_lock():
-        if not os.path.exists(APPS_PATH):
-            return {}
-        try:
-            with open(APPS_PATH, "r", encoding="utf-8") as f:
-                txt = f.read().strip()
-            if not txt:
-                return {}
-            data = json.loads(txt)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-
-async def _save_apps(data: Dict[str, Any]) -> None:
-    async with _get_apps_lock():
-        _atomic_write(APPS_PATH, data)
+_pending_applications: Dict[int, Dict[str, str]] = {}
 
 
 # ============================================================
-# EMBED BUILDER  (single source of truth)
+# PANEL EMBED
 # ============================================================
 
-def _build_log_embed(app: Dict[str, Any]) -> discord.Embed:
-    """
-    Build (or rebuild) the full application log embed from stored app data.
-    Called both when first posting and whenever an action button is clicked.
-    """
-    all_yes = bool(app.get("all_yes", False))
-    status  = app.get("status", "pending")
-
-    # Color reflects current decision state
-    if status == "accepted":
-        color = discord.Color.green()
-    elif status == "rejected":
-        color = discord.Color.red()
-    elif all_yes:
-        color = discord.Color.green()
-    else:
-        color = discord.Color.orange()
-
-    # Restore original submission timestamp
-    ts_str = app.get("submitted_at", "")
-    try:
-        ts = datetime.fromisoformat(ts_str) if ts_str else datetime.now(timezone.utc)
-    except Exception:
-        ts = datetime.now(timezone.utc)
-
+def _build_panel_embed() -> discord.Embed:
     embed = discord.Embed(
-        title=     "📋 Corporation Transfer Application",
-        color=     color,
-        timestamp= ts,
+        title="🚀 Apply to ARC Security",
+        description=(
+            "Ready to make the jump into wormhole space with ARC Security? "
+            "Click the **Apply** button below to begin your application.\n\n"
+            "A short series of questions will appear — please answer each one "
+            "honestly and thoughtfully. Once submitted, a private application "
+            "ticket will be opened for review by **ARC Security leadership**.\n\n"
+            "⚠️ You may only have **one open application** at a time."
+        ),
+        color=discord.Color.orange(),
     )
-
-    avatar_url = app.get("applicant_avatar") or None
-    embed.set_author(
-        name=     app.get("applicant_name", "Unknown"),
-        icon_url= avatar_url,
-    )
-
-    # ── Top row: Applicant | Eligibility | Status ─────────────────────────
-    applicant_id = app.get("applicant_id")
-    embed.add_field(name="Applicant",   value=f"<@{applicant_id}>",                                               inline=True)
-    embed.add_field(name="Eligibility", value="✅ All criteria met" if all_yes else "⚠️ One or more criteria not met", inline=True)
-    embed.add_field(
-        name="Status",
-        value={
-            "pending":  "🕐 Pending Review",
-            "accepted": "✅ Accepted",
-            "rejected": "❌ Rejected",
-        }.get(status, "🕐 Pending Review"),
-        inline=True,
-    )
-
-    # ── Q&A fields ────────────────────────────────────────────────────────
-    answers = app.get("answers", [])
-    for i, (question, answer) in enumerate(zip(QUESTIONS, answers), start=1):
-        embed.add_field(
-            name=  f"Q{i}. {question}",
-            value= _yn(answer),
-            inline=False,
-        )
-
-    # ── Reached-out log (may have multiple entries from different officers) ─
-    reached_out: List[Dict] = app.get("reached_out", [])
-    if reached_out:
-        lines = [
-            f"<@{e['by_id']}> — {_ts_display(e.get('at', ''))}"
-            for e in reached_out
-            if isinstance(e, dict) and e.get("by_id")
-        ]
-        if lines:
-            embed.add_field(
-                name=  "📞 Reached Out",
-                value= "\n".join(lines),
-                inline=False,
-            )
-
-    # ── Final decision ────────────────────────────────────────────────────
-    decision: Optional[Dict] = app.get("decision")
-    if decision and isinstance(decision, dict):
-        by_id  = decision.get("by_id")
-        action = decision.get("action", "")
-        label  = "✅ Accepted by" if action == "accepted" else "❌ Rejected by"
-        embed.add_field(
-            name=  label,
-            value= f"<@{by_id}> — {_ts_display(decision.get('at', ''))}",
-            inline=False,
-        )
-
-    embed.set_footer(text=f"User ID: {applicant_id}")
+    embed.set_footer(text="ARC Security — Corp Transfer Application System")
     return embed
 
 
 # ============================================================
-# ACTION BUTTON & VIEW
+# TICKET EMBED (posted inside the new ticket channel)
 # ============================================================
 
-class ActionButton(discord.ui.Button):
-    """
-    One of the three leadership action buttons on an application log message.
-    The message_id is baked into the custom_id so the view can be re-registered
-    persistently after a bot restart without any additional lookup.
+def _build_ticket_embed(
+    creator: discord.Member,
+    answers: Dict[str, str],
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="📋 ARC Security Application",
+        description=(
+            f"Application submitted by {creator.mention}.\n\n"
+            "**ARC Security Administration Council**, "
+            "**ARC Security Corporation Leader**, and "
+            "**ARC General** will review this application and respond "
+            "as soon as possible.\n\n"
+            "When the review is complete, press **Close Ticket** to close this ticket."
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(
+        text=f"Application opened by {creator.display_name} • {creator.id}"
+    )
 
-    custom_id format:  corp_ro:{message_id}
-                       corp_acc:{message_id}
-                       corp_rej:{message_id}
-    """
+    # ── Application answers ──────────────────────────────────────────────────
+    # The answers dict uses short keys (q0 … q15); map to display labels.
+    LABELS: Dict[str, str] = {
+        "char_name": "Main Character / Discord Name",
+        "q1":  "1. How long have you been playing EVE?",
+        "q2":  "2. How long have you been a member of ARC Subsidized?",
+        "q3":  "3. What is your Timezone / Play schedule like?",
+        "q4":  "4. Do you have a history in any other corporations in EVE?",
+        "q5":  "5. Have you completed the Required Skill Plan(s) to enter ARC Security?",
+        "q6":  "6. Have you attended any of our organised classes and/or fleets?",
+        "q7":  "7. Why do you want to join a Wormhole corporation?",
+        "q8":  "8. What makes you think ARC Security is the right Wormhole Corporation?",
+        "q9":  "9. Tell us what you bring to the table as a member of ARC Security.",
+        "q10": "10. What are your goals personally in EVE and the Corporation?",
+        "q11": "11. Tell us about an exciting or educational experience in ARC Subsidized.",
+        "q12": "12. Do you have members of ARC Security who would support your move?",
+        "q13": "13. Are you willing to come to the defense of our home system / alliance?",
+        "q14": "14. Are you willing to delay personal skill goals for corp PvP fits?",
+        "q15": "15. Share a little about yourself outside of EVE.",
+    }
 
-    def __init__(
-        self,
-        action:     str,
-        message_id: int,
-        label:      str,
-        style:      discord.ButtonStyle,
-    ):
-        super().__init__(
-            label=     label,
-            style=     style,
-            custom_id= f"corp_{action}:{message_id}",
+    for key, label in LABELS.items():
+        value = answers.get(key, "_No answer provided._") or "_No answer provided._"
+        # Discord embed field values are capped at 1 024 characters
+        if len(value) > 1020:
+            value = value[:1020] + "…"
+        embed.add_field(name=label, value=value, inline=False)
+
+    return embed
+
+
+# ============================================================
+# MODALS  (4 modals × ≤5 fields each = 16 fields total)
+# ============================================================
+
+class ApplicationModal1(discord.ui.Modal, title="ARC Security Application — Part 1 of 4"):
+    """Character name + Questions 1–4."""
+
+    char_name = discord.ui.TextInput(
+        label="Main Character / Discord Name",
+        placeholder="Your EVE main character name and/or Discord username",
+        style=discord.TextStyle.short,
+        max_length=200,
+        required=True,
+    )
+    q1 = discord.ui.TextInput(
+        label="1. How long have you been playing EVE?",
+        placeholder="e.g. 3 years, since 2019 …",
+        style=discord.TextStyle.short,
+        max_length=300,
+        required=True,
+    )
+    q2 = discord.ui.TextInput(
+        label="2. How long in ARC Subsidized?",
+        placeholder="e.g. 6 months",
+        style=discord.TextStyle.short,
+        max_length=300,
+        required=True,
+    )
+    q3 = discord.ui.TextInput(
+        label="3. Timezone / Play schedule?",
+        placeholder="e.g. EU TZ, evenings weekdays + weekends",
+        style=discord.TextStyle.short,
+        max_length=300,
+        required=True,
+    )
+    q4 = discord.ui.TextInput(
+        label="4. History in other EVE corporations?",
+        placeholder="List any previous corps and briefly explain",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
+
+    def __init__(self, cog: "CorpTransferCog") -> None:
+        super().__init__()
+        self._cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        uid = interaction.user.id
+        _pending_applications[uid] = {
+            "char_name": self.char_name.value,
+            "q1": self.q1.value,
+            "q2": self.q2.value,
+            "q3": self.q3.value,
+            "q4": self.q4.value,
+        }
+        # Immediately open the next modal
+        await interaction.response.send_modal(ApplicationModal2(self._cog))
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        print(f"[corp_transfer] Modal1 error: {error}")
+        await interaction.response.send_message(
+            "❌ An error occurred processing Part 1. Please try again.", ephemeral=True
         )
-        self.action     = action
-        self.message_id = message_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        cog: Optional["CorpTransfer"] = interaction.client.cogs.get("CorpTransfer")  # type: ignore
-        if cog is None:
-            await interaction.response.send_message(
-                "❌ System error — transfer cog not loaded.", ephemeral=True
-            )
-            return
-        await cog._handle_action(interaction, self.action, self.message_id)
 
 
-class ApplicationActionView(discord.ui.View):
-    """
-    Persistent view attached to every application log message.
-    Uniqueness is guaranteed by message_id embedded in each button's custom_id.
+class ApplicationModal2(discord.ui.Modal, title="ARC Security Application — Part 2 of 4"):
+    """Questions 5–9."""
 
-    decided=True  → all buttons are pre-disabled (used when re-registering
-                    views for already-decided applications after a restart).
-    """
+    q5 = discord.ui.TextInput(
+        label="5. Completed the Required Skill Plan(s)?",
+        placeholder="Yes / No / Partially — please explain",
+        style=discord.TextStyle.short,
+        max_length=500,
+        required=True,
+    )
+    q6 = discord.ui.TextInput(
+        label="6. Attended organised classes / fleets?",
+        placeholder="Which ones? How many?",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=True,
+    )
+    q7 = discord.ui.TextInput(
+        label="7. Why do you want to join a Wormhole corp?",
+        style=discord.TextStyle.paragraph,
+        max_length=800,
+        required=True,
+    )
+    q8 = discord.ui.TextInput(
+        label="8. Why is ARC Security the right Wormhole corp?",
+        style=discord.TextStyle.paragraph,
+        max_length=800,
+        required=True,
+    )
+    q9 = discord.ui.TextInput(
+        label="9. What do you bring to ARC Security?",
+        style=discord.TextStyle.paragraph,
+        max_length=800,
+        required=True,
+    )
 
-    def __init__(self, message_id: int, decided: bool = False):
-        super().__init__(timeout=None)   # persistent
-        self.add_item(ActionButton("ro",  message_id, "📞 Reached Out", discord.ButtonStyle.primary))
-        self.add_item(ActionButton("acc", message_id, "✅ Accepted",     discord.ButtonStyle.success))
-        self.add_item(ActionButton("rej", message_id, "❌ Rejected",     discord.ButtonStyle.danger))
+    def __init__(self, cog: "CorpTransferCog") -> None:
+        super().__init__()
+        self._cog = cog
 
-        if decided:
-            for item in self.children:
-                item.disabled = True
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        uid = interaction.user.id
+        existing = _pending_applications.setdefault(uid, {})
+        existing.update({
+            "q5": self.q5.value,
+            "q6": self.q6.value,
+            "q7": self.q7.value,
+            "q8": self.q8.value,
+            "q9": self.q9.value,
+        })
+        await interaction.response.send_modal(ApplicationModal3(self._cog))
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        print(f"[corp_transfer] Modal2 error: {error}")
+        await interaction.response.send_message(
+            "❌ An error occurred processing Part 2. Please try again.", ephemeral=True
+        )
+
+
+class ApplicationModal3(discord.ui.Modal, title="ARC Security Application — Part 3 of 4"):
+    """Questions 10–14."""
+
+    q10 = discord.ui.TextInput(
+        label="10. Goals in EVE and the Corporation?",
+        style=discord.TextStyle.paragraph,
+        max_length=800,
+        required=True,
+    )
+    q11 = discord.ui.TextInput(
+        label="11. Exciting / educational ARC Subsidized experience?",
+        style=discord.TextStyle.paragraph,
+        max_length=800,
+        required=True,
+    )
+    q12 = discord.ui.TextInput(
+        label="12. ARC Security members who'd support your move?",
+        placeholder="Names, or 'None that I'm aware of'",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=True,
+    )
+    q13 = discord.ui.TextInput(
+        label="13. Willing to defend home / alliance as needed?",
+        placeholder="Yes / No / Comments (real life first is understood)",
+        style=discord.TextStyle.short,
+        max_length=300,
+        required=True,
+    )
+    q14 = discord.ui.TextInput(
+        label="14. Willing to delay personal skills for corp PvP fits?",
+        placeholder="Yes / No / Comments",
+        style=discord.TextStyle.short,
+        max_length=300,
+        required=True,
+    )
+
+    def __init__(self, cog: "CorpTransferCog") -> None:
+        super().__init__()
+        self._cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        uid = interaction.user.id
+        existing = _pending_applications.setdefault(uid, {})
+        existing.update({
+            "q10": self.q10.value,
+            "q11": self.q11.value,
+            "q12": self.q12.value,
+            "q13": self.q13.value,
+            "q14": self.q14.value,
+        })
+        await interaction.response.send_modal(ApplicationModal4(self._cog))
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        print(f"[corp_transfer] Modal3 error: {error}")
+        await interaction.response.send_message(
+            "❌ An error occurred processing Part 3. Please try again.", ephemeral=True
+        )
+
+
+class ApplicationModal4(discord.ui.Modal, title="ARC Security Application — Part 4 of 4"):
+    """Question 15 — final modal, triggers ticket creation."""
+
+    q15 = discord.ui.TextInput(
+        label="15. Tell us about yourself outside of EVE.",
+        placeholder="Share as much or as little as you'd like us to know.",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
+
+    def __init__(self, cog: "CorpTransferCog") -> None:
+        super().__init__()
+        self._cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        uid = interaction.user.id
+        existing = _pending_applications.setdefault(uid, {})
+        existing["q15"] = self.q15.value
+
+        # All answers collected — hand off to the cog to create the ticket
+        answers = dict(existing)
+        _pending_applications.pop(uid, None)
+
+        await interaction.response.defer(ephemeral=True)
+        await self._cog._create_ticket(interaction, answers)
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        print(f"[corp_transfer] Modal4 error: {error}")
+        await interaction.response.send_message(
+            "❌ An error occurred processing Part 4. Please try again.", ephemeral=True
+        )
 
 
 # ============================================================
-# QUESTION VIEWS
+# VIEWS
 # ============================================================
 
-class QuestionView(discord.ui.View):
+class TransferPanelView(discord.ui.View):
     """
-    Ephemeral yes/no view for a single question.  Not persistent — if the bot
-    restarts mid-session the member clicks Apply again.
+    Persistent view attached to the panel message in #corp-transfer.
+    Stable custom_id survives bot restarts without needing the message_id.
     """
 
-    def __init__(self, cog: "CorpTransfer", user_id: int, q_index: int):
-        super().__init__(timeout=300)   # 5-minute inactivity window
-        self.cog     = cog
-        self.user_id = user_id
-        self.q_index = q_index
-
-    async def _handle(self, interaction: discord.Interaction, answer: bool) -> None:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                "⚠️ This application belongs to someone else.", ephemeral=True
-            )
-            return
-        self.stop()
-        await self.cog._record_answer(interaction, self.q_index, answer)
-
-    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success, custom_id="corp_transfer_q_yes")
-    async def yes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle(interaction, True)
-
-    @discord.ui.button(label="No", style=discord.ButtonStyle.danger, custom_id="corp_transfer_q_no")
-    async def no_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._handle(interaction, False)
-
-    async def on_timeout(self) -> None:
-        self.cog._sessions.pop(self.user_id, None)
-
-
-# ============================================================
-# APPLY PANEL VIEW
-# ============================================================
-
-class ApplyButtonView(discord.ui.View):
-    """Persistent view containing the single 'Apply' button."""
-
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Apply",
-        style=discord.ButtonStyle.primary,
-        custom_id=PANEL_CUSTOM_ID,
-        emoji="📋",
+        label="Apply to ARC Security",
+        style=discord.ButtonStyle.success,
+        emoji="🚀",
+        custom_id="corp_transfer:open",
     )
-    async def apply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cog: Optional["CorpTransfer"] = interaction.client.cogs.get("CorpTransfer")  # type: ignore
+    async def open_application(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        cog: Optional["CorpTransferCog"] = interaction.client.cogs.get("CorpTransferCog")  # type: ignore
         if cog is None:
             await interaction.response.send_message(
-                "❌ System error — transfer cog not loaded. Please contact an officer.",
-                ephemeral=True,
+                "❌ Application system is currently unavailable.", ephemeral=True
             )
             return
-        await cog._start_application(interaction)
+        await cog._handle_open_application(interaction)
+
+
+class TicketView(discord.ui.View):
+    """
+    Persistent view posted inside each ticket channel.
+    The channel_id is baked into the custom_id so the cog can look up
+    the correct ticket after a restart without extra state.
+    """
+
+    def __init__(self, channel_id: int) -> None:
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+
+        close_btn = discord.ui.Button(
+            label="Close Ticket",
+            style=discord.ButtonStyle.danger,
+            emoji="🔒",
+            custom_id=f"corp_transfer:close:{channel_id}",
+        )
+        close_btn.callback = self._close_callback  # type: ignore
+        self.add_item(close_btn)
+
+    async def _close_callback(self, interaction: discord.Interaction) -> None:
+        cog: Optional["CorpTransferCog"] = interaction.client.cogs.get("CorpTransferCog")  # type: ignore
+        if cog is None:
+            await interaction.response.send_message(
+                "❌ Ticket system is currently unavailable.", ephemeral=True
+            )
+            return
+        await cog._handle_close_ticket(interaction, self.channel_id)
+
+
+# ============================================================
+# TRANSCRIPT HELPER
+# ============================================================
+
+async def _build_transcript(
+    channel: discord.TextChannel, ticket: Dict[str, Any]
+) -> str:
+    lines: List[str] = [
+        "=" * 60,
+        "  ARC SECURITY APPLICATION TRANSCRIPT",
+        f"  Applicant : {ticket.get('creator_name', 'Unknown')} (ID: {ticket.get('creator_id', '?')})",
+        f"  Channel   : #{channel.name}",
+        f"  Opened    : {ticket.get('opened_at', 'Unknown')}",
+        f"  Closed    : {_utcnow()}",
+        "=" * 60,
+        "",
+    ]
+
+    messages: List[discord.Message] = []
+    async for msg in channel.history(limit=None, oldest_first=True):
+        messages.append(msg)
+
+    for msg in messages:
+        timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        author    = f"{msg.author.display_name} ({msg.author})"
+        content   = msg.content or ""
+
+        for embed in msg.embeds:
+            parts: List[str] = []
+            if embed.title:
+                parts.append(f"[Embed Title: {embed.title}]")
+            if embed.description:
+                parts.append(f"[Embed: {embed.description}]")
+            for field in embed.fields:
+                parts.append(f"[Field — {field.name}: {field.value}]")
+            if parts:
+                content = (content + "\n" + "\n".join(parts)).strip()
+
+        for att in msg.attachments:
+            content = (content + f"\n[Attachment: {att.filename} — {att.url}]").strip()
+
+        if not content:
+            content = "<no text content>"
+
+        lines.append(f"[{timestamp}] {author}")
+        lines.append(f"  {content}")
+        lines.append("")
+
+    lines.append("=" * 60)
+    lines.append("  END OF TRANSCRIPT")
+    lines.append("=" * 60)
+    return "\n".join(lines)
 
 
 # ============================================================
 # COG
 # ============================================================
 
-class CorpTransfer(commands.Cog):
+class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
+    """ARC Security Corp Transfer Application — private ticket channels for applicants."""
 
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        # In-memory Q&A sessions: {user_id: [answer, ...]}
-        self._sessions: Dict[int, List[bool]] = {}
 
     # ----------------------------------------------------------------
-    # on_ready
+    # on_ready — ensure panel + re-register persistent views
     # ----------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        # Register the panel Apply button
-        self.bot.add_view(ApplyButtonView())
+        self.bot.add_view(TransferPanelView())
 
-        # Re-register every stored application's action view
-        apps  = await _load_apps()
-        count = 0
-        for msg_id_str, app in apps.items():
-            if not msg_id_str.isdigit():
-                continue
-            msg_id  = int(msg_id_str)
-            decided = app.get("status") in ("accepted", "rejected")
-            view    = ApplicationActionView(msg_id, decided=decided)
+        data    = await _load()
+        tickets = data.get("tickets", {})
+        registered = 0
+        stale: List[str] = []
+
+        for channel_id_str, ticket in list(tickets.items()):
             try:
-                self.bot.add_view(view, message_id=msg_id)
-                count += 1
+                channel_id = int(channel_id_str)
+            except ValueError:
+                stale.append(channel_id_str)
+                continue
+
+            channel = self.bot.get_channel(channel_id)
+            if channel is None:
+                stale.append(channel_id_str)
+                continue
+
+            view = TicketView(channel_id)
+            self.bot.add_view(view, message_id=None)
+            registered += 1
+
+        if stale:
+            for key in stale:
+                tickets.pop(key, None)
+            data["tickets"] = tickets
+            await _save(data)
+            print(f"[corp_transfer] Cleaned up {len(stale)} stale ticket record(s).")
+
+        print(f"[corp_transfer] Re-registered {registered} open ticket view(s).")
+
+        for guild in self.bot.guilds:
+            try:
+                await self._ensure_panel(guild, data)
             except Exception as e:
-                print(
-                    f"[corp_transfer] Could not re-register action view "
-                    f"for message {msg_id}: {e}"
-                )
+                print(f"[corp_transfer] Panel setup error in '{guild.name}': {e}")
 
-        print(
-            f"[corp_transfer] Registered ApplyButtonView + "
-            f"{count} application action view(s)."
+        await _save(data)
+
+    # ----------------------------------------------------------------
+    # Channel / category helpers
+    # ----------------------------------------------------------------
+
+    async def _ensure_transfer_channel(
+        self, guild: discord.Guild
+    ) -> discord.TextChannel:
+        ch = discord.utils.get(guild.text_channels, name=TRANSFER_CHANNEL_NAME)
+        if ch:
+            return ch
+
+        bot_member = guild.get_member(self.bot.user.id) if self.bot.user else None
+        overwrites: Dict[Any, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(
+                send_messages=False,
+                add_reactions=False,
+                view_channel=True,
+            )
+        }
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                embed_links=True,
+                manage_messages=True,
+                manage_channels=True,
+            )
+
+        ch = await guild.create_text_channel(
+            TRANSFER_CHANNEL_NAME,
+            overwrites=overwrites,
+            reason="Corp Transfer Application System — panel channel",
         )
+        print(f"[corp_transfer] Created #{TRANSFER_CHANNEL_NAME} in '{guild.name}'.")
+        return ch
+
+    async def _get_or_create_ticket_category(
+        self, guild: discord.Guild
+    ) -> Optional[discord.CategoryChannel]:
+        category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+        if category:
+            return category
+        try:
+            category = await guild.create_category(
+                TICKET_CATEGORY_NAME,
+                reason="Corp Transfer Application System — ticket category",
+            )
+            return category
+        except discord.Forbidden:
+            print(
+                f"[corp_transfer] Cannot create '{TICKET_CATEGORY_NAME}' category "
+                f"in '{guild.name}' — missing permissions."
+            )
+            return None
 
     # ----------------------------------------------------------------
-    # Q&A flow
+    # Panel management
     # ----------------------------------------------------------------
 
-    async def _start_application(self, interaction: discord.Interaction) -> None:
-        user_id = interaction.user.id
-        if user_id in self._sessions:
+    async def _ensure_panel(
+        self, guild: discord.Guild, data: Dict[str, Any]
+    ) -> None:
+        ch = await self._ensure_transfer_channel(guild)
+
+        panels    = data.setdefault("panels", {})
+        gkey      = str(guild.id)
+        panel_rec = panels.get(gkey, {})
+        msg_id    = panel_rec.get("message_id")
+
+        embed = _build_panel_embed()
+        view  = TransferPanelView()
+
+        if msg_id:
+            try:
+                existing = await ch.fetch_message(int(msg_id))
+                await existing.edit(embed=embed, view=view)
+                return
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        try:
+            msg = await ch.send(embed=embed, view=view)
+            panels[gkey] = {
+                "channel_id": ch.id,
+                "message_id": msg.id,
+            }
+            data["panels"] = panels
+            print(f"[corp_transfer] Panel posted in '{guild.name}' #{ch.name}.")
+        except discord.Forbidden:
+            print(
+                f"[corp_transfer] Cannot post panel in #{ch.name} "
+                f"in '{guild.name}' — missing permissions."
+            )
+
+    # ----------------------------------------------------------------
+    # "Apply" button handler — opens Modal 1
+    # ----------------------------------------------------------------
+
+    async def _handle_open_application(
+        self, interaction: discord.Interaction
+    ) -> None:
+        """Called when a member clicks the Apply button."""
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
-                "⚠️ You already have an application in progress — "
-                "please finish answering the current question.",
-                ephemeral=True,
+                "❌ This must be used inside the server.", ephemeral=True
             )
             return
-        self._sessions[user_id] = []
-        await self._ask_question(interaction, q_index=0, first=True)
 
-    async def _ask_question(
+        guild  = interaction.guild
+        member = interaction.user
+
+        # ── One-ticket-per-user guard ─────────────────────────────────────────
+        data    = await _load()
+        tickets = data.get("tickets", {})
+
+        for ch_id_str, ticket in tickets.items():
+            if (
+                ticket.get("creator_id") == member.id
+                and ticket.get("guild_id") == guild.id
+            ):
+                existing_ch = guild.get_channel(int(ch_id_str))
+                if existing_ch is not None:
+                    await interaction.response.send_message(
+                        f"❌ You already have an open application ticket: {existing_ch.mention}\n"
+                        "Please use your existing ticket or close it before starting a new one.",
+                        ephemeral=True,
+                    )
+                    return
+                # Channel gone — clean up the stale record
+                tickets.pop(ch_id_str, None)
+                data["tickets"] = tickets
+                await _save(data)
+                break
+
+        # Open the first modal (the interaction response must be a modal)
+        await interaction.response.send_modal(ApplicationModal1(self))
+
+    # ----------------------------------------------------------------
+    # Ticket creation — called after all 4 modals are submitted
+    # ----------------------------------------------------------------
+
+    async def _create_ticket(
         self,
         interaction: discord.Interaction,
-        q_index:     int,
-        first:       bool = False,
+        answers: Dict[str, str],
     ) -> None:
-        total = len(QUESTIONS)
-        embed = discord.Embed(
-            title=       f"Corporation Transfer Application  ({q_index + 1} / {total})",
-            description= f"**{QUESTIONS[q_index]}**",
-            color=       discord.Color.blurple(),
-        )
-        embed.set_footer(
-            text="Answer Yes or No • Session expires after 5 minutes of inactivity"
-        )
-        view = QuestionView(self, interaction.user.id, q_index)
-        if first:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        else:
-            await interaction.response.edit_message(embed=embed, view=view)
-
-    async def _record_answer(
-        self,
-        interaction: discord.Interaction,
-        q_index:     int,
-        answer:      bool,
-    ) -> None:
-        user_id = interaction.user.id
-        answers = self._sessions.get(user_id)
-        if answers is None:
-            await interaction.response.send_message(
-                "⚠️ Your session expired. Please click **Apply** again to restart.",
-                ephemeral=True,
+        """Create the private ticket channel and post the application inside it."""
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.followup.send(
+                "❌ This must be used inside the server.", ephemeral=True
             )
             return
 
-        answers.append(answer)
-        next_index = q_index + 1
-        if next_index < len(QUESTIONS):
-            await self._ask_question(interaction, next_index, first=False)
-        else:
-            self._sessions.pop(user_id, None)
-            await self._finalize_application(interaction, answers)
+        guild  = interaction.guild
+        member = interaction.user
 
-    # ----------------------------------------------------------------
-    # Finalize — post log embed with action buttons
-    # ----------------------------------------------------------------
+        # ── Build permission overwrites ───────────────────────────────────────
+        bot_member = guild.get_member(self.bot.user.id) if self.bot.user else None
 
-    async def _finalize_application(
-        self,
-        interaction: discord.Interaction,
-        answers:     List[bool],
-    ) -> None:
-        member  = interaction.user
-        guild   = interaction.guild
-        all_yes = all(answers)
-
-        app: Dict[str, Any] = {
-            "applicant_id":     member.id,
-            "applicant_name":   member.display_name,
-            "applicant_avatar": str(member.display_avatar.url),
-            "all_yes":          all_yes,
-            "answers":          answers,
-            "status":           "pending",
-            "submitted_at":     datetime.now(timezone.utc).isoformat(),
-            "reached_out":      [],
-            "decision":         None,
+        overwrites: Dict[Any, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=False,
+                send_messages=False,
+                read_message_history=False,
+            )
         }
 
-        log_ch = (
-            discord.utils.get(guild.text_channels, name=LOG_CHANNEL)
-            if guild else None
+        # Applicant
+        overwrites[member] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            embed_links=True,
+            attach_files=True,
         )
 
-        if log_ch:
-            try:
-                # Post with a zero-id placeholder view, then immediately edit
-                # to replace with the real view that has the correct message_id
-                # baked into each button's custom_id.
-                log_msg = await log_ch.send(
-                    embed= _build_log_embed(app),
-                    view=  ApplicationActionView(0),
-                )
-                real_view = ApplicationActionView(log_msg.id)
-                await log_msg.edit(view=real_view)
-
-                # Register persistently so buttons survive restarts
-                try:
-                    self.bot.add_view(real_view, message_id=log_msg.id)
-                except Exception:
-                    pass
-
-                # Persist to disk
-                apps = await _load_apps()
-                apps[str(log_msg.id)] = app
-                await _save_apps(apps)
-
-            except Exception as e:
-                print(
-                    f"[corp_transfer] Failed to post application log "
-                    f"for {member} ({member.id}): {e}"
-                )
-        else:
-            print(
-                f"[corp_transfer] WARNING: #{LOG_CHANNEL} not found — "
-                f"application from {member} could not be logged."
+        # Staff roles (Admin Council + Corp Leader + ARC General)
+        for role in _staff_roles(guild):
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                embed_links=True,
+                attach_files=True,
+                manage_messages=True,
             )
 
-        # Confirm to the applicant (edit their ephemeral message)
-        confirm_embed = discord.Embed(
-            title=       "✅ Application Submitted",
-            description= (
-                "Your answers have been recorded and submitted to leadership for review.\n\n"
-                + (
-                    "**All criteria are currently met.** Leadership will be in touch shortly."
-                    if all_yes else
-                    "**Some criteria are not yet met.** Keep working toward them and "
-                    "click Apply again when you're ready."
-                )
-            ),
-            color= discord.Color.green() if all_yes else discord.Color.orange(),
-        )
-        confirm_embed.set_footer(text="ARC Security Corporation")
-        await interaction.response.edit_message(embed=confirm_embed, view=None)
-
-    # ----------------------------------------------------------------
-    # Action button handler
-    # ----------------------------------------------------------------
-
-    async def _handle_action(
-        self,
-        interaction: discord.Interaction,
-        action:      str,
-        message_id:  int,
-    ) -> None:
-        apps = await _load_apps()
-        key  = str(message_id)
-        app  = apps.get(key)
-
-        if not app or not isinstance(app, dict):
-            await interaction.response.send_message(
-                "⚠️ Application record not found. It may predate this feature.",
-                ephemeral=True,
+        # Bot itself
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                embed_links=True,
+                manage_channels=True,
+                manage_messages=True,
             )
-            return
 
-        # Prevent overwriting a final decision
-        if app.get("status") in ("accepted", "rejected") and action in ("acc", "rej"):
-            await interaction.response.send_message(
-                "⚠️ This application has already been decided and cannot be changed.",
-                ephemeral=True,
-            )
-            return
+        # ── Create the ticket channel ─────────────────────────────────────────
+        category = await self._get_or_create_ticket_category(guild)
 
-        actor   = interaction.user
-        now_iso = datetime.now(timezone.utc).isoformat()
+        safe_name = "".join(
+            c if (c.isalnum() or c == "-") else "-"
+            for c in member.display_name.lower()
+        ).strip("-")[:20] or "member"
 
-        if action == "ro":
-            # Repeatable — any number of officers can log that they reached out
-            app.setdefault("reached_out", []).append({
-                "by_id":   actor.id,
-                "by_name": actor.display_name,
-                "at":      now_iso,
-            })
+        channel_name = f"transfer-{safe_name}"
 
-        elif action == "acc":
-            app["status"]   = "accepted"
-            app["decision"] = {
-                "action":  "accepted",
-                "by_id":   actor.id,
-                "by_name": actor.display_name,
-                "at":      now_iso,
-            }
-
-        elif action == "rej":
-            app["status"]   = "rejected"
-            app["decision"] = {
-                "action":  "rejected",
-                "by_id":   actor.id,
-                "by_name": actor.display_name,
-                "at":      now_iso,
-            }
-
-        # Persist updated state
-        apps[key] = app
-        await _save_apps(apps)
-
-        # Rebuild embed + view and edit the log message in place
-        decided  = app.get("status") in ("accepted", "rejected")
-        new_view = ApplicationActionView(message_id, decided=decided)
-
-        await interaction.response.edit_message(
-            embed= _build_log_embed(app),
-            view=  new_view,
-        )
-
-    # ----------------------------------------------------------------
-    # /post_transfer_panel
-    # ----------------------------------------------------------------
-
-    @app_commands.command(
-        name="post_transfer_panel",
-        description="Post the Corporation Transfer application panel in #wormhole-transfer-request.",
-    )
-    async def post_transfer_panel(self, interaction: discord.Interaction) -> None:
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
-            return
-
-        if not self._can_post_panel(interaction.user):
-            await interaction.response.send_message(
-                "❌ You are not authorized to post the transfer panel.", ephemeral=True
-            )
-            return
-
-        guild = interaction.guild
-        ch    = (
-            discord.utils.get(guild.text_channels, name=REQUEST_CHANNEL)
-            if guild else None
-        )
-        if not ch:
-            await interaction.response.send_message(
-                f"❌ Channel `#{REQUEST_CHANNEL}` not found in this server.", ephemeral=True
-            )
-            return
-
-        panel_embed = discord.Embed(
-            title=       "🚀 Apply for Corporation Transfer",
-            description= (
-                "Ready to move from **ARC Subsidized** to **ARC Security**?\n\n"
-                "Click the button below to begin your eligibility check. "
-                "You will be asked a short series of Yes / No questions privately.\n\n"
-                "Your responses will be reviewed by leadership."
-            ),
-            color= discord.Color.blurple(),
-        )
-        panel_embed.set_footer(text="ARC Security Corporation")
-
-        await interaction.response.defer(ephemeral=True)
         try:
-            await ch.send(embed=panel_embed, view=ApplyButtonView())
-            await interaction.followup.send(
-                f"✅ Transfer application panel posted in {ch.mention}.", ephemeral=True
+            ticket_channel = await guild.create_text_channel(
+                channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Corp transfer application by {member} ({member.id})",
             )
         except discord.Forbidden:
             await interaction.followup.send(
-                f"❌ I don't have permission to send messages in {ch.mention}.", ephemeral=True
+                "❌ I don't have permission to create ticket channels. "
+                "Please contact an admin.",
+                ephemeral=True,
             )
-        except Exception as e:
-            await interaction.followup.send(f"❌ Failed to post panel: `{e}`", ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                f"❌ Failed to create ticket channel: `{e}`",
+                ephemeral=True,
+            )
+            return
 
-    def _can_post_panel(self, member: discord.Member) -> bool:
-        return _has_any_role(member, PANEL_POSTER_ROLES)
+        # ── Post the ticket embed + Close button ──────────────────────────────
+        view = TicketView(ticket_channel.id)
+        try:
+            self.bot.add_view(view)
+        except Exception:
+            pass
+
+        ticket_embed   = _build_ticket_embed(member, answers)
+        staff_mentions = " ".join(
+            role.mention for role in _staff_roles(guild) if role
+        )
+
+        await ticket_channel.send(
+            content=staff_mentions or None,
+            embed=ticket_embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+
+        # ── Pull ARC-SEAT data and post as follow-up embeds ──────────────────
+        await self._post_seat_data(ticket_channel, member)
+
+        # ── Persist the ticket record ─────────────────────────────────────────
+        data    = await _load()
+        tickets = data.get("tickets", {})
+        tickets[str(ticket_channel.id)] = {
+            "creator_id":   member.id,
+            "creator_name": str(member),
+            "guild_id":     guild.id,
+            "channel_id":   ticket_channel.id,
+            "opened_at":    _utcnow(),
+        }
+        data["tickets"] = tickets
+        await _save(data)
+
+        await interaction.followup.send(
+            f"✅ Your application ticket has been created: {ticket_channel.mention}\n"
+            "Leadership will review it and get back to you there.",
+            ephemeral=True,
+        )
+
+    # ----------------------------------------------------------------
+    # Pull ARC-SEAT data into the ticket (self-contained — no cog import)
+    # ----------------------------------------------------------------
+
+    async def _post_seat_data(
+        self,
+        channel: discord.TextChannel,
+        member: discord.Member,
+    ) -> None:
+        """
+        Read the same data sources that arc_seat.py writes to and post
+        the applicant's test/cert status and event participation as embeds.
+        No cross-cog dependency — the files are read directly.
+        """
+        # ── Test & Certification Status ───────────────────────────────────────
+        try:
+            tests_embed = self._build_tests_embed(member)
+            await channel.send(embed=tests_embed)
+        except Exception as e:
+            print(f"[corp_transfer] Failed to build tests embed: {e}")
+            await channel.send(
+                f"⚠️ Could not retrieve test/certification data: `{e}`"
+            )
+
+        # ── Event Participation History ───────────────────────────────────────
+        try:
+            events_embed = self._build_events_embed(member.id)
+            await channel.send(embed=events_embed)
+        except Exception as e:
+            print(f"[corp_transfer] Failed to build events embed: {e}")
+            await channel.send(
+                f"⚠️ Could not retrieve event participation data: `{e}`"
+            )
+
+    # ----------------------------------------------------------------
+    # Tests & certifications embed
+    # (mirrors arc_seat.py _build_tests_embed — reads the same sources)
+    # ----------------------------------------------------------------
+
+    def _build_tests_embed(self, member: discord.Member) -> discord.Embed:
+        """
+        Build an embed showing the applicant's status on all three in-bot tests.
+
+        Data sources (read-only):
+        • Roles on the member  — role presence/absence is the canonical record
+          of test completion, because each test removes or grants a role on pass.
+        • signature_tagging_attempts.json  — attempt counts per day per user.
+          Located at ./signature_tagging_attempts.json (project root, as written
+          by signature_tagging_test.py).
+
+        Tests:
+        ┌──────────────────────────┬────────────────────────────┬─────────────┐
+        │ Test                     │ Pass evidence              │ Fail/pending│
+        ├──────────────────────────┼────────────────────────────┼─────────────┤
+        │ Onboarding Test          │ "Onboarding" role ABSENT   │ role PRESENT│
+        │ Corp Rules Test          │ "Newbro" role ABSENT       │ role PRESENT│
+        │ Signature Tagging Test   │ "Exploration Certified"    │ role ABSENT │
+        └──────────────────────────┴────────────────────────────┴─────────────┘
+        """
+        member_role_names = {r.name for r in member.roles}
+
+        # ── Onboarding Test ───────────────────────────────────────────────────
+        has_onboarding = "Onboarding" in member_role_names
+        onboarding_status = (
+            "❌ Not yet passed  (`Onboarding` role still present)"
+            if has_onboarding
+            else "✅ Passed  (role removed)"
+        )
+
+        # ── Corp Rules Test ───────────────────────────────────────────────────
+        has_newbro = "Newbro" in member_role_names
+        corp_rules_status = (
+            "❌ Not yet passed  (`Newbro` role still present)"
+            if has_newbro
+            else "✅ Passed  (role removed)"
+        )
+
+        # ── Signature Tagging Test ────────────────────────────────────────────
+        has_cert = "Exploration Certified" in member_role_names
+        sig_status = (
+            "✅ Passed  (`Exploration Certified` granted)"
+            if has_cert
+            else "❌ Not yet passed"
+        )
+
+        # ── Signature tagging attempt history from JSON ───────────────────────
+        sig_attempts_total = 0
+        sig_attempts_detail: List[str] = []
+        attempts_path = Path("signature_tagging_attempts.json")
+        try:
+            if attempts_path.exists():
+                raw = json.loads(attempts_path.read_text(encoding="utf-8"))
+                uid_str = str(member.id)
+                for day, day_data in sorted(raw.items(), reverse=True):
+                    if uid_str in day_data:
+                        count = int(day_data[uid_str])
+                        sig_attempts_total += count
+                        sig_attempts_detail.append(f"`{day}` — {count} attempt(s)")
+        except Exception:
+            pass  # file missing or malformed — silently skip
+
+        if sig_attempts_total > 0:
+            attempts_str = f"{sig_attempts_total} lifetime attempt(s)"
+            if sig_attempts_detail:
+                shown = sig_attempts_detail[:5]
+                attempts_str += "\n" + "\n".join(shown)
+                if len(sig_attempts_detail) > 5:
+                    attempts_str += f"\n_(+ {len(sig_attempts_detail) - 5} more day(s))_"
+        else:
+            attempts_str = "0 — no attempts recorded"
+
+        embed = discord.Embed(
+            title="📝 Test & Certification Status",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="🎓 Onboarding Test",
+            value=onboarding_status,
+            inline=False,
+        )
+        embed.add_field(
+            name="📋 Corp Rules Test",
+            value=corp_rules_status,
+            inline=False,
+        )
+        embed.add_field(
+            name="🗺️ Signature Tagging Test",
+            value=sig_status,
+            inline=False,
+        )
+        embed.add_field(
+            name="🗺️ Signature Tagging — Attempt History",
+            value=attempts_str,
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                "Pass evidence is inferred from Discord roles. "
+                "Onboarding/Corp Rules: role removed on pass. "
+                "Sig Tagging: role granted on pass."
+            )
+        )
+        return embed
+
+    # ----------------------------------------------------------------
+    # Event participation embed
+    # (mirrors arc_seat.py _build_events_embed — reads /data/events.json)
+    # ----------------------------------------------------------------
+
+    def _build_events_embed(self, discord_id: int) -> discord.Embed:
+        """
+        Build an embed showing the applicant's event RSVP and attendance history.
+
+        Data source: /data/events.json (written by event_creator.py).
+        Read-only; no lock required.
+
+        For each event the member appeared in (any RSVP or vc_qualified):
+        • Shows title, scheduled time (<t:unix:d>), and their RSVP button(s).
+        • Marks with ✅ if they are in vc_qualified (attended ≥ 15 min in VC).
+        • Marks with 📋 if they RSVPd but did not qualify (or event is still active).
+        • Sorted newest-first; capped at 25 events to stay under embed limits.
+        """
+        uid     = discord_id
+        uid_str = str(uid)
+
+        events_data: Dict[str, Any] = {}
+        events_path = PERSIST_ROOT / "events.json"
+        try:
+            if events_path.exists():
+                raw = events_path.read_text(encoding="utf-8").strip()
+                if raw:
+                    events_data = json.loads(raw)
+        except Exception:
+            pass
+
+        member_events: List[Dict[str, Any]] = []
+
+        for event_id, event in events_data.items():
+            if not isinstance(event, dict):
+                continue
+
+            ts        = int(event.get("timestamp", 0) or 0)
+            title     = str(event.get("title", "Untitled"))
+            qualified = event.get("vc_qualified") or []
+            roles     = event.get("roles") or {}
+
+            # RSVP buttons this member clicked (excluding Decline)
+            rsvp_buttons: List[str] = []
+            for btn_name, btn_users in roles.items():
+                if btn_name.lower() == "decline":
+                    continue
+                if isinstance(btn_users, list) and uid in btn_users:
+                    rsvp_buttons.append(btn_name)
+
+            is_qualified = uid in qualified
+
+            if not rsvp_buttons and not is_qualified:
+                continue
+
+            # Cumulative VC time
+            cum_times   = event.get("vc_cumulative_times") or {}
+            vc_secs     = int(cum_times.get(uid_str, cum_times.get(uid, 0)) or 0)
+            vc_time_str = ""
+            if vc_secs > 0:
+                mins = vc_secs // 60
+                secs = vc_secs % 60
+                vc_time_str = f" ({mins}m {secs}s in VC)"
+
+            member_events.append({
+                "ts":          ts,
+                "title":       title,
+                "qualified":   is_qualified,
+                "rsvp":        rsvp_buttons,
+                "vc_time_str": vc_time_str,
+                "active":      bool(event.get("active", True)) and not bool(event.get("closed", False)),
+            })
+
+        # Sort newest-first, cap at 25
+        member_events.sort(key=lambda e: e["ts"], reverse=True)
+        member_events = member_events[:25]
+
+        embed = discord.Embed(
+            title="⚔️ Event Participation History",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        if not member_events:
+            embed.description = "_No event participation recorded._"
+            embed.set_footer(text="Source: /data/events.json")
+            return embed
+
+        qualified_count = sum(1 for e in member_events if e["qualified"])
+        rsvp_count      = len(member_events)
+
+        embed.description = (
+            f"**Events found:** {rsvp_count}  |  "
+            f"**Qualified (≥15 min VC):** {qualified_count}"
+        )
+
+        # Build field lines and pack into ≤1 000-char chunks
+        lines: List[str] = []
+        for ev in member_events:
+            ts_str   = f"<t:{ev['ts']}:d>" if ev["ts"] else "?"
+            icon     = "✅" if ev["qualified"] else ("📋" if not ev["active"] else "📌")
+            rsvp_str = ", ".join(ev["rsvp"]) if ev["rsvp"] else "No RSVP"
+            lines.append(
+                f"{icon} **{ev['title']}** — {ts_str}\n"
+                f"  RSVP: {rsvp_str}{ev['vc_time_str']}"
+            )
+
+        FIELD_LIMIT = 1000
+        buf       = ""
+        field_idx = 0
+        for line in lines:
+            sep       = "\n\n" if buf else ""
+            candidate = buf + sep + line
+            if len(candidate) > FIELD_LIMIT:
+                if buf:
+                    embed.add_field(
+                        name="Events" if field_idx == 0 else "Events (cont.)",
+                        value=buf,
+                        inline=False,
+                    )
+                    field_idx += 1
+                buf = line
+            else:
+                buf = candidate
+        if buf:
+            embed.add_field(
+                name="Events" if field_idx == 0 else "Events (cont.)",
+                value=buf,
+                inline=False,
+            )
+
+        embed.set_footer(
+            text=(
+                "✅ = Qualified (≥15 min in event VC)  "
+                "📋 = RSVPd, event closed  "
+                "📌 = RSVPd, event still active  "
+                "| Source: /data/events.json"
+            )
+        )
+        return embed
+
+    # ----------------------------------------------------------------
+    # Close ticket handler
+    # ----------------------------------------------------------------
+
+    # ----------------------------------------------------------------
+    # Close ticket handler
+    # ----------------------------------------------------------------
+
+    async def _handle_close_ticket(
+        self,
+        interaction: discord.Interaction,
+        channel_id: int,
+    ) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "❌ Must be used in a server.", ephemeral=True
+            )
+            return
+
+        guild  = interaction.guild
+        member = interaction.user
+
+        data    = await _load()
+        tickets = data.get("tickets", {})
+        ticket  = tickets.get(str(channel_id))
+
+        if ticket is None:
+            if not _has_any_role(member, STAFF_ROLES):
+                await interaction.response.send_message(
+                    "❌ Ticket record not found.", ephemeral=True
+                )
+                return
+        else:
+            is_creator = ticket.get("creator_id") == member.id
+            is_staff   = _has_any_role(member, STAFF_ROLES)
+            if not (is_creator or is_staff):
+                await interaction.response.send_message(
+                    "❌ Only the applicant or ARC Security leadership can close this ticket.",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.response.send_message(
+            "🔒 Closing this ticket in **5 seconds**…", ephemeral=False
+        )
+
+        await asyncio.sleep(5)
+
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            # ── Build & upload transcript to #transfer-application ────────────
+            try:
+                transcript_text = await _build_transcript(channel, ticket or {})
+
+                creator_name: str = (ticket or {}).get("creator_name", "unknown")
+                safe_filename = "".join(
+                    c if (c.isalnum() or c in "-_.") else "_"
+                    for c in creator_name
+                ).strip("_")[:50] or "unknown"
+                filename = f"transfer_{safe_filename}.txt"
+
+                transcript_bytes = transcript_text.encode("utf-8")
+                transcript_file  = discord.File(
+                    fp=io.BytesIO(transcript_bytes),
+                    filename=filename,
+                )
+
+                admin_channel = discord.utils.get(
+                    guild.text_channels, name=ADMIN_LOG_CHANNEL_NAME
+                )
+                if admin_channel is not None:
+                    await admin_channel.send(
+                        content=(
+                            f"📋 **Corp Transfer Application transcript** — `{creator_name}` "
+                            f"(closed by {member.mention})"
+                        ),
+                        file=transcript_file,
+                    )
+                else:
+                    print(
+                        f"[corp_transfer] Could not find #{ADMIN_LOG_CHANNEL_NAME} "
+                        f"in '{guild.name}' — transcript not saved."
+                    )
+            except Exception as e:
+                print(f"[corp_transfer] Transcript error: {e}")
+
+            # ── Clean up persistence ──────────────────────────────────────────
+            tickets.pop(str(channel_id), None)
+            data["tickets"] = tickets
+            await _save(data)
+
+            # ── Delete the ticket channel ─────────────────────────────────────
+            try:
+                await channel.delete(
+                    reason=f"Corp transfer application closed by {member} ({member.id})"
+                )
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException as e:
+                print(f"[corp_transfer] Channel delete error: {e}")
+        else:
+            tickets.pop(str(channel_id), None)
+            data["tickets"] = tickets
+            await _save(data)
+
+    # ----------------------------------------------------------------
+    # /transfer_setup — manual panel refresh (leadership only)
+    # ----------------------------------------------------------------
+
+    @app_commands.command(
+        name="transfer_setup",
+        description="Post or refresh the ARC Security application panel (leadership only).",
+    )
+    async def transfer_setup(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "Must be used in a server.", ephemeral=True
+            )
+            return
+
+        if not _has_any_role(interaction.user, SETUP_ROLES):
+            await interaction.response.send_message(
+                "❌ Only **ARC Security Administration Council** or "
+                "**ARC Security Corporation Leader** can use this command.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        data   = await _load()
+        panels = data.setdefault("panels", {})
+        panels.pop(str(interaction.guild.id), None)
+        data["panels"] = panels
+
+        await self._ensure_panel(interaction.guild, data)
+        await _save(data)
+
+        await interaction.followup.send(
+            f"✅ Corp Transfer panel refreshed in `#{TRANSFER_CHANNEL_NAME}`.",
+            ephemeral=True,
+        )
 
 
 # ============================================================
@@ -679,4 +1310,4 @@ class CorpTransfer(commands.Cog):
 # ============================================================
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(CorpTransfer(bot))
+    await bot.add_cog(CorpTransferCog(bot))
