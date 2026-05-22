@@ -130,7 +130,7 @@ APPLICATION_QUESTIONS: List[tuple[str, str]] = [
     ("q2",  "**[3 / 16]** How long have you been a member of **ARC Subsidized**?"),
     ("q3",  "**[4 / 16]** What is your **Timezone / Play schedule** like?"),
     ("q4",  "**[5 / 16]** Do you have a history in any other corporations in EVE?\n*(List any previous corps and briefly explain)*"),
-    ("q5",  "**[6 / 16]** Have you completed the **Required Skill Plan(s)** to enter ARC Security?\n*(Yes / No / Partially — please explain)*"),
+    ("q5",  "**[6 / 16]** Have you completed the **WH Skill Plan** to enter ARC Security?\n*(Yes / No / Partially — please explain)*"),
     ("q6",  "**[7 / 16]** Have you attended any of our **organised classes and/or fleets**?\n*(Which ones? How many?)*"),
     ("q7",  "**[8 / 16]** Why do you want to join a **Wormhole corporation**?"),
     ("q8",  "**[9 / 16]** What makes you think **ARC Security** is the right Wormhole Corporation for you?"),
