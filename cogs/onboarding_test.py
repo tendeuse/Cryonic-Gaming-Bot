@@ -22,7 +22,7 @@ log = logging.getLogger("onboarding_test")
 # =====================
 # CONFIG
 # =====================
-TEST_CHANNEL_NAME   = "onboarding"          # Channel where the Start button is posted
+TEST_CHANNEL_NAME   = "onboarding-quiz"          # Channel where the Start button is posted
 LOG_CH              = "arc-hierarchy-log"   # Channel where results are logged
 
 QUESTIONS_PER_TEST  = 5        # Questions drawn per attempt
