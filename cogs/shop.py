@@ -180,6 +180,18 @@ def utc_iso() -> str:
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+def is_valid_image_url(url: str) -> bool:
+    """Return True only if url is a well-formed http/https URL within Discord's 2048-char limit."""
+    if not url or len(url) > 2048:
+        return False
+    try:
+        from urllib.parse import urlparse
+        r = urlparse(url)
+        return r.scheme in ("http", "https") and bool(r.netloc)
+    except Exception:
+        return False
+
+
 def is_manager(member: discord.abc.User | discord.Member) -> bool:
     if not isinstance(member, discord.Member):
         return False
@@ -201,7 +213,7 @@ def build_item_embed(shop_key: str, item_id: str, item: dict) -> discord.Embed:
     )
     embed.add_field(name="Price", value=f'{int(item.get("price", 0))} AP', inline=True)
     embed.add_field(name="Stock", value=str(int(item.get("stock", 0))), inline=True)
-    if item.get("image"):
+    if item.get("image") and is_valid_image_url(item["image"]):
         embed.set_image(url=item["image"])
 
     # Stable footer for recovery (include shop_key)
@@ -742,6 +754,15 @@ class UpdateItemModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
             return
 
+        image_url = str(self.image.value).strip() or None
+        if image_url and not is_valid_image_url(image_url):
+            await safe_reply(
+                interaction,
+                "❌ Invalid image URL. Must be a valid `http`/`https` URL and under 2048 characters.",
+                ephemeral=True,
+            )
+            return
+
         async with SHOP_LOCK:
             shop = load_shop(self.shop_key)
             items = shop["items"]
@@ -753,7 +774,7 @@ class UpdateItemModal(discord.ui.Modal):
             item["name"] = str(self.name.value).strip()
             item["desc"] = str(self.desc.value).strip()
             item["price"] = price
-            item["image"] = str(self.image.value).strip() or None
+            item["image"] = image_url
 
             items[self.item_id] = item
             save_shop(self.shop_key, shop)
@@ -792,6 +813,15 @@ class AddNewItemModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
             return
 
+        image_url = str(self.image.value).strip() or None
+        if image_url and not is_valid_image_url(image_url):
+            await safe_reply(
+                interaction,
+                "❌ Invalid image URL. Must be a valid `http`/`https` URL and under 2048 characters.",
+                ephemeral=True,
+            )
+            return
+
         async with SHOP_LOCK:
             shop = load_shop(self.shop_key)
             items = shop["items"]
@@ -802,7 +832,7 @@ class AddNewItemModal(discord.ui.Modal):
                 "desc": str(self.desc.value).strip(),
                 "price": price,
                 "stock": 0,
-                "image": str(self.image.value).strip() or None
+                "image": image_url,
             }
             save_shop(self.shop_key, shop)
 
