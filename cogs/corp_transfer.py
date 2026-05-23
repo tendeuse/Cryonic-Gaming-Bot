@@ -177,14 +177,55 @@ def _build_panel_embed() -> discord.Embed:
 
 
 # ============================================================
-# TICKET EMBED (posted inside the new ticket channel)
+# EMBED SIZE HELPER
 # ============================================================
 
-def _build_ticket_embed(
+def _embed_size(embed: discord.Embed) -> int:
+    """
+    Return the approximate total character count of a Discord embed.
+    Discord enforces a hard 6 000-character limit across all text fields
+    combined (title + description + all field names + all field values +
+    footer text + author name).
+    """
+    total = 0
+    if embed.title:
+        total += len(embed.title)
+    if embed.description:
+        total += len(embed.description)
+    for field in embed.fields:
+        total += len(field.name) + len(field.value)
+    if embed.footer and embed.footer.text:
+        total += len(embed.footer.text)
+    if embed.author and embed.author.name:
+        total += len(embed.author.name)
+    return total
+
+
+# ============================================================
+# TICKET EMBEDS (posted inside the new ticket channel)
+# ============================================================
+# Returns a *list* of embeds.  When all 16 answers fit inside the
+# 6 000-character Discord limit they come back as a single-element list;
+# when they do not, answers overflow into one or more plain continuation
+# embeds so that every send() call stays under the limit.
+
+def _build_ticket_embeds(
     creator: discord.Member,
     answers: Dict[str, str],
-) -> discord.Embed:
-    embed = discord.Embed(
+) -> List[discord.Embed]:
+    """
+    Build one or more embeds for the application ticket.
+
+    Discord enforces a hard 6 000-character total across every text field in
+    an embed.  With 16 free-text answers that limit is easily exceeded, so
+    this function tracks the running size and spills overflow fields into
+    plain "continuation" embeds rather than letting a single send() call
+    blow past the limit.
+    """
+    EMBED_LIMIT = 5_900  # 100-char safety margin below Discord's 6 000 cap
+
+    # ── First embed — header + as many answer fields as fit ──────────────────
+    first = discord.Embed(
         title="📋 ARC Security Application",
         description=(
             f"Application submitted by {creator.mention}.\n\n"
@@ -197,9 +238,12 @@ def _build_ticket_embed(
         color=discord.Color.orange(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.set_footer(
+    first.set_footer(
         text=f"Application opened by {creator.display_name} • {creator.id}"
     )
+
+    embeds: List[discord.Embed] = [first]
+    current = first
 
     # ── Application answers ──────────────────────────────────────────────────
     # The answers dict uses short keys (q0 … q15); map to display labels.
@@ -227,9 +271,22 @@ def _build_ticket_embed(
         # Discord embed field values are capped at 1 024 characters
         if len(value) > 1020:
             value = value[:1020] + "…"
-        embed.add_field(name=label, value=value, inline=False)
 
-    return embed
+        field_cost = len(label) + len(value)
+
+        # If adding this field would push the current embed over the limit,
+        # open a fresh continuation embed and write into that instead.
+        if _embed_size(current) + field_cost > EMBED_LIMIT:
+            continuation = discord.Embed(
+                title="📋 Application Answers (cont.)",
+                color=discord.Color.orange(),
+            )
+            embeds.append(continuation)
+            current = continuation
+
+        current.add_field(name=label, value=value, inline=False)
+
+    return embeds
 
 
 # ============================================================
@@ -743,17 +800,22 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
         except Exception:
             pass
 
-        ticket_embed   = _build_ticket_embed(member, answers)
+        ticket_embeds  = _build_ticket_embeds(member, answers)
         staff_mentions = " ".join(
             role.mention for role in _staff_roles(guild) if role
         )
 
+        # Send the first embed with the staff pings and the Close button.
+        # Any overflow continuation embeds are sent as plain follow-ups so
+        # that no single message exceeds Discord's 6 000-char embed limit.
         await ticket_channel.send(
             content=staff_mentions or None,
-            embed=ticket_embed,
+            embed=ticket_embeds[0],
             view=view,
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
+        for extra_embed in ticket_embeds[1:]:
+            await ticket_channel.send(embed=extra_embed)
 
         # ── Pull ARC-SEAT data and post as follow-up embeds ──────────────────
         await self._post_seat_data(ticket_channel, member)
