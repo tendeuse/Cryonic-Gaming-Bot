@@ -1125,11 +1125,7 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
         return embed
 
     # ----------------------------------------------------------------
-    # Close ticket handler
-    # ----------------------------------------------------------------
-
-    # ----------------------------------------------------------------
-    # Close ticket handler
+    # Close ticket handler  (called by the in-channel Close button)
     # ----------------------------------------------------------------
 
     async def _handle_close_ticket(
@@ -1228,6 +1224,159 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
             tickets.pop(str(channel_id), None)
             data["tickets"] = tickets
             await _save(data)
+
+    # ----------------------------------------------------------------
+    # /transfer_close — manual staff-only ticket closer
+    # ----------------------------------------------------------------
+
+    @app_commands.command(
+        name="transfer_close",
+        description="Manually close a corp-transfer ticket channel (staff only).",
+    )
+    @app_commands.describe(
+        channel=(
+            "The ticket channel to close — defaults to the current channel if omitted."
+        )
+    )
+    async def transfer_close(
+        self,
+        interaction: discord.Interaction,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        """
+        Force-closes a transfer ticket regardless of whether a persistence
+        record exists.  Designed to recover half-opened tickets (e.g. the
+        channel was created but the embed send crashed before the record
+        was written) as well as normally-opened ones.
+
+        Steps
+        -----
+        1. Resolve the target channel (argument or current channel).
+        2. Staff-role gate.
+        3. Try to save a transcript to #transfer-application (soft-fail).
+        4. Erase the persistence record if one exists.
+        5. Clear any stuck in-flight DM application state for the creator.
+        6. Delete the channel.
+        """
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "❌ Must be used in a server.", ephemeral=True
+            )
+            return
+
+        if not _has_any_role(interaction.user, STAFF_ROLES):
+            await interaction.response.send_message(
+                "❌ Only ARC Security leadership can use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild  = interaction.guild
+        closer = interaction.user
+
+        # ── Resolve target channel ────────────────────────────────────────────
+        target: Optional[discord.TextChannel] = channel
+        if target is None:
+            if isinstance(interaction.channel, discord.TextChannel):
+                target = interaction.channel
+            else:
+                await interaction.response.send_message(
+                    "❌ Run this command inside a ticket channel, or pass the "
+                    "`channel` argument.",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # ── Look up persistence record (may not exist for half-opened tickets) ─
+        data    = await _load()
+        tickets = data.get("tickets", {})
+        ticket  = tickets.get(str(target.id))  # may be None
+
+        creator_name: str = (ticket or {}).get("creator_name", target.name)
+        creator_id: Optional[int] = (ticket or {}).get("creator_id")
+
+        # ── Attempt transcript ────────────────────────────────────────────────
+        transcript_saved = False
+        try:
+            transcript_text  = await _build_transcript(target, ticket or {})
+            safe_filename    = "".join(
+                c if (c.isalnum() or c in "-_.") else "_" for c in creator_name
+            ).strip("_")[:50] or "unknown"
+            transcript_file  = discord.File(
+                fp=io.BytesIO(transcript_text.encode("utf-8")),
+                filename=f"transfer_{safe_filename}.txt",
+            )
+            admin_channel = discord.utils.get(
+                guild.text_channels, name=ADMIN_LOG_CHANNEL_NAME
+            )
+            if admin_channel is not None:
+                note = " *(half-opened — no ticket record)*" if ticket is None else ""
+                await admin_channel.send(
+                    content=(
+                        f"📋 **Corp Transfer Application transcript** — `{creator_name}`"
+                        f"{note} (force-closed by {closer.mention})"
+                    ),
+                    file=transcript_file,
+                )
+                transcript_saved = True
+            else:
+                print(
+                    f"[corp_transfer] /transfer_close: #{ADMIN_LOG_CHANNEL_NAME} "
+                    f"not found in '{guild.name}' — transcript skipped."
+                )
+        except Exception as e:
+            print(f"[corp_transfer] /transfer_close transcript error: {e}")
+
+        # ── Clear persistence record ──────────────────────────────────────────
+        had_record = str(target.id) in tickets
+        tickets.pop(str(target.id), None)
+        data["tickets"] = tickets
+        await _save(data)
+
+        # ── Clear any in-flight DM application state for the creator ──────────
+        cleared_pending = False
+        if creator_id is not None and creator_id in _pending_applications:
+            _pending_applications.pop(creator_id, None)
+            cleared_pending = True
+
+        # ── Delete the channel ────────────────────────────────────────────────
+        deleted = False
+        try:
+            await target.delete(
+                reason=(
+                    f"Corp transfer ticket force-closed by "
+                    f"{closer} ({closer.id}) via /transfer_close"
+                )
+            )
+            deleted = True
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "⚠️ Persistence record cleared but I lack permission to delete "
+                f"{target.mention} — please delete it manually.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                f"⚠️ Persistence record cleared but channel deletion failed: `{e}`",
+                ephemeral=True,
+            )
+            return
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        parts: List[str] = [f"✅ **#{target.name}** has been closed."]
+        parts.append(
+            f"📄 Transcript: {'saved to ' + f'`#{ADMIN_LOG_CHANNEL_NAME}`' if transcript_saved else '⚠️ could not be saved (channel may have been empty or unreachable)'}"
+        )
+        parts.append(
+            f"🗂️ Persistence record: {'removed' if had_record else 'none found (half-opened ticket)'}"
+        )
+        if cleared_pending:
+            parts.append("🧹 In-flight DM application state cleared for the applicant.")
+
+        await interaction.followup.send("\n".join(parts), ephemeral=True)
 
     # ----------------------------------------------------------------
     # /transfer_setup — manual panel refresh (leadership only)
