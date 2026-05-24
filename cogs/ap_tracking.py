@@ -74,6 +74,10 @@ CHAT_INTERVAL   = 1800    # 30 minutes
 CHAT_AP         = 15
 MIN_ACCOUNT_AGE_DAYS = 14  # Alt-account mitigation
 
+# Roles that bypass the account-age block and trigger retroactive AP catch-up.
+# These are matched by role NAME exactly as they appear in Discord.
+BYPASS_ROLE_NAMES = {"1", "2", "3", "4", "5", "6"}
+
 LYCAN_ROLE           = "Lycan King"
 AP_CHECK_CHANNEL     = "ap-check"
 AP_CHECK_EMBED_TITLE = "AP Balance"
@@ -174,7 +178,18 @@ async def save(data: Dict[str, Any]) -> None:
 def has_role_name(member: discord.Member, role_name: str) -> bool:
     return any(r.name == role_name for r in member.roles)
 
+def has_bypass_role(member: discord.Member) -> bool:
+    """Return True if the member holds any of the account-age bypass roles."""
+    return any(r.name in BYPASS_ROLE_NAMES for r in member.roles)
+
 def is_alt_account(member: discord.Member) -> bool:
+    """
+    Return True if the member should be treated as a too-young alt account.
+    Members who hold a bypass role (names "1"–"6") are always allowed through,
+    even if their Discord account is less than MIN_ACCOUNT_AGE_DAYS old.
+    """
+    if has_bypass_role(member):
+        return False
     age = (datetime.datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
     return age < MIN_ACCOUNT_AGE_DAYS
 
@@ -984,11 +999,121 @@ class APTracking(commands.Cog):
         gmeta[AP_CHECK_MESSAGE_ID_KEY] = msg.id
         await save(data)
 
+    # -------------------------
+    # Retroactive AP (bypass-role grant)
+    # -------------------------
+    async def _award_retroactive_ap(self, member: discord.Member) -> None:
+        """
+        Called the first time a bypass role (name "1"–"6") is assigned to a member
+        who was previously blocked by the account-age check.
+
+        Awards:
+          • Join bonus (100 AP) — if it was never granted.
+          • Chat AP catch-up   — one CHAT_AP award for every CHAT_INTERVAL window
+            that has elapsed since the member joined the server, capped at
+            MIN_ACCOUNT_AGE_DAYS worth of intervals (the maximum time they could
+            have been blocked).
+
+        Voice AP is intentionally omitted — there is no record of past voice activity.
+        Leadership bonuses are NOT cascaded on this retroactive award to avoid large
+        unexpected payouts to CEO / Director accounts.
+
+        All awards are written to the per-user audit log and to both log channels.
+        """
+        if not isinstance(member, discord.Member) or not member.guild:
+            return
+
+        data = await load()
+        rec  = data.setdefault(str(member.id), {"ap": 0, "last_chat": None})
+
+        retroactive_total = 0.0
+        reasons: List[str] = []
+
+        # ── 1. Join bonus ─────────────────────────────────────────────────────
+        if not rec.get(JOIN_BONUS_KEY):
+            await add_ap_raw(data, member.id, float(JOIN_BONUS_AP))
+            append_audit(
+                data, member.id, float(JOIN_BONUS_AP),
+                "join bonus (retroactive — bypass role granted)",
+            )
+            rec[JOIN_BONUS_KEY] = True
+            retroactive_total  += JOIN_BONUS_AP
+            reasons.append(f"join bonus: +{JOIN_BONUS_AP} AP")
+
+        # ── 2. Chat AP catch-up ───────────────────────────────────────────────
+        if member.joined_at:
+            now              = datetime.datetime.utcnow()
+            seconds_in_guild = (now - member.joined_at.replace(tzinfo=None)).total_seconds()
+            # Cap: they were blocked for at most MIN_ACCOUNT_AGE_DAYS
+            max_blocked_secs = MIN_ACCOUNT_AGE_DAYS * 86400.0
+            blocked_secs     = min(seconds_in_guild, max_blocked_secs)
+            intervals        = int(blocked_secs // CHAT_INTERVAL)
+
+            if intervals > 0:
+                chat_retro = float(intervals * CHAT_AP)
+                await add_ap_raw(data, member.id, chat_retro)
+                append_audit(
+                    data, member.id, chat_retro,
+                    "chat AP catch-up (retroactive — bypass role granted)",
+                    reason=f"{intervals} × {CHAT_AP} AP ({CHAT_INTERVAL}s interval)",
+                )
+                retroactive_total += chat_retro
+                reasons.append(
+                    f"chat catch-up ({intervals} interval(s) × {CHAT_AP} AP): +{int(chat_retro)} AP"
+                )
+
+        if retroactive_total <= 0:
+            # Nothing to award (e.g. join bonus already given, joined seconds ago)
+            await save(data)
+            return
+
+        await save(data)
+
+        # ── 3. Distribution embed ─────────────────────────────────────────────
+        try:
+            await log_ap_distribution_embed(
+                member.guild,
+                title="Retroactive AP Awarded — Bypass Role Granted",
+                recipient=member,
+                amount=retroactive_total,
+                source="bypass_role_grant",
+                reason="; ".join(reasons),
+            )
+        except Exception:
+            pass
+
+        # ── 4. Hierarchy log ──────────────────────────────────────────────────
+        try:
+            bullet_lines = "\n".join(f"  • {r}" for r in reasons)
+            await log_hierarchy_ap(
+                member.guild,
+                (
+                    f"Bypass role granted: {member.mention} received retroactive "
+                    f"**+{int(retroactive_total)} AP** (account-age block lifted).\n"
+                    f"{bullet_lines}"
+                ),
+                mention_ids=[member.id],
+            )
+        except Exception:
+            pass
+
+    # -------------------------
+    # Role / event listeners
+    # -------------------------
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
-        """Invalidate the leadership cache whenever a member's roles change."""
+        """Invalidate the leadership cache whenever a member's roles change.
+        Also triggers retroactive AP catch-up the first time a bypass role is assigned."""
         if before.roles != after.roles and after.guild:
             self._refresh_leadership_cache(after.guild)
+
+            # Detect first bypass-role assignment:
+            #   - the member did NOT have a bypass role before
+            #   - at least one bypass role is newly added
+            before_had_bypass = has_bypass_role(before)
+            after_has_bypass  = has_bypass_role(after)
+            if not before_had_bypass and after_has_bypass:
+                await self._award_retroactive_ap(after)
 
     @commands.Cog.listener()
     async def on_ready(self):
