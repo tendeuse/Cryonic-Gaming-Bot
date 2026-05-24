@@ -89,9 +89,10 @@ AP_CHECK_MESSAGE_ID_KEY = "ap_check_message_id"
 LAST_WIPE_KEY         = "last_wipe_utc"
 
 # ARC roles (bonus eligibility + admin permissions)
-CEO_ROLE       = "ARC Security Corporation Leader"
-DIRECTORS_ROLE = "ARC Security Administration Council"
-SECURITY_ROLE  = "ARC Security"
+CEO_ROLE        = "ARC Security Corporation Leader"
+DIRECTORS_ROLE  = "ARC Security Administration Council"
+SECURITY_ROLE   = "ARC Security"
+SUBSIDIZED_ROLE = "ARC Subsidized"
 
 # Join bonus
 JOIN_BONUS_AP  = 100
@@ -181,6 +182,10 @@ def has_role_name(member: discord.Member, role_name: str) -> bool:
 def has_bypass_role(member: discord.Member) -> bool:
     """Return True if the member holds any of the account-age bypass roles."""
     return any(r.name in BYPASS_ROLE_NAMES for r in member.roles)
+
+def earns_leadership_bonus(member: discord.Member) -> bool:
+    """Return True if this earner's AP should trigger CEO / Director bonuses."""
+    return has_role_name(member, SECURITY_ROLE) or has_role_name(member, SUBSIDIZED_ROLE)
 
 def is_alt_account(member: discord.Member) -> bool:
     """
@@ -528,7 +533,7 @@ async def award_ap_with_bonuses(
     directors_each    = 0.0
     directors_targets: List[int] = []
 
-    if has_role_name(earner, SECURITY_ROLE):
+    if earns_leadership_bonus(earner):
         ceo_targets   = ceo_ids(guild)
         all_directors = director_ids(guild)
         ceo_set       = set(ceo_targets)
@@ -594,8 +599,8 @@ async def award_ap_with_bonuses(
         if reason:
             lines.append(f"Reason: {reason}")
         lines.append("Unit bonuses: disabled (leadership-only bonus mode).")
-        if not has_role_name(earner, SECURITY_ROLE):
-            lines.append(f"Leadership bonus: none (earner missing required role {SECURITY_ROLE}).")
+        if not earns_leadership_bonus(earner):
+            lines.append(f"Leadership bonus: none (earner missing {SECURITY_ROLE} or {SUBSIDIZED_ROLE}).")
         else:
             if ceo_targets and ceo_bonus_each > 0:
                 lines.append(
@@ -839,8 +844,8 @@ def _apply_ap_to_data(
 
     mention_ids: List[int] = [earner.id]
 
-    if has_role_name(earner, SECURITY_ROLE):
-        ceo_set = set(ceo_id_list)
+    if earns_leadership_bonus(earner):
+        ceo_set            = set(ceo_id_list)
         eligible_directors = [uid for uid in director_id_list if uid not in ceo_set]
 
         # CEO: +10% each (not divided)
@@ -1002,6 +1007,37 @@ class APTracking(commands.Cog):
     # -------------------------
     # Retroactive AP (bypass-role grant)
     # -------------------------
+    async def _count_active_chat_intervals(self, member: discord.Member) -> int:
+        """
+        Scan message history across every readable text channel to find how many
+        distinct CHAT_INTERVAL (30-min) windows the member sent at least one
+        message in, from their join date up to now (capped at MIN_ACCOUNT_AGE_DAYS).
+
+        Returns the number of active windows (each worth CHAT_AP on award).
+        """
+        if not member.joined_at:
+            return 0
+
+        joined     = member.joined_at.replace(tzinfo=None)
+        now        = datetime.datetime.utcnow()
+        scan_start = max(joined, now - datetime.timedelta(days=MIN_ACCOUNT_AGE_DAYS))
+
+        active_buckets: set = set()
+
+        for channel in member.guild.text_channels:
+            try:
+                async for msg in channel.history(after=scan_start, before=now, limit=None):
+                    if msg.author.id == member.id:
+                        ts     = msg.created_at.replace(tzinfo=None)
+                        epoch  = (ts - datetime.datetime(1970, 1, 1)).total_seconds()
+                        bucket = int(epoch // CHAT_INTERVAL)
+                        active_buckets.add(bucket)
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            await asyncio.sleep(0)   # yield between channels
+
+        return len(active_buckets)
+
     async def _award_retroactive_ap(self, member: discord.Member) -> None:
         """
         Called the first time a bypass role (name "1"–"6") is assigned to a member
@@ -1023,13 +1059,22 @@ class APTracking(commands.Cog):
         if not isinstance(member, discord.Member) or not member.guild:
             return
 
+        # Only award retroactive AP if the member was actually blocked.
+        # If their Discord account is already MIN_ACCOUNT_AGE_DAYS or older,
+        # they were never affected by the alt-account check and earned AP normally.
+        account_age_days = (
+            datetime.datetime.utcnow() - member.created_at.replace(tzinfo=None)
+        ).days
+        if account_age_days >= MIN_ACCOUNT_AGE_DAYS:
+            return
+
         data = await load()
         rec  = data.setdefault(str(member.id), {"ap": 0, "last_chat": None})
 
         retroactive_total = 0.0
         reasons: List[str] = []
 
-        # ── 1. Join bonus ─────────────────────────────────────────────────────
+        # ── 1. Join bonus only ────────────────────────────────────────────────
         if not rec.get(JOIN_BONUS_KEY):
             await add_ap_raw(data, member.id, float(JOIN_BONUS_AP))
             append_audit(
@@ -1040,27 +1085,20 @@ class APTracking(commands.Cog):
             retroactive_total  += JOIN_BONUS_AP
             reasons.append(f"join bonus: +{JOIN_BONUS_AP} AP")
 
-        # ── 2. Chat AP catch-up ───────────────────────────────────────────────
-        if member.joined_at:
-            now              = datetime.datetime.utcnow()
-            seconds_in_guild = (now - member.joined_at.replace(tzinfo=None)).total_seconds()
-            # Cap: they were blocked for at most MIN_ACCOUNT_AGE_DAYS
-            max_blocked_secs = MIN_ACCOUNT_AGE_DAYS * 86400.0
-            blocked_secs     = min(seconds_in_guild, max_blocked_secs)
-            intervals        = int(blocked_secs // CHAT_INTERVAL)
-
-            if intervals > 0:
-                chat_retro = float(intervals * CHAT_AP)
-                await add_ap_raw(data, member.id, chat_retro)
-                append_audit(
-                    data, member.id, chat_retro,
-                    "chat AP catch-up (retroactive — bypass role granted)",
-                    reason=f"{intervals} × {CHAT_AP} AP ({CHAT_INTERVAL}s interval)",
-                )
-                retroactive_total += chat_retro
-                reasons.append(
-                    f"chat catch-up ({intervals} interval(s) × {CHAT_AP} AP): +{int(chat_retro)} AP"
-                )
+        # ── 2. Chat AP — based on actual messages sent while blocked ──────────
+        intervals = await self._count_active_chat_intervals(member)
+        if intervals > 0:
+            chat_retro = float(intervals * CHAT_AP)
+            await add_ap_raw(data, member.id, chat_retro)
+            append_audit(
+                data, member.id, chat_retro,
+                "chat AP (retroactive — bypass role granted)",
+                reason=f"{intervals} active 30-min window(s) found in message history",
+            )
+            retroactive_total += chat_retro
+            reasons.append(
+                f"chat catch-up ({intervals} active window(s) × {CHAT_AP} AP): +{int(chat_retro)} AP"
+            )
 
         if retroactive_total <= 0:
             # Nothing to award (e.g. join bonus already given, joined seconds ago)
@@ -1258,7 +1296,7 @@ class APTracking(commands.Cog):
         view = APClaimGameView(owner_id=interaction.user.id)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="give_ap", description="Give AP to a member (Lycan King only).")
+    @app_commands.command(name="give_ap", description="Give AP to a member (CEO / Lycan King only).")
     async def give_ap(
         self,
         interaction: discord.Interaction,
@@ -1266,7 +1304,7 @@ class APTracking(commands.Cog):
         amount: app_commands.Range[int, 1, 1_000_000],
         reason: str | None = None
     ):
-        if not isinstance(interaction.user, discord.Member) or not has_role_name(interaction.user, LYCAN_ROLE):
+        if not isinstance(interaction.user, discord.Member) or not is_authorized_admin(interaction.user):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
         await award_ap_with_bonuses(
@@ -1285,7 +1323,7 @@ class APTracking(commands.Cog):
             ephemeral=True
         )
 
-    @app_commands.command(name="remove_ap", description="Remove AP from a member (Lycan King only).")
+    @app_commands.command(name="remove_ap", description="Remove AP from a member (CEO / Lycan King only).")
     async def remove_ap(
         self,
         interaction: discord.Interaction,
@@ -1293,7 +1331,7 @@ class APTracking(commands.Cog):
         amount: app_commands.Range[int, 1, 1_000_000],
         reason: str | None = None
     ):
-        if not isinstance(interaction.user, discord.Member) or not has_role_name(interaction.user, LYCAN_ROLE):
+        if not isinstance(interaction.user, discord.Member) or not is_authorized_admin(interaction.user):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
         data = await load()
