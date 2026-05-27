@@ -25,7 +25,8 @@ from datetime import datetime, timedelta, timezone
 DATA_DIR = "/data"
 DATA_FILE = os.path.join(DATA_DIR, "member_roles.json")
 
-NEW_MEMBER_ROLE = "New Member"
+NEW_MEMBER_ROLE = "New Member"          # display / log strings only
+NEW_MEMBER_ROLE_ID = 1419837428146901013  # authoritative lookup – immune to renames
 SECURITY_ROLE = "ARC Security"
 SUBSIDIZED_ROLE = "ARC Subsidized"
 SCHEDULING_ROLE = "Scheduling"
@@ -136,6 +137,10 @@ class NewMemberRoles(commands.Cog):
 
     def get_role(self, guild: discord.Guild, name: str):
         return discord.utils.get(guild.roles, name=name)
+
+    def get_new_member_role(self, guild: discord.Guild):
+        """Always look up New Member by ID so renames don't break anything."""
+        return discord.utils.get(guild.roles, id=NEW_MEMBER_ROLE_ID)
 
     def get_log_channel(self, guild: discord.Guild):
         return discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
@@ -256,7 +261,7 @@ class NewMemberRoles(commands.Cog):
 
     async def is_new_player(self, member: discord.Member) -> bool:
         guild = member.guild
-        nm_role = self.get_role(guild, NEW_MEMBER_ROLE)
+        nm_role = self.get_new_member_role(guild)
 
         if nm_role and nm_role in member.roles:
             return True
@@ -326,7 +331,7 @@ class NewMemberRoles(commands.Cog):
         changed = False
 
         for guild in self.bot.guilds:
-            nm_role = self.get_role(guild, NEW_MEMBER_ROLE)
+            nm_role = self.get_new_member_role(guild)
             if nm_role:
                 for member in guild.members:
                     if nm_role in member.roles:
@@ -371,7 +376,7 @@ class NewMemberRoles(commands.Cog):
                     break
 
             if member:
-                role = self.get_role(member.guild, NEW_MEMBER_ROLE)
+                role = self.get_new_member_role(member.guild)
                 if role and role not in member.roles:
                     try:
                         await self._safe_add_roles(member, role, reason="Auto New Member role (1 hour after join)")
@@ -394,6 +399,8 @@ class NewMemberRoles(commands.Cog):
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         before_roles = {r.name for r in before.roles}
         after_roles = {r.name for r in after.roles}
+        before_role_ids = {r.id for r in before.roles}
+        after_role_ids = {r.id for r in after.roles}
 
         # NEW: log when ARC Security is granted
         if (SECURITY_ROLE in after_roles) and (SECURITY_ROLE not in before_roles):
@@ -403,10 +410,10 @@ class NewMemberRoles(commands.Cog):
             await self.handle_eve_role_added(after, reason="EVE role added")
 
         # NEW: send DM when New Member role is granted (auto timer or manual)
-        if (NEW_MEMBER_ROLE in after_roles) and (NEW_MEMBER_ROLE not in before_roles):
+        if (NEW_MEMBER_ROLE_ID in after_role_ids) and (NEW_MEMBER_ROLE_ID not in before_role_ids):
             await self._send_new_member_dm(after)
 
-        if NEW_MEMBER_ROLE in before_roles and NEW_MEMBER_ROLE not in after_roles:
+        if NEW_MEMBER_ROLE_ID in before_role_ids and NEW_MEMBER_ROLE_ID not in after_role_ids:
             actor = "Unknown"
             try:
                 async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
@@ -670,7 +677,7 @@ class NewMemberRoles(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        nm = self.get_role(guild, NEW_MEMBER_ROLE)
+        nm = self.get_new_member_role(guild)
         sched = self.get_role(guild, SCHEDULING_ROLE)
         onboard = self.get_role(guild, ONBOARDING_ROLE)
 
