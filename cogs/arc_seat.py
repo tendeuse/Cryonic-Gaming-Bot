@@ -245,6 +245,8 @@ def _default_member(discord_id: int) -> Dict[str, Any]:
         "last_esi_pull":          None,
         "discord_roles_synced_at": None,
         "watch_list_thread_id":   None,
+        "tests_embed_msg_id":     None,
+        "events_embed_msg_id":    None,
         "characters":             [],
         "flags":                  [],
         "risk_score":             0,
@@ -1397,7 +1399,8 @@ class ArcSeatCog(commands.Cog, name="ArcSeat"):
         await save_seat_data(data)
         print(
             f"[ARC-SEAT] Ready. {len(data.get('members', {}))} member(s) tracked. "
-            "Tokens shared with overlay_api via overlay DB."
+            f"Approved corp IDs: {ARC_APPROVED_CORP_IDS}. "
+            "Tokens stored in arc_seat.db."
         )
 
     def _register_callback_route(self) -> None:
@@ -1703,16 +1706,16 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                 if all_info:
                     char["alliance_name"] = all_info.get("name", str(alliance_id))
 
+            # Check in-ARC-corp — only when we got fresh data from ESI
+            cfg = data.get("config", {})
+            char["in_arc_corp"] = _is_approved_corp(char.get("corporation_id"), cfg)
+
         # Corp history — public
         corp_history = await self._esi.get(
             f"/characters/{char_id}/corporationhistory/"
         )
         if corp_history is not None:
             cache["corp_history"] = corp_history
-
-        # Check in-ARC-corp (main corp OR approved subsidiary)
-        cfg = data.get("config", {})
-        char["in_arc_corp"] = _is_approved_corp(char.get("corporation_id"), cfg)
 
         # zkillboard — public
         zkm = await self._esi.zkill_character(char_id, page=1)
@@ -1844,13 +1847,15 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         if not arc_corp_id:
             return
 
-        characters   = member.get("characters", [])
-        any_in_corp  = False
+        characters       = member.get("characters", [])
+        any_in_corp      = False
+        any_esi_success  = False   # track whether we got at least one valid ESI response
 
         for char in characters:
             # Corp membership is a public ESI endpoint — no token needed
             pub = await self._esi.get(f"/characters/{char['character_id']}/")
             if pub:
+                any_esi_success = True
                 new_corp_id            = pub.get("corporation_id")
                 char["corporation_id"] = new_corp_id
                 char["in_arc_corp"]    = _is_approved_corp(new_corp_id, cfg)
@@ -1862,10 +1867,22 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                     corp_info = await self._esi.get(f"/corporations/{new_corp_id}/")
                     if corp_info:
                         char["corporation_name"] = corp_info.get("name", str(new_corp_id))
+            else:
+                # ESI failed for this character — fall back to last known value
+                if char.get("in_arc_corp"):
+                    any_in_corp = True
 
         member["last_corp_check"] = _now_iso()
         data["members"][key]      = member
         await save_seat_data(data)
+
+        # If every ESI call failed, don't act on stale/missing data — skip this cycle
+        if not any_esi_success:
+            print(
+                f"[ARC-SEAT] Corp sync skipped for {discord_id}: "
+                "all ESI calls failed — retaining current status."
+            )
+            return
 
         discord_member = guild.get_member(discord_id)
         if not discord_member:
@@ -2240,19 +2257,51 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                 except Exception as e:
                     print(f"[ARC-SEAT] Overflow flags file failed: {e}")
 
-        # ── Tests & Certifications follow-up ─────────────────────────────────
+        # ── Tests & Certifications follow-up (edit existing or send once) ────
         if isinstance(existing_thread, discord.Thread):
             try:
                 tests_embed = self._build_tests_embed(discord_member)
-                await existing_thread.send(embed=tests_embed)
+                tests_msg_id = member_rec.get("tests_embed_msg_id")
+                tests_msg: Optional[discord.Message] = None
+
+                # Try to edit the existing message
+                if tests_msg_id:
+                    try:
+                        tests_msg = await existing_thread.fetch_message(tests_msg_id)
+                        await tests_msg.edit(embed=tests_embed)
+                    except (discord.NotFound, discord.HTTPException):
+                        tests_msg = None  # message gone — send a new one
+
+                # Send a new message only if we don't have one yet
+                if tests_msg is None:
+                    tests_msg = await existing_thread.send(embed=tests_embed)
+                    member_rec["tests_embed_msg_id"] = tests_msg.id
+                    data["members"][str(discord_member.id)] = member_rec
+                    await save_seat_data(data)
             except Exception as e:
                 print(f"[ARC-SEAT] Tests embed failed: {e}")
 
-        # ── Event participation follow-up ─────────────────────────────────────
+        # ── Event participation follow-up (edit existing or send once) ────────
         if isinstance(existing_thread, discord.Thread):
             try:
                 events_embed = self._build_events_embed(discord_member.id)
-                await existing_thread.send(embed=events_embed)
+                events_msg_id = member_rec.get("events_embed_msg_id")
+                events_msg: Optional[discord.Message] = None
+
+                # Try to edit the existing message
+                if events_msg_id:
+                    try:
+                        events_msg = await existing_thread.fetch_message(events_msg_id)
+                        await events_msg.edit(embed=events_embed)
+                    except (discord.NotFound, discord.HTTPException):
+                        events_msg = None  # message gone — send a new one
+
+                # Send a new message only if we don't have one yet
+                if events_msg is None:
+                    events_msg = await existing_thread.send(embed=events_embed)
+                    member_rec["events_embed_msg_id"] = events_msg.id
+                    data["members"][str(discord_member.id)] = member_rec
+                    await save_seat_data(data)
             except Exception as e:
                 print(f"[ARC-SEAT] Events embed failed: {e}")
 
