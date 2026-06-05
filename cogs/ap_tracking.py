@@ -715,12 +715,11 @@ async def wipe_ap_in_data(data: Dict[str, Any]) -> None:
     Wipes AP balances for all users while preserving:
       - join bonus flag (JOIN_BONUS_KEY)
       - ign/game claim fields
-    Also clears last_chat timestamps to avoid immediate chat awards,
-    and clears the per-user audit log (logs are "since last reset").
+    Clears the per-user audit log (logs are "since last reset").
+    Note: last_chat is tracked in-memory on the cog, not in this file.
     """
     for _, rec in iter_member_records(data):
         rec["ap"]        = 0
-        rec["last_chat"] = None
         rec[AUDIT_KEY]   = []   # clear audit so next cycle starts fresh
 
 # -------------------------
@@ -897,6 +896,10 @@ class APTracking(commands.Cog):
         # Built on ready and refreshed whenever a member's roles change.
         # Avoids iterating all guild members on every voice/chat tick.
         self._leadership_cache: Dict[int, Tuple[List[int], List[int]]] = {}
+        # In-memory chat activity tracker: {member_id: datetime}.
+        # Replaces the old file-based "last_chat" field to avoid race conditions
+        # where voice_loop / chat_loop save() would overwrite on_message updates.
+        self._last_chat: Dict[int, datetime.datetime] = {}
         if not self.voice_loop.is_running():
             self.voice_loop.start()
         if not self.chat_loop.is_running():
@@ -1200,10 +1203,8 @@ class APTracking(commands.Cog):
             return
         if is_alt_account(message.author):
             return
-        data = await load()
-        rec  = data.setdefault(str(message.author.id), {"ap": 0, "last_chat": None})
-        rec["last_chat"] = utcnow()
-        await save(data)
+        # Track in memory — no file I/O, immune to save() race conditions
+        self._last_chat[message.author.id] = datetime.datetime.utcnow()
 
     @tasks.loop(seconds=VOICE_INTERVAL)
     async def voice_loop(self):
@@ -1247,6 +1248,11 @@ class APTracking(commands.Cog):
         boosts_changed = False
         data   = await load()
 
+        # Snapshot and clear the in-memory chat tracker so each message
+        # is credited exactly once, regardless of how long processing takes.
+        chat_snapshot = dict(self._last_chat)
+        self._last_chat.clear()
+
         for guild in self.bot.guilds:
             ceos, dirs = self._get_leadership_ids(guild)
             for i, m in enumerate(guild.members):
@@ -1254,15 +1260,8 @@ class APTracking(commands.Cog):
                     continue
                 if is_alt_account(m):
                     continue
-                rec = data.get(str(m.id))
-                if not isinstance(rec, dict):
-                    continue
-                ts = rec.get("last_chat")
-                if not ts:
-                    continue
-                try:
-                    last = datetime.datetime.fromisoformat(ts)
-                except ValueError:
+                last = chat_snapshot.get(m.id)
+                if not last:
                     continue
                 if (now - last).total_seconds() <= CHAT_INTERVAL:
                     _, _, changed = _apply_ap_to_data(
@@ -1490,6 +1489,7 @@ class APTracking(commands.Cog):
             pass
 
         await wipe_ap_in_data(data)
+        self._last_chat.clear()   # clear in-memory chat tracker on wipe
         meta  = data.setdefault(META_KEY, {})
         gmeta = meta.setdefault(str(interaction.guild.id), {})
         gmeta[LAST_WIPE_KEY] = utcnow()
@@ -1849,6 +1849,205 @@ class APTracking(commands.Cog):
                 f"⚠️ CSV generation failed: `{e}`",
                 ephemeral=True,
             )
+
+
+    # -------------------------
+    # /ap_recalculate — retroactive chat AP catch-up
+    # -------------------------
+
+    @app_commands.command(
+        name="ap_recalculate",
+        description="[Admin] Scan message history since last wipe and award missing chat AP."
+    )
+    async def ap_recalculate(self, interaction: discord.Interaction):
+        """
+        Scans every text channel for messages sent since the last AP wipe,
+        counts distinct CHAT_INTERVAL (30-min) windows per member, compares
+        against chat AP already credited in their audit log, and awards the
+        difference.  Voice AP cannot be recovered (no historical data).
+
+        This is a one-time catch-up command — safe to run multiple times
+        because it deducts already-credited windows.
+        """
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
+            return
+        if not is_authorized_admin(interaction.user):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        data  = await load()
+        meta  = data.get(META_KEY, {})
+        gmeta = meta.get(str(guild.id), {}) if isinstance(meta, dict) else {}
+        wipe_iso = gmeta.get(LAST_WIPE_KEY)
+
+        if not wipe_iso:
+            await interaction.followup.send(
+                "❌ No wipe timestamp found — cannot determine scan window.\n"
+                "This command scans messages since the last `/export_ap` wipe.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            wipe_dt = datetime.datetime.fromisoformat(wipe_iso)
+        except ValueError:
+            await interaction.followup.send(
+                f"❌ Malformed wipe timestamp: `{wipe_iso}`", ephemeral=True
+            )
+            return
+
+        now = datetime.datetime.utcnow()
+
+        await interaction.followup.send(
+            f"⏳ Scanning message history since last wipe (`{wipe_iso[:19]} UTC`).\n"
+            "This may take a few minutes for large servers…",
+            ephemeral=True,
+        )
+
+        # ── 1. Scan channels and count active 30-min buckets per member ───────
+        # bucket = floor(epoch_seconds / CHAT_INTERVAL)
+        member_buckets: Dict[int, set] = {}   # {member_id: set of bucket indices}
+        channels_scanned = 0
+        messages_scanned = 0
+
+        for channel in guild.text_channels:
+            try:
+                async for msg in channel.history(after=wipe_dt, before=now, limit=None):
+                    if msg.author.bot:
+                        continue
+                    if not isinstance(msg.author, discord.Member):
+                        continue
+                    if is_alt_account(msg.author):
+                        continue
+                    ts    = msg.created_at.replace(tzinfo=None)
+                    epoch = (ts - datetime.datetime(1970, 1, 1)).total_seconds()
+                    bucket = int(epoch // CHAT_INTERVAL)
+                    member_buckets.setdefault(msg.author.id, set()).add(bucket)
+                    messages_scanned += 1
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            channels_scanned += 1
+            await asyncio.sleep(0)   # yield between channels
+
+        if not member_buckets:
+            await interaction.followup.send(
+                f"✅ Scan complete — {channels_scanned} channel(s), "
+                f"{messages_scanned} message(s).\n"
+                "No eligible chat activity found since the last wipe.",
+                ephemeral=True,
+            )
+            return
+
+        # ── 2. Count already-credited chat AP from audit logs ─────────────────
+        def _count_credited_chat_entries(rec: Dict[str, Any]) -> int:
+            """Count audit entries with source 'chat' since the last wipe."""
+            count = 0
+            for entry in rec.get(AUDIT_KEY, []):
+                if entry.get("source") == "chat" and entry.get("delta", 0) > 0:
+                    count += 1
+            return count
+
+        # ── 3. Award the difference ───────────────────────────────────────────
+        data = await load()   # re-load fresh to avoid stale snapshot
+        ceos, dirs = self._get_leadership_ids(guild)
+        boosts: Dict[str, Any] = _load_boosts_file()
+        boosts_changed = False
+
+        corrected_members = 0
+        total_ap_awarded  = 0.0
+        details: List[str] = []
+
+        for member_id, buckets in member_buckets.items():
+            member = guild.get_member(member_id)
+            if not member or member.bot:
+                continue
+
+            expected_windows = len(buckets)
+            rec = data.get(str(member_id), {})
+            already_credited = _count_credited_chat_entries(rec) if isinstance(rec, dict) else 0
+
+            missing = expected_windows - already_credited
+            if missing <= 0:
+                continue   # already fully credited
+
+            missing_ap = float(missing * CHAT_AP)
+
+            _, _, changed = _apply_ap_to_data(
+                data, member, missing_ap,
+                "chat (recalculated catch-up)", None,
+                ceos, dirs, boosts,
+            )
+            if changed:
+                boosts_changed = True
+
+            corrected_members += 1
+            total_ap_awarded  += missing_ap
+            details.append(
+                f"• {member.display_name}: **+{int(missing_ap)} AP** "
+                f"({missing} missed window(s) of {expected_windows} total)"
+            )
+
+        await save(data)
+        if boosts_changed:
+            _save_boosts_file(boosts)
+
+        # ── 4. Log to hierarchy channel ───────────────────────────────────────
+        try:
+            await log_hierarchy_ap(
+                guild,
+                f"AP recalculation executed by {interaction.user.mention}.\n"
+                f"Scanned {channels_scanned} channel(s), {messages_scanned:,} message(s) "
+                f"since `{wipe_iso[:19]} UTC`.\n"
+                f"**{corrected_members}** member(s) received catch-up AP "
+                f"totalling **+{int(total_ap_awarded)} AP**.",
+                mention_ids=[interaction.user.id],
+            )
+        except Exception:
+            pass
+
+        # ── 5. Report results ─────────────────────────────────────────────────
+        summary = (
+            f"**Scan complete**\n"
+            f"Channels scanned: `{channels_scanned}`\n"
+            f"Messages scanned: `{messages_scanned:,}`\n"
+            f"Window since wipe: `{wipe_iso[:19]} UTC` → now\n\n"
+            f"**Members corrected:** `{corrected_members}`\n"
+            f"**Total catch-up AP awarded:** `+{int(total_ap_awarded)} AP`\n"
+            f"_(includes leadership bonuses where applicable)_\n\n"
+            f"⚠️ **Voice AP cannot be recovered** — Discord does not store "
+            f"historical voice presence data."
+        )
+
+        if details:
+            detail_text = "\n".join(details[:50])
+            if len(details) > 50:
+                detail_text += f"\n… and {len(details) - 50} more"
+            summary += f"\n\n**Breakdown:**\n{detail_text}"
+
+        # Split if too long for a single message
+        if len(summary) <= 1900:
+            await interaction.followup.send(summary, ephemeral=True)
+        else:
+            # Send summary as file attachment
+            embed = discord.Embed(
+                title="✅ AP Recalculation Complete",
+                description=(
+                    f"Channels: `{channels_scanned}` | Messages: `{messages_scanned:,}`\n"
+                    f"Members corrected: `{corrected_members}` | "
+                    f"AP awarded: `+{int(total_ap_awarded)}`\n\n"
+                    "Full breakdown attached."
+                ),
+                timestamp=datetime.datetime.utcnow(),
+            )
+            file = discord.File(
+                io.BytesIO(summary.encode("utf-8")),
+                filename="ap_recalculation_report.txt",
+            )
+            await interaction.followup.send(embed=embed, file=file, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
