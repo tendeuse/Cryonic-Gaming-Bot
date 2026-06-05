@@ -38,7 +38,7 @@ GENESIS_ROLE = "ARC Genesis"
 DIRECTOR_ROLE = "ARC Security Administration Council"
 CEO_ROLE = "ARC Security Corporation Leader"
 
-LOG_CHANNEL_NAME = "roles-log"
+LOG_CHANNEL_NAME = "audit-log"
 
 NEW_MEMBER_DM = (
     "You've been identified by this bot as a new member of discord server Cryonic Gaming. Welcome! "
