@@ -1857,11 +1857,18 @@ class APTracking(commands.Cog):
 
     @app_commands.command(
         name="ap_recalculate",
-        description="[Admin] Scan message history since last wipe and award missing chat AP."
+        description="[Admin] Scan message history since reset date and award missing chat AP."
     )
-    async def ap_recalculate(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        reset_date="The AP reset date to scan from (YYYY-MM-DD). Defaults to last wipe date.",
+    )
+    async def ap_recalculate(
+        self,
+        interaction: discord.Interaction,
+        reset_date: Optional[str] = None,
+    ):
         """
-        Scans every text channel for messages sent since the last AP wipe,
+        Scans every text channel for messages sent since the given reset date,
         counts distinct CHAT_INTERVAL (30-min) windows per member, compares
         against chat AP already credited in their audit log, and awards the
         difference.  Voice AP cannot be recovered (no historical data).
@@ -1884,26 +1891,39 @@ class APTracking(commands.Cog):
         gmeta = meta.get(str(guild.id), {}) if isinstance(meta, dict) else {}
         wipe_iso = gmeta.get(LAST_WIPE_KEY)
 
-        if not wipe_iso:
+        # ── Resolve start date ────────────────────────────────────────────
+        if reset_date:
+            try:
+                wipe_dt = datetime.datetime.strptime(reset_date.strip(), "%Y-%m-%d")
+            except ValueError:
+                await interaction.followup.send(
+                    f"❌ Invalid `reset_date`: `{reset_date}`. Use format **YYYY-MM-DD**.",
+                    ephemeral=True,
+                )
+                return
+            scan_start_label = reset_date.strip()
+        elif wipe_iso:
+            try:
+                wipe_dt = datetime.datetime.fromisoformat(wipe_iso)
+            except ValueError:
+                await interaction.followup.send(
+                    f"❌ Malformed wipe timestamp: `{wipe_iso}`", ephemeral=True
+                )
+                return
+            scan_start_label = wipe_iso[:19] + " UTC (last wipe)"
+        else:
             await interaction.followup.send(
-                "❌ No wipe timestamp found — cannot determine scan window.\n"
-                "This command scans messages since the last `/export_ap` wipe.",
+                "❌ No wipe timestamp found and no `reset_date` provided.\n"
+                "Specify the reset date, e.g. `/ap_recalculate reset_date:2026-05-01`.",
                 ephemeral=True,
             )
             return
 
-        try:
-            wipe_dt = datetime.datetime.fromisoformat(wipe_iso)
-        except ValueError:
-            await interaction.followup.send(
-                f"❌ Malformed wipe timestamp: `{wipe_iso}`", ephemeral=True
-            )
-            return
-
         now = datetime.datetime.utcnow()
+        scan_end_label = "now"
 
         await interaction.followup.send(
-            f"⏳ Scanning message history since last wipe (`{wipe_iso[:19]} UTC`).\n"
+            f"⏳ Scanning message history from `{scan_start_label}` to now.\n"
             "This may take a few minutes for large servers…",
             ephemeral=True,
         )
@@ -2001,7 +2021,7 @@ class APTracking(commands.Cog):
                 guild,
                 f"AP recalculation executed by {interaction.user.mention}.\n"
                 f"Scanned {channels_scanned} channel(s), {messages_scanned:,} message(s) "
-                f"since `{wipe_iso[:19]} UTC`.\n"
+                f"from `{scan_start_label}` to `{scan_end_label}`.\n"
                 f"**{corrected_members}** member(s) received catch-up AP "
                 f"totalling **+{int(total_ap_awarded)} AP**.",
                 mention_ids=[interaction.user.id],
@@ -2014,7 +2034,7 @@ class APTracking(commands.Cog):
             f"**Scan complete**\n"
             f"Channels scanned: `{channels_scanned}`\n"
             f"Messages scanned: `{messages_scanned:,}`\n"
-            f"Window since wipe: `{wipe_iso[:19]} UTC` → now\n\n"
+            f"Scan window: `{scan_start_label}` → `{scan_end_label}`\n\n"
             f"**Members corrected:** `{corrected_members}`\n"
             f"**Total catch-up AP awarded:** `+{int(total_ap_awarded)} AP`\n"
             f"_(includes leadership bonuses where applicable)_\n\n"
