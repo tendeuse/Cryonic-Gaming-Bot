@@ -204,18 +204,14 @@ def is_admin(member: discord.abc.User | discord.Member) -> bool:
 # =====================
 def build_role_listing_embed(listing_id: str, listing: dict) -> discord.Embed:
     role_name = listing.get("role_name", "Unknown Role")
-    desc      = listing.get("description", "")
     price     = int(listing.get("price", 0))
-    dur_hours = int(listing.get("duration_hours", 0))
 
     embed = discord.Embed(
         title=f"\U0001f451 {role_name}",
-        description=desc or "No description.",
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow(),
     )
-    embed.add_field(name="Cost",     value=f"{price} AP",                    inline=True)
-    embed.add_field(name="Duration", value=format_duration(dur_hours),       inline=True)
+    embed.add_field(name="Cost", value=f"{price} AP", inline=True)
     embed.set_footer(text=f"Role Shop | id:{listing_id}")
     return embed
 
@@ -353,31 +349,60 @@ class SetupItemView(discord.ui.View):
 # =====================
 # Admin modals
 # =====================
-class AddRoleListingModal(discord.ui.Modal):
-    def __init__(self, cog: "RoleShopCog"):
-        super().__init__(title="Add Role Listing")
-        self.cog = cog
+def get_roles_below_bot(guild: discord.Guild) -> list[discord.Role]:
+    """Return all guild roles below the bot's highest role, excluding @everyone and managed roles."""
+    me = guild.me
+    if not me:
+        return []
+    bot_top = me.top_role
+    return [
+        r for r in guild.roles
+        if r < bot_top
+        and r != guild.default_role
+        and not r.managed
+    ]
 
-        self.role_name = discord.ui.TextInput(
-            label="Role Name (must match a Discord role exactly)",
-            placeholder="e.g. VIP Member",
-            required=True,
-            max_length=100,
+
+class AddRoleSelectView(discord.ui.View):
+    """Step 1: admin picks a role from a dropdown of roles below the bot."""
+    def __init__(self, cog: "RoleShopCog", roles: list[discord.Role]):
+        super().__init__(timeout=120)
+        self.cog = cog
+        # Discord selects max 25 options — take the top 25 by position (highest first)
+        sorted_roles = sorted(roles, key=lambda r: r.position, reverse=True)[:25]
+        options = [
+            discord.SelectOption(label=r.name, value=str(r.id))
+            for r in sorted_roles
+        ]
+        select = discord.ui.Select(
+            placeholder="Choose a role to list...",
+            options=options,
+            custom_id="roleshop:add_role_select",
         )
-        self.description = discord.ui.TextInput(
-            label="Description",
-            style=discord.TextStyle.long,
-            placeholder="What does this role give?",
-            required=False,
-            max_length=500,
-        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        role_id = int(interaction.data["values"][0])
+        role    = interaction.guild.get_role(role_id) if interaction.guild else None
+        if not role:
+            await safe_reply(interaction, "❌ Role not found.", ephemeral=True)
+            return
+        await safe_send_modal(interaction, AddRolePriceModal(self.cog, role))
+
+
+class AddRolePriceModal(discord.ui.Modal):
+    """Step 2: admin enters the AP price for the selected role."""
+    def __init__(self, cog: "RoleShopCog", role: discord.Role):
+        super().__init__(title=f"Set Price — {role.name[:40]}")
+        self.cog  = cog
+        self.role = role
+
         self.price = discord.ui.TextInput(
             label="AP Cost",
             placeholder="e.g. 500",
             required=True,
         )
-        self.add_item(self.role_name)
-        self.add_item(self.description)
         self.add_item(self.price)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -385,9 +410,6 @@ class AddRoleListingModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
             return
         await safe_defer(interaction, ephemeral=True)
-
-        role_name = str(self.role_name.value).strip()
-        desc      = str(self.description.value).strip()
 
         try:
             price = int(str(self.price.value).strip())
@@ -397,19 +419,12 @@ class AddRoleListingModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
             return
 
-        if interaction.guild:
-            role = discord.utils.get(interaction.guild.roles, name=role_name)
-            if not role:
-                await safe_reply(interaction, f"❌ No role named **{role_name}** found in this server.", ephemeral=True)
-                return
-
         async with ROLE_SHOP_LOCK:
             shop       = await aload_role_shop()
             listing_id = uuid.uuid4().hex[:10]
             shop["roles"][listing_id] = {
-                "role_name":      role_name,
-                "role_id":        str(role.id) if interaction.guild and role else None,
-                "description":    desc,
+                "role_name":      self.role.name,
+                "role_id":        str(self.role.id),
                 "price":          price,
                 "duration_hours": 720,
             }
@@ -417,33 +432,57 @@ class AddRoleListingModal(discord.ui.Modal):
 
         if interaction.guild:
             await self.cog.sync_shop_messages(interaction.guild)
-        await safe_reply(interaction, f"✅ Role listing **{role_name}** added.", ephemeral=True)
+        await safe_reply(interaction, f"✅ Role listing **{self.role.name}** added at **{price} AP**.", ephemeral=True)
 
 
-class EditRoleListingModal(discord.ui.Modal):
-    def __init__(self, cog: "RoleShopCog", listing_id: str, listing: dict):
-        super().__init__(title="Edit Role Listing")
+class EditRoleSelectView(discord.ui.View):
+    """Step 1 of edit: admin picks a new role (or the same one) from the dropdown."""
+    def __init__(self, cog: "RoleShopCog", listing_id: str, listing: dict, roles: list[discord.Role]):
+        super().__init__(timeout=120)
         self.cog        = cog
         self.listing_id = listing_id
+        self.listing    = listing
 
-        self.role_name = discord.ui.TextInput(
-            label="Role Name",
-            default=listing.get("role_name", ""),
-            required=True, max_length=100,
+        sorted_roles = sorted(roles, key=lambda r: r.position, reverse=True)[:25]
+        current_id   = str(listing.get("role_id", ""))
+        options = []
+        for r in sorted_roles:
+            options.append(discord.SelectOption(
+                label=r.name, value=str(r.id),
+                default=(str(r.id) == current_id),
+            ))
+        select = discord.ui.Select(
+            placeholder="Choose a role...",
+            options=options,
         )
-        self.description = discord.ui.TextInput(
-            label="Description",
-            style=discord.TextStyle.long,
-            default=listing.get("description", ""),
-            required=False, max_length=500,
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        role_id = int(interaction.data["values"][0])
+        role    = interaction.guild.get_role(role_id) if interaction.guild else None
+        if not role:
+            await safe_reply(interaction, "❌ Role not found.", ephemeral=True)
+            return
+        await safe_send_modal(
+            interaction,
+            EditRolePriceModal(self.cog, self.listing_id, role, self.listing),
         )
+
+
+class EditRolePriceModal(discord.ui.Modal):
+    """Step 2 of edit: admin updates the AP price."""
+    def __init__(self, cog: "RoleShopCog", listing_id: str, role: discord.Role, listing: dict):
+        super().__init__(title=f"Edit Price — {role.name[:40]}")
+        self.cog        = cog
+        self.listing_id = listing_id
+        self.role       = role
+
         self.price = discord.ui.TextInput(
             label="AP Cost",
             default=str(listing.get("price", 0)),
             required=True,
         )
-        self.add_item(self.role_name)
-        self.add_item(self.description)
         self.add_item(self.price)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -452,8 +491,6 @@ class EditRoleListingModal(discord.ui.Modal):
             return
         await safe_defer(interaction, ephemeral=True)
 
-        role_name = str(self.role_name.value).strip()
-        desc      = str(self.description.value).strip()
         try:
             price = int(str(self.price.value).strip())
             if price < 0:
@@ -462,28 +499,20 @@ class EditRoleListingModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
             return
 
-        role = None
-        if interaction.guild:
-            role = discord.utils.get(interaction.guild.roles, name=role_name)
-            if not role:
-                await safe_reply(interaction, f"❌ No role named **{role_name}** found.", ephemeral=True)
-                return
-
         async with ROLE_SHOP_LOCK:
             shop = await aload_role_shop()
             if self.listing_id not in shop["roles"]:
                 await safe_reply(interaction, "❌ Listing no longer exists.", ephemeral=True)
                 return
             listing = shop["roles"][self.listing_id]
-            listing["role_name"]   = role_name
-            listing["role_id"]     = str(role.id) if role else listing.get("role_id")
-            listing["description"] = desc
-            listing["price"]       = price
+            listing["role_name"] = self.role.name
+            listing["role_id"]   = str(self.role.id)
+            listing["price"]     = price
             await asave_role_shop(shop)
 
         if interaction.guild:
             await self.cog.sync_shop_messages(interaction.guild)
-        await safe_reply(interaction, f"✅ Listing **{role_name}** updated.", ephemeral=True)
+        await safe_reply(interaction, f"✅ Listing updated to **{self.role.name}** at **{price} AP**.", ephemeral=True)
 
 
 # =====================
@@ -932,18 +961,18 @@ class RoleShopCog(commands.Cog):
 
             purchase_id = uuid.uuid4().hex[:10]
             purchase = {
-                "purchase_id":  purchase_id,
-                "member_id":    str(interaction.user.id),
-                "member_tag":   str(interaction.user),
-                "listing_id":   listing_id,
-                "role_id":      str(role.id),
-                "role_name":    role_name,
-                "cost":         price,
+                "purchase_id":    purchase_id,
+                "member_id":      str(interaction.user.id),
+                "member_tag":     str(interaction.user),
+                "listing_id":     listing_id,
+                "role_id":        str(role.id),
+                "role_name":      role_name,
+                "cost":           price,
                 "duration_hours": duration_hours,
-                "purchased_at": utc_iso(),
-                "expires_at":   expires_str,
-                "status":       "ACTIVE",
-                "guild_id":     str(interaction.guild.id),
+                "purchased_at":   utc_iso(),
+                "expires_at":     expires_str,
+                "status":         "ACTIVE",
+                "guild_id":       str(interaction.guild.id),
             }
 
             pdata = await aload_purchases()
@@ -994,7 +1023,17 @@ class RoleShopCog(commands.Cog):
                 if not is_admin(interaction.user):
                     await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
                     return
-                await safe_send_modal(interaction, AddRoleListingModal(self))
+                if not interaction.guild:
+                    await safe_reply(interaction, "❌ Must be used in a server.", ephemeral=True)
+                    return
+                roles = get_roles_below_bot(interaction.guild)
+                if not roles:
+                    await safe_reply(interaction, "❌ No assignable roles found below the bot's role.", ephemeral=True)
+                    return
+                view = AddRoleSelectView(self, roles)
+                await interaction.response.send_message(
+                    "**Select a role to add to the shop:**", view=view, ephemeral=True,
+                )
                 return
 
             if action == "edit" and len(parts) >= 3:
@@ -1002,12 +1041,22 @@ class RoleShopCog(commands.Cog):
                 if not is_admin(interaction.user):
                     await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
                     return
+                if not interaction.guild:
+                    await safe_reply(interaction, "❌ Must be used in a server.", ephemeral=True)
+                    return
                 shop = await aload_role_shop()
                 listing = shop["roles"].get(listing_id)
                 if not listing:
                     await safe_reply(interaction, "❌ Listing no longer exists.", ephemeral=True)
                     return
-                await safe_send_modal(interaction, EditRoleListingModal(self, listing_id, listing))
+                roles = get_roles_below_bot(interaction.guild)
+                if not roles:
+                    await safe_reply(interaction, "❌ No assignable roles found below the bot's role.", ephemeral=True)
+                    return
+                view = EditRoleSelectView(self, listing_id, listing, roles)
+                await interaction.response.send_message(
+                    "**Select the role and update the price:**", view=view, ephemeral=True,
+                )
                 return
 
             if action == "remove" and len(parts) >= 3:
