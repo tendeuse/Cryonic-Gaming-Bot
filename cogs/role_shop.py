@@ -60,7 +60,6 @@ DURATION_CHOICES = [
     ("30 Days",  720),
     ("60 Days",  1440),
     ("90 Days",  2160),
-    ("Permanent", 0),
 ]
 
 
@@ -193,6 +192,18 @@ def format_duration(hours: int) -> str:
     return f"{days}d"
 
 
+def hours_to_days(hours: int) -> int:
+    """Whole days for a duration (rounded up, minimum 1)."""
+    if hours <= 0:
+        return 0
+    return max(1, -(-hours // 24))  # ceil division
+
+
+def total_cost(daily_price: int, hours: int) -> int:
+    """Total AP = daily rate × number of days."""
+    return int(daily_price) * hours_to_days(hours)
+
+
 def is_admin(member: discord.abc.User | discord.Member) -> bool:
     if not isinstance(member, discord.Member):
         return False
@@ -211,7 +222,7 @@ def build_role_listing_embed(listing_id: str, listing: dict) -> discord.Embed:
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow(),
     )
-    embed.add_field(name="Cost", value=f"{price} AP", inline=True)
+    embed.add_field(name="Price", value=f"{price} AP / day", inline=True)
     embed.set_footer(text=f"Role Shop | id:{listing_id}")
     return embed
 
@@ -277,14 +288,18 @@ class DurationSelect(discord.ui.Select):
             if not listing:
                 await safe_reply(interaction, "❌ This role listing no longer exists.", ephemeral=True)
                 return
-            price = int(listing.get("price", 0))
-            role_name = listing.get("role_name", "Unknown")
+            daily_price = int(listing.get("price", 0))
+            role_name   = listing.get("role_name", "Unknown")
+
+        days  = hours_to_days(hours)
+        total = total_cost(daily_price, hours)
 
         embed = discord.Embed(
             title=f"Confirm Purchase: {role_name}",
             description=(
-                f"**Cost:** {price} AP\n"
-                f"**Duration:** {dur_label}\n\n"
+                f"**Daily Rate:** {daily_price} AP / day\n"
+                f"**Duration:** {dur_label} ({days} day{'s' if days != 1 else ''})\n"
+                f"**Total Cost:** {total} AP\n\n"
                 "Click **Confirm** to purchase this role."
             ),
             color=discord.Color.green(),
@@ -399,8 +414,8 @@ class AddRolePriceModal(discord.ui.Modal):
         self.role = role
 
         self.price = discord.ui.TextInput(
-            label="AP Cost",
-            placeholder="e.g. 500",
+            label="Daily AP Cost (price per day)",
+            placeholder="e.g. 50",
             required=True,
         )
         self.add_item(self.price)
@@ -432,7 +447,7 @@ class AddRolePriceModal(discord.ui.Modal):
 
         if interaction.guild:
             await self.cog.sync_shop_messages(interaction.guild)
-        await safe_reply(interaction, f"✅ Role listing **{self.role.name}** added at **{price} AP**.", ephemeral=True)
+        await safe_reply(interaction, f"✅ Role listing **{self.role.name}** added at **{price} AP / day**.", ephemeral=True)
 
 
 class EditRoleSelectView(discord.ui.View):
@@ -479,7 +494,7 @@ class EditRolePriceModal(discord.ui.Modal):
         self.role       = role
 
         self.price = discord.ui.TextInput(
-            label="AP Cost",
+            label="Daily AP Cost (price per day)",
             default=str(listing.get("price", 0)),
             required=True,
         )
@@ -512,7 +527,7 @@ class EditRolePriceModal(discord.ui.Modal):
 
         if interaction.guild:
             await self.cog.sync_shop_messages(interaction.guild)
-        await safe_reply(interaction, f"✅ Listing updated to **{self.role.name}** at **{price} AP**.", ephemeral=True)
+        await safe_reply(interaction, f"✅ Listing updated to **{self.role.name}** at **{price} AP / day**.", ephemeral=True)
 
 
 # =====================
@@ -913,9 +928,12 @@ class RoleShopCog(commands.Cog):
                 await safe_reply(interaction, "❌ This role listing no longer exists.", ephemeral=True)
                 return
 
-            price     = int(listing.get("price", 0))
-            role_name = listing.get("role_name", "Unknown")
-            role_id   = listing.get("role_id")
+            daily_price = int(listing.get("price", 0))
+            role_name   = listing.get("role_name", "Unknown")
+            role_id     = listing.get("role_id")
+
+            days = hours_to_days(duration_hours)
+            cost = total_cost(daily_price, duration_hours)
 
             ap_data = await aload_ap()
             uid     = str(interaction.user.id)
@@ -925,8 +943,8 @@ class RoleShopCog(commands.Cog):
                 return
 
             user_ap = int(float(entry.get("ap", 0)))
-            if user_ap < price:
-                await safe_reply(interaction, f"❌ Not enough AP (cost {price}, you have {user_ap}).", ephemeral=True)
+            if user_ap < cost:
+                await safe_reply(interaction, f"❌ Not enough AP (cost {cost}, you have {user_ap}).", ephemeral=True)
                 return
 
             role = interaction.guild.get_role(int(role_id)) if role_id else None
@@ -940,13 +958,14 @@ class RoleShopCog(commands.Cog):
                 await safe_reply(interaction, f"❌ You already have the **{role_name}** role.", ephemeral=True)
                 return
 
-            entry["ap"] = user_ap - price
+            entry["ap"] = user_ap - cost
             audit = entry.setdefault("audit", [])
             audit.append({
                 "ts":       utc_iso(),
-                "delta":    -price,
+                "delta":    -cost,
                 "source":   "role_shop_purchase",
-                "reason":   f"Purchased role {role_name} for {format_duration(duration_hours)}",
+                "reason":   f"Purchased role {role_name} for {format_duration(duration_hours)} "
+                            f"({days} day{'s' if days != 1 else ''} @ {daily_price} AP/day)",
                 "actor_id": interaction.user.id,
             })
             ap_data[uid] = entry
@@ -967,7 +986,8 @@ class RoleShopCog(commands.Cog):
                 "listing_id":     listing_id,
                 "role_id":        str(role.id),
                 "role_name":      role_name,
-                "cost":           price,
+                "daily_price":    daily_price,
+                "cost":           cost,
                 "duration_hours": duration_hours,
                 "purchased_at":   utc_iso(),
                 "expires_at":     expires_str,
@@ -999,7 +1019,8 @@ class RoleShopCog(commands.Cog):
         dur_text = format_duration(duration_hours)
         await safe_reply(
             interaction,
-            f"✅ You purchased **{role_name}** for **{price} AP** (duration: {dur_text}).",
+            f"✅ You purchased **{role_name}** for **{cost} AP** "
+            f"({days} day{'s' if days != 1 else ''} @ {daily_price} AP/day, duration: {dur_text}).",
             ephemeral=True,
         )
 
