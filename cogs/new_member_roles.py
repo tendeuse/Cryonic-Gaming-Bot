@@ -348,10 +348,23 @@ class NewMemberRoles(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
+        uid = str(member.id)
+        already_onboarded = False
+
         async with self._data_lock:
             data = load_data()
-            data["pending"][str(member.id)] = int(time.time()) + DELAY_SECONDS
-            save_data(data)
+            if uid in data.get("rewarded", []):
+                already_onboarded = True
+            else:
+                data["pending"][uid] = int(time.time()) + DELAY_SECONDS
+                save_data(data)
+
+        if already_onboarded:
+            await self.log(
+                member.guild,
+                f"↩️ {member.mention} rejoined and was already onboarded previously — skipping the **{NEW_MEMBER_ROLE}** flow."
+            )
+            return
 
         await self.log(member.guild, f"⏳ {member.mention} joined. Timer started: **{DELAY_SECONDS // 60} min** → add **{NEW_MEMBER_ROLE}**.")
 
@@ -363,10 +376,19 @@ class NewMemberRoles(commands.Cog):
             data = load_data()
 
         now = int(time.time())
-        changed = False
+        rewarded = set(data.get("rewarded", []))
+        processed_ids = []  # pending keys handled this cycle (cleared regardless of outcome)
 
         for user_id, due in list(data["pending"].items()):
             if now < due:
+                continue
+
+            # This entry is now due — it will be removed from pending no matter what.
+            processed_ids.append(user_id)
+
+            # Skip members who already completed onboarding. Prevents re-granting
+            # "New Member" to someone whose role was removed before the timer fired.
+            if user_id in rewarded:
                 continue
 
             member = None
@@ -386,11 +408,14 @@ class NewMemberRoles(commands.Cog):
                     except Exception:
                         await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (transient error).")
 
-            del data["pending"][user_id]
-            changed = True
-
-        if changed:
+        # Remove processed entries from the CURRENT file contents (re-loaded under the
+        # lock) so concurrent on_member_join/on_member_update writes during the slow
+        # role work above are not clobbered by a stale snapshot.
+        if processed_ids:
             async with self._data_lock:
+                data = load_data()
+                for uid in processed_ids:
+                    data["pending"].pop(uid, None)
                 save_data(data)
 
     # ---------- Role Update Handling ----------
@@ -428,10 +453,19 @@ class NewMemberRoles(commands.Cog):
             await self.log(after.guild, f"🔴 **New Member removed** from {after.mention} by {actor}")
 
             uid = str(after.id)
+
+            # Kill any stale pending timer + check onboarding status in one pass.
+            # Clearing pending here is what stops the 1-hour timer from re-adding
+            # "New Member" after the role has already been removed.
             async with self._data_lock:
                 data = load_data()
-                if uid in data.get("rewarded", []):
-                    return
+                pending_cleared = data["pending"].pop(uid, None) is not None
+                already_rewarded = uid in data.get("rewarded", [])
+                if pending_cleared:
+                    save_data(data)
+
+            if already_rewarded:
+                return
 
             sched = self.get_role(after.guild, SCHEDULING_ROLE)
             onboard = self.get_role(after.guild, ONBOARDING_ROLE)
