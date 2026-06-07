@@ -900,6 +900,10 @@ class APTracking(commands.Cog):
         # Replaces the old file-based "last_chat" field to avoid race conditions
         # where voice_loop / chat_loop save() would overwrite on_message updates.
         self._last_chat: Dict[int, datetime.datetime] = {}
+        # Prevents voice_loop and chat_loop from interleaving their
+        # load-modify-save cycles, which caused the later save to
+        # overwrite the earlier one and lose its AP changes.
+        self._data_cycle_lock = asyncio.Lock()
         if not self.voice_loop.is_running():
             self.voice_loop.start()
         if not self.chat_loop.is_running():
@@ -1208,75 +1212,76 @@ class APTracking(commands.Cog):
 
     @tasks.loop(seconds=VOICE_INTERVAL)
     async def voice_loop(self):
-        # Single load/save per tick; yield to the event loop between members
-        # so the Discord heartbeat is never starved.
-        boosts: Dict[str, Any] = _load_boosts_file()
-        boosts_changed = False
-        data = await load()
+        async with self._data_cycle_lock:
+            boosts: Dict[str, Any] = _load_boosts_file()
+            boosts_changed = False
+            data = await load()
 
-        for guild in self.bot.guilds:
-            ceos, dirs = self._get_leadership_ids(guild)
-            for vc in guild.voice_channels:
-                if vc == guild.afk_channel:
-                    continue
-                members = [
-                    m for m in vc.members
-                    if isinstance(m, discord.Member)
-                    and not m.bot
-                    and m.voice
-                    and not m.voice.self_mute
-                    and not m.voice.self_deaf
-                    and not is_alt_account(m)
-                ]
-                if len(members) < 2:
-                    continue
-                for m in members:
-                    _apply_ap_to_data(
-                        data, m, float(VOICE_AP), "voice", None,
-                        ceos, dirs, boosts,
-                    )
-                    await asyncio.sleep(0)   # yield so heartbeat isn't blocked
+            for guild in self.bot.guilds:
+                ceos, dirs = self._get_leadership_ids(guild)
+                for vc in guild.voice_channels:
+                    if vc == guild.afk_channel:
+                        continue
+                    members = [
+                        m for m in vc.members
+                        if isinstance(m, discord.Member)
+                        and not m.bot
+                        and m.voice
+                        and not m.voice.self_mute
+                        and not m.voice.self_deaf
+                        and not is_alt_account(m)
+                    ]
+                    if len(members) < 2:
+                        continue
+                    for m in members:
+                        _apply_ap_to_data(
+                            data, m, float(VOICE_AP), "voice", None,
+                            ceos, dirs, boosts,
+                        )
+                        await asyncio.sleep(0)
 
-        await save(data)
-        if boosts_changed:
-            _save_boosts_file(boosts)
+            await save(data)
+            if boosts_changed:
+                _save_boosts_file(boosts)
 
     @tasks.loop(seconds=CHAT_INTERVAL)
     async def chat_loop(self):
         now    = datetime.datetime.utcnow()
-        boosts: Dict[str, Any] = _load_boosts_file()
-        boosts_changed = False
-        data   = await load()
 
         # Snapshot and clear the in-memory chat tracker so each message
         # is credited exactly once, regardless of how long processing takes.
         chat_snapshot = dict(self._last_chat)
         self._last_chat.clear()
 
-        for guild in self.bot.guilds:
-            ceos, dirs = self._get_leadership_ids(guild)
-            for i, m in enumerate(guild.members):
-                if not isinstance(m, discord.Member) or m.bot:
-                    continue
-                if is_alt_account(m):
-                    continue
-                last = chat_snapshot.get(m.id)
-                if not last:
-                    continue
-                if (now - last).total_seconds() <= CHAT_INTERVAL:
-                    _, _, changed = _apply_ap_to_data(
-                        data, m, float(CHAT_AP), "chat", None,
-                        ceos, dirs, boosts,
-                    )
-                    if changed:
-                        boosts_changed = True
-                # Yield every 50 members to stay cooperative
-                if i % 50 == 0:
-                    await asyncio.sleep(0)
+        async with self._data_cycle_lock:
+            boosts: Dict[str, Any] = _load_boosts_file()
+            boosts_changed = False
+            data   = await load()
 
-        await save(data)
-        if boosts_changed:
-            _save_boosts_file(boosts)
+            for guild in self.bot.guilds:
+                ceos, dirs = self._get_leadership_ids(guild)
+                for i, m in enumerate(guild.members):
+                    if not isinstance(m, discord.Member) or m.bot:
+                        continue
+                    if is_alt_account(m):
+                        continue
+                    last = chat_snapshot.get(m.id)
+                    if not last:
+                        continue
+                    if (now - last).total_seconds() <= CHAT_INTERVAL:
+                        _, _, changed = _apply_ap_to_data(
+                            data, m, float(CHAT_AP), "chat", None,
+                            ceos, dirs, boosts,
+                        )
+                        if changed:
+                            boosts_changed = True
+                    # Yield every 50 members to stay cooperative
+                    if i % 50 == 0:
+                        await asyncio.sleep(0)
+
+            await save(data)
+            if boosts_changed:
+                _save_boosts_file(boosts)
 
     # -------------------------
     # Slash Commands
