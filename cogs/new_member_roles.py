@@ -2,7 +2,7 @@
 #
 # Order:
 # 1) If "EVE online" role is added for a NEW player -> add "ARC Subsidized" and ensure "ARC Security" is NOT present.
-# 2) On join -> start 1-hour timer -> add "New Member".
+# 2) On join -> immediately add "New Member".
 # 3) When "New Member" is removed -> add "Onboarding" + "Scheduling".
 # + /fix_roles (LEADERSHIP) -> remove Onboarding/Scheduling from anyone who still has New Member.
 #
@@ -13,7 +13,7 @@
 # Keeps the existing slash commands + restrictions; /fix_roles is set to leadership-only.
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 import asyncio
 import json
@@ -49,7 +49,6 @@ NEW_MEMBER_DM = (
     "https://discord.com/channels/559041517663289344/1459204314882117662"
 )
 
-DELAY_SECONDS = 3600  # 1 hour
 NEW_PLAYER_WINDOW_DAYS = 14
 ROLE_OP_THROTTLE_SECONDS = 0.35
 
@@ -125,11 +124,9 @@ class NewMemberRoles(commands.Cog):
         # prevents sending duplicate DMs if role event fires more than once quickly
         self._new_member_dm_guard: dict[int, float] = {}
 
-        self.timer_task.start()
         self._boot_task = bot.loop.create_task(self.bootstrap_existing_members())
 
     def cog_unload(self):
-        self.timer_task.cancel()
         if hasattr(self, "_boot_task") and self._boot_task and not self._boot_task.done():
             self._boot_task.cancel()
 
@@ -349,74 +346,25 @@ class NewMemberRoles(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         uid = str(member.id)
-        already_onboarded = False
 
         async with self._data_lock:
             data = load_data()
             if uid in data.get("rewarded", []):
-                already_onboarded = True
-            else:
-                data["pending"][uid] = int(time.time()) + DELAY_SECONDS
-                save_data(data)
+                await self.log(
+                    member.guild,
+                    f"↩️ {member.mention} rejoined and was already onboarded previously — skipping the **{NEW_MEMBER_ROLE}** flow."
+                )
+                return
 
-        if already_onboarded:
-            await self.log(
-                member.guild,
-                f"↩️ {member.mention} rejoined and was already onboarded previously — skipping the **{NEW_MEMBER_ROLE}** flow."
-            )
-            return
-
-        await self.log(member.guild, f"⏳ {member.mention} joined. Timer started: **{DELAY_SECONDS // 60} min** → add **{NEW_MEMBER_ROLE}**.")
-
-    # ---------- Timer Task: add New Member after 1 hour (Rule 2) ----------
-
-    @tasks.loop(seconds=60)
-    async def timer_task(self):
-        async with self._data_lock:
-            data = load_data()
-
-        now = int(time.time())
-        rewarded = set(data.get("rewarded", []))
-        processed_ids = []  # pending keys handled this cycle (cleared regardless of outcome)
-
-        for user_id, due in list(data["pending"].items()):
-            if now < due:
-                continue
-
-            # This entry is now due — it will be removed from pending no matter what.
-            processed_ids.append(user_id)
-
-            # Skip members who already completed onboarding. Prevents re-granting
-            # "New Member" to someone whose role was removed before the timer fired.
-            if user_id in rewarded:
-                continue
-
-            member = None
-            for guild in self.bot.guilds:
-                member = guild.get_member(int(user_id))
-                if member:
-                    break
-
-            if member:
-                role = self.get_new_member_role(member.guild)
-                if role and role not in member.roles:
-                    try:
-                        await self._safe_add_roles(member, role, reason="Auto New Member role (1 hour after join)")
-                        await self.log(member.guild, f"🟢 **New Member added** to {member.mention} (auto after 1 hour).")
-                    except discord.Forbidden:
-                        await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (permissions/hierarchy).")
-                    except Exception:
-                        await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (transient error).")
-
-        # Remove processed entries from the CURRENT file contents (re-loaded under the
-        # lock) so concurrent on_member_join/on_member_update writes during the slow
-        # role work above are not clobbered by a stale snapshot.
-        if processed_ids:
-            async with self._data_lock:
-                data = load_data()
-                for uid in processed_ids:
-                    data["pending"].pop(uid, None)
-                save_data(data)
+        role = self.get_new_member_role(member.guild)
+        if role and role not in member.roles:
+            try:
+                await self._safe_add_roles(member, role, reason="Auto New Member role on join")
+                await self.log(member.guild, f"🟢 **New Member added** to {member.mention} (on join).")
+            except discord.Forbidden:
+                await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (permissions/hierarchy).")
+            except Exception:
+                await self.log(member.guild, f"⚠️ Could not add **{NEW_MEMBER_ROLE}** to {member.mention} (transient error).")
 
     # ---------- Role Update Handling ----------
 
@@ -454,15 +402,9 @@ class NewMemberRoles(commands.Cog):
 
             uid = str(after.id)
 
-            # Kill any stale pending timer + check onboarding status in one pass.
-            # Clearing pending here is what stops the 1-hour timer from re-adding
-            # "New Member" after the role has already been removed.
             async with self._data_lock:
                 data = load_data()
-                pending_cleared = data["pending"].pop(uid, None) is not None
                 already_rewarded = uid in data.get("rewarded", [])
-                if pending_cleared:
-                    save_data(data)
 
             if already_rewarded:
                 return
