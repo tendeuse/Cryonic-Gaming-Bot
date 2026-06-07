@@ -270,10 +270,11 @@ class DurationSelect(discord.ui.Select):
                 value=str(hours),
                 description=f"Duration: {label}",
             ))
+        # No custom_id: this select only lives inside a transient ephemeral message,
+        # so it doesn't need to survive a restart.
         super().__init__(
-            placeholder="Select duration...",
+            placeholder="Select how long you want the role...",
             options=options,
-            custom_id=f"roleshop:duration:{listing_id}",
         )
         self.cog        = cog
         self.listing_id = listing_id
@@ -331,12 +332,21 @@ class ConfirmPurchaseView(discord.ui.View):
 # Buy View (on each listing in the shop channel)
 # =====================
 class BuyRoleView(discord.ui.View):
+    """Persistent view on each shop listing — just a Buy button."""
     def __init__(self, cog: "RoleShopCog", listing_id: str):
         super().__init__(timeout=None)
-        durations = []
-        for label, hours in DURATION_CHOICES:
-            durations.append((label, hours))
-        self.add_item(DurationSelect(cog, listing_id, durations))
+        self.add_item(discord.ui.Button(
+            label="Buy",
+            style=discord.ButtonStyle.success,
+            custom_id=f"roleshop:buy:{listing_id}",
+        ))
+
+
+class DurationSelectView(discord.ui.View):
+    """Transient ephemeral view shown after clicking Buy — prompts for duration."""
+    def __init__(self, cog: "RoleShopCog", listing_id: str):
+        super().__init__(timeout=120)
+        self.add_item(DurationSelect(cog, listing_id, list(DURATION_CHOICES)))
 
 
 # =====================
@@ -378,24 +388,58 @@ def get_roles_below_bot(guild: discord.Guild) -> list[discord.Role]:
     ]
 
 
-class AddRoleSelectView(discord.ui.View):
-    """Step 1: admin picks a role from a dropdown of roles below the bot."""
-    def __init__(self, cog: "RoleShopCog", roles: list[discord.Role]):
-        super().__init__(timeout=120)
-        self.cog = cog
-        # Discord selects max 25 options — take the top 25 by position (highest first)
-        sorted_roles = sorted(roles, key=lambda r: r.position, reverse=True)[:25]
+class PaginatedRoleSelectView(discord.ui.View):
+    """Transient role picker that pages through ALL eligible roles (25 per page).
+
+    Discord caps a select menu at 25 options, so when the server has more eligible
+    roles than that we show Prev/Next buttons to move between pages.
+
+    `on_pick` is an async callable: await on_pick(interaction, role).
+    """
+    PER_PAGE = 25
+
+    def __init__(self, cog: "RoleShopCog", roles: list[discord.Role], on_pick,
+                 *, current_id: str | None = None):
+        super().__init__(timeout=180)
+        self.cog        = cog
+        self.roles      = sorted(roles, key=lambda r: r.position, reverse=True)
+        self.on_pick    = on_pick
+        self.current_id = current_id
+        self.page       = 0
+        self._build()
+
+    def _total_pages(self) -> int:
+        return max(1, (len(self.roles) + self.PER_PAGE - 1) // self.PER_PAGE)
+
+    def _build(self):
+        self.clear_items()
+        total_pages = self._total_pages()
+        self.page   = max(0, min(self.page, total_pages - 1))
+        start       = self.page * self.PER_PAGE
+        page_roles  = self.roles[start:start + self.PER_PAGE]
+
         options = [
-            discord.SelectOption(label=r.name, value=str(r.id))
-            for r in sorted_roles
+            discord.SelectOption(
+                label=r.name[:100],
+                value=str(r.id),
+                default=(str(r.id) == self.current_id),
+            )
+            for r in page_roles
         ]
         select = discord.ui.Select(
-            placeholder="Choose a role to list...",
+            placeholder=f"Choose a role… (page {self.page + 1}/{total_pages})",
             options=options,
-            custom_id="roleshop:add_role_select",
         )
         select.callback = self._on_select
         self.add_item(select)
+
+        if total_pages > 1:
+            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, disabled=(self.page == 0))
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, disabled=(self.page >= total_pages - 1))
+            prev_btn.callback = self._prev
+            next_btn.callback = self._next
+            self.add_item(prev_btn)
+            self.add_item(next_btn)
 
     async def _on_select(self, interaction: discord.Interaction):
         role_id = int(interaction.data["values"][0])
@@ -403,7 +447,17 @@ class AddRoleSelectView(discord.ui.View):
         if not role:
             await safe_reply(interaction, "❌ Role not found.", ephemeral=True)
             return
-        await safe_send_modal(interaction, AddRolePriceModal(self.cog, role))
+        await self.on_pick(interaction, role)
+
+    async def _prev(self, interaction: discord.Interaction):
+        self.page -= 1
+        self._build()
+        await interaction.response.edit_message(view=self)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page += 1
+        self._build()
+        await interaction.response.edit_message(view=self)
 
 
 class AddRolePriceModal(discord.ui.Modal):
@@ -448,41 +502,6 @@ class AddRolePriceModal(discord.ui.Modal):
         if interaction.guild:
             await self.cog.sync_shop_messages(interaction.guild)
         await safe_reply(interaction, f"✅ Role listing **{self.role.name}** added at **{price} AP / day**.", ephemeral=True)
-
-
-class EditRoleSelectView(discord.ui.View):
-    """Step 1 of edit: admin picks a new role (or the same one) from the dropdown."""
-    def __init__(self, cog: "RoleShopCog", listing_id: str, listing: dict, roles: list[discord.Role]):
-        super().__init__(timeout=120)
-        self.cog        = cog
-        self.listing_id = listing_id
-        self.listing    = listing
-
-        sorted_roles = sorted(roles, key=lambda r: r.position, reverse=True)[:25]
-        current_id   = str(listing.get("role_id", ""))
-        options = []
-        for r in sorted_roles:
-            options.append(discord.SelectOption(
-                label=r.name, value=str(r.id),
-                default=(str(r.id) == current_id),
-            ))
-        select = discord.ui.Select(
-            placeholder="Choose a role...",
-            options=options,
-        )
-        select.callback = self._on_select
-        self.add_item(select)
-
-    async def _on_select(self, interaction: discord.Interaction):
-        role_id = int(interaction.data["values"][0])
-        role    = interaction.guild.get_role(role_id) if interaction.guild else None
-        if not role:
-            await safe_reply(interaction, "❌ Role not found.", ephemeral=True)
-            return
-        await safe_send_modal(
-            interaction,
-            EditRolePriceModal(self.cog, self.listing_id, role, self.listing),
-        )
 
 
 class EditRolePriceModal(discord.ui.Modal):
@@ -1040,6 +1059,28 @@ class RoleShopCog(commands.Cog):
             parts  = custom_id.split(":")
             action = parts[1] if len(parts) >= 2 else None
 
+            if action == "buy" and len(parts) >= 3:
+                listing_id = parts[2]
+                shop = await aload_role_shop()
+                listing = shop["roles"].get(listing_id)
+                if not listing:
+                    await safe_reply(interaction, "❌ This role listing no longer exists.", ephemeral=True)
+                    return
+                role_name   = listing.get("role_name", "Unknown")
+                daily_price = int(listing.get("price", 0))
+                embed = discord.Embed(
+                    title=f"Buy: {role_name}",
+                    description=(
+                        f"**Daily Rate:** {daily_price} AP / day\n\n"
+                        "Select how long you'd like the role for:"
+                    ),
+                    color=discord.Color.gold(),
+                )
+                await interaction.response.send_message(
+                    embed=embed, view=DurationSelectView(self, listing_id), ephemeral=True,
+                )
+                return
+
             if action == "add_listing":
                 if not is_admin(interaction.user):
                     await safe_reply(interaction, "❌ Not authorized.", ephemeral=True)
@@ -1051,7 +1092,11 @@ class RoleShopCog(commands.Cog):
                 if not roles:
                     await safe_reply(interaction, "❌ No assignable roles found below the bot's role.", ephemeral=True)
                     return
-                view = AddRoleSelectView(self, roles)
+
+                async def _pick_add(inter: discord.Interaction, role: discord.Role):
+                    await safe_send_modal(inter, AddRolePriceModal(self, role))
+
+                view = PaginatedRoleSelectView(self, roles, _pick_add)
                 await interaction.response.send_message(
                     "**Select a role to add to the shop:**", view=view, ephemeral=True,
                 )
@@ -1074,7 +1119,11 @@ class RoleShopCog(commands.Cog):
                 if not roles:
                     await safe_reply(interaction, "❌ No assignable roles found below the bot's role.", ephemeral=True)
                     return
-                view = EditRoleSelectView(self, listing_id, listing, roles)
+
+                async def _pick_edit(inter: discord.Interaction, role: discord.Role):
+                    await safe_send_modal(inter, EditRolePriceModal(self, listing_id, role, listing))
+
+                view = PaginatedRoleSelectView(self, roles, _pick_edit, current_id=str(listing.get("role_id", "")))
                 await interaction.response.send_message(
                     "**Select the role and update the price:**", view=view, ephemeral=True,
                 )
@@ -1121,10 +1170,6 @@ class RoleShopCog(commands.Cog):
                         await asyncio.gather(*deletions, return_exceptions=True)
 
                 await safe_reply(interaction, f"\U0001f5d1️ Removed **{role_name}** from the role shop.", ephemeral=True)
-                return
-
-            if action == "duration" and len(parts) >= 3:
-                # Handled by the DurationSelect class callback
                 return
 
         except Exception:
