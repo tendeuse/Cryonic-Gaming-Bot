@@ -216,9 +216,11 @@ def is_admin(member: discord.abc.User | discord.Member) -> bool:
 def build_role_listing_embed(listing_id: str, listing: dict) -> discord.Embed:
     role_name = listing.get("role_name", "Unknown Role")
     price     = int(listing.get("price", 0))
+    desc      = listing.get("description", "")
 
     embed = discord.Embed(
         title=f"\U0001f451 {role_name}",
+        description=desc or None,
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow(),
     )
@@ -461,7 +463,7 @@ class PaginatedRoleSelectView(discord.ui.View):
 
 
 class AddRolePriceModal(discord.ui.Modal):
-    """Step 2: admin enters the AP price for the selected role."""
+    """Step 2: admin enters the AP price + description for the selected role."""
     def __init__(self, cog: "RoleShopCog", role: discord.Role):
         super().__init__(title=f"Set Price — {role.name[:40]}")
         self.cog  = cog
@@ -472,7 +474,15 @@ class AddRolePriceModal(discord.ui.Modal):
             placeholder="e.g. 50",
             required=True,
         )
+        self.description = discord.ui.TextInput(
+            label="Description",
+            style=discord.TextStyle.long,
+            placeholder="What does this role give? (shown in the shop)",
+            required=False,
+            max_length=500,
+        )
         self.add_item(self.price)
+        self.add_item(self.description)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_admin(interaction.user):
@@ -488,12 +498,15 @@ class AddRolePriceModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
             return
 
+        desc = str(self.description.value).strip()
+
         async with ROLE_SHOP_LOCK:
             shop       = await aload_role_shop()
             listing_id = uuid.uuid4().hex[:10]
             shop["roles"][listing_id] = {
                 "role_name":      self.role.name,
                 "role_id":        str(self.role.id),
+                "description":    desc,
                 "price":          price,
                 "duration_hours": 720,
             }
@@ -517,7 +530,16 @@ class EditRolePriceModal(discord.ui.Modal):
             default=str(listing.get("price", 0)),
             required=True,
         )
+        self.description = discord.ui.TextInput(
+            label="Description",
+            style=discord.TextStyle.long,
+            default=listing.get("description", ""),
+            placeholder="What does this role give? (shown in the shop)",
+            required=False,
+            max_length=500,
+        )
         self.add_item(self.price)
+        self.add_item(self.description)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_admin(interaction.user):
@@ -533,15 +555,18 @@ class EditRolePriceModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Price must be a non-negative integer.", ephemeral=True)
             return
 
+        desc = str(self.description.value).strip()
+
         async with ROLE_SHOP_LOCK:
             shop = await aload_role_shop()
             if self.listing_id not in shop["roles"]:
                 await safe_reply(interaction, "❌ Listing no longer exists.", ephemeral=True)
                 return
             listing = shop["roles"][self.listing_id]
-            listing["role_name"] = self.role.name
-            listing["role_id"]   = str(self.role.id)
-            listing["price"]     = price
+            listing["role_name"]   = self.role.name
+            listing["role_id"]     = str(self.role.id)
+            listing["description"] = desc
+            listing["price"]       = price
             await asave_role_shop(shop)
 
         if interaction.guild:
