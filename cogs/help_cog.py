@@ -347,8 +347,9 @@ class HelpCog(commands.Cog):
         before_roles = _role_names(before.roles)
         after_roles = _role_names(after.roles)
         gained = after_roles - before_roles
+        lost = before_roles - after_roles
 
-        if not gained:
+        if not gained and not lost:
             return
 
         guild = after.guild
@@ -358,12 +359,37 @@ class HelpCog(commands.Cog):
             if ch:
                 await ch.send(f"{after.mention} has an interest in recruiting.")
 
+        # Patreon tier changes. Patreon auto-assigns the tier role on pledge and
+        # strips it on cancel/decline; an upgrade/downgrade arrives as a role
+        # swap (one tier lost AND another gained in the same update). Higher
+        # tier number = more valuable tier.
         donor_gained = gained.intersection(DONOR_ROLE_NAMES)
-        if donor_gained:
+        donor_lost = lost.intersection(DONOR_ROLE_NAMES)
+        if donor_gained or donor_lost:
             ch = _get_text_channel_by_name(guild, DONOR_NOTIFY_CHANNEL)
             if ch:
-                for role_name in sorted(donor_gained, key=str.lower):
-                    await ch.send(f"{after.mention} just received the **{role_name}** donor role! 🎉")
+                if donor_gained and donor_lost:
+                    # Tier swap: report the net upgrade or downgrade only.
+                    old_tier = max(donor_lost, key=int)
+                    new_tier = max(donor_gained, key=int)
+                    if int(new_tier) > int(old_tier):
+                        await ch.send(
+                            f"{after.mention} upgraded their subscription from "
+                            f"**{old_tier}** to **{new_tier}**! ⬆️"
+                        )
+                    else:
+                        await ch.send(
+                            f"{after.mention} downgraded their subscription from "
+                            f"**{old_tier}** to **{new_tier}**. ⬇️"
+                        )
+                elif donor_gained:
+                    # New subscriber (no tier lost).
+                    for role_name in sorted(donor_gained, key=int):
+                        await ch.send(f"{after.mention} just received the **{role_name}** donor role! 🎉")
+                else:
+                    # True cancellation (tier lost, none gained).
+                    for role_name in sorted(donor_lost, key=int):
+                        await ch.send(f"{after.mention} canceled their **{role_name}** subscription. 💔")
 
     # =====================
     # RECRUITER LOG ON JOIN

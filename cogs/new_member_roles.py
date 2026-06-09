@@ -320,25 +320,34 @@ class NewMemberRoles(commands.Cog):
     # ---------- Bootstrap Existing Members ----------
 
     async def bootstrap_existing_members(self):
+        # `rewarded` means "has already completed the onboarding cycle" (i.e., New
+        # Member was removed at least once). A member who currently HOLDS New Member
+        # has NOT completed it yet, so they must not be in `rewarded` — otherwise the
+        # removal handler would skip granting Onboarding + Scheduling.
+        #
+        # The previous version did the opposite: it pre-marked current holders as
+        # rewarded. This heals that bad data by removing any current New Member
+        # holder from `rewarded` on startup.
         await self.bot.wait_until_ready()
 
         async with self._data_lock:
             data = load_data()
+            rewarded = set(data.get("rewarded", []))
+            if not rewarded:
+                return
 
-        changed = False
-
-        for guild in self.bot.guilds:
-            nm_role = self.get_new_member_role(guild)
-            if nm_role:
+            holders: set[str] = set()
+            for guild in self.bot.guilds:
+                nm_role = self.get_new_member_role(guild)
+                if not nm_role:
+                    continue
                 for member in guild.members:
                     if nm_role in member.roles:
-                        uid = str(member.id)
-                        if uid not in data["rewarded"]:
-                            data["rewarded"].append(uid)
-                            changed = True
+                        holders.add(str(member.id))
 
-        if changed:
-            async with self._data_lock:
+            stale = rewarded & holders
+            if stale:
+                data["rewarded"] = [uid for uid in data["rewarded"] if uid not in stale]
                 save_data(data)
 
     # ---------- Member Join Handling (Rule 2) ----------
