@@ -1536,6 +1536,53 @@ class AdminView(discord.ui.View):
             f"✅ Event **{state}**.", ephemeral=True
         )
 
+    @discord.ui.button(label="✅ Mark Event as Done", style=discord.ButtonStyle.success, row=2)
+    async def finalize(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        # Restart-proof alternative to the DM "Mark Event as Done" button:
+        # this panel is re-opened fresh from the persistent Manage button, so
+        # the finalize path survives bot restarts (the DM view does not).
+        #
+        # Defer as a message-update (no ephemeral) so edit_original_response
+        # disables this button on the panel itself — mirrors EventDoneView.done.
+        await interaction.response.defer()
+
+        data  = await load_events()
+        event = data.get(self.event_id)
+        if not isinstance(event, dict):
+            await interaction.followup.send("Event not found.", ephemeral=True)
+            return
+
+        is_active = event.get("active", True) and not event.get("closed", False)
+        if not is_active:
+            await interaction.followup.send(
+                "This event is already closed.", ephemeral=True
+            )
+            return
+
+        # Disable to prevent a double-click paying AP twice while finalizing.
+        button.disabled = True
+        button.label    = "⏳ Finalizing…"
+        try:
+            await interaction.edit_original_response(view=self)
+        except Exception:
+            pass
+
+        cog = interaction.client.cogs.get("EventCreator")
+        if not cog:
+            await interaction.followup.send(
+                "❌ EventCreator cog not found.", ephemeral=True
+            )
+            return
+
+        # Locks in VC times, awards AP to qualified attendees, moves members to
+        # ARC Main, deletes the event VC, logs results, and closes the event.
+        await cog._finalize_event(
+            interaction= interaction,
+            event_id=    self.event_id,
+        )
+
     @discord.ui.button(label="🗑 Delete Event", style=discord.ButtonStyle.danger, row=1)
     async def delete(
         self, interaction: discord.Interaction, button: discord.ui.Button
