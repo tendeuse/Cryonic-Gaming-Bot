@@ -136,12 +136,6 @@ class HelpCog(commands.Cog):
         description="Show all available slash commands organized by category",
     )
     async def help(self, interaction: discord.Interaction):
-        embed = discord.Embed(
-            title="Bot Commands",
-            description="List of available slash commands organized by category (cog):",
-            color=discord.Color.blue(),
-        )
-
         cog_commands: dict[str, list[str]] = {}
 
         for cmd in self.bot.tree.walk_commands():
@@ -152,18 +146,55 @@ class HelpCog(commands.Cog):
             desc = (cmd.description or "No description").strip()
             cog_commands.setdefault(cog_name, []).append(f"/{qn} — {desc}")
 
+        # Build (name, value) field pairs, splitting any cog whose lines exceed
+        # the 1024-char-per-field limit across multiple fields.
+        fields: list[tuple[str, str]] = []
         for cog_name in sorted(cog_commands.keys(), key=str.lower):
             cmds = sorted(cog_commands[cog_name], key=str.lower)
             chunk = ""
             for line in cmds:
                 if len(chunk) + len(line) + 1 > 1024:
-                    embed.add_field(name=cog_name, value=chunk.rstrip(), inline=False)
+                    fields.append((cog_name, chunk.rstrip()))
                     chunk = ""
                 chunk += line + "\n"
             if chunk.strip():
-                embed.add_field(name=cog_name, value=chunk.rstrip(), inline=False)
+                fields.append((cog_name, chunk.rstrip()))
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        # Pack fields into embeds, respecting Discord's per-embed limits:
+        # max 25 fields AND max 6000 total characters (title + desc + all fields).
+        # Each embed/message is independently capped, so overflow goes to followups.
+        MAX_FIELDS = 25
+        MAX_CHARS = 5800  # leave headroom under the hard 6000 cap
+
+        embeds: list[discord.Embed] = []
+        title = "Bot Commands"
+        description = "List of available slash commands organized by category (cog):"
+
+        def _new_embed(first: bool) -> discord.Embed:
+            return discord.Embed(
+                title=title if first else f"{title} (cont.)",
+                description=description if first else None,
+                color=discord.Color.blue(),
+            )
+
+        current = _new_embed(first=True)
+        used = len(title) + len(description)
+
+        for name, value in fields:
+            cost = len(name) + len(value)
+            if len(current.fields) >= MAX_FIELDS or used + cost > MAX_CHARS:
+                embeds.append(current)
+                current = _new_embed(first=False)
+                used = len(current.title or "")
+            current.add_field(name=name, value=value, inline=False)
+            used += cost
+
+        if current.fields or not embeds:
+            embeds.append(current)
+
+        await interaction.response.send_message(embed=embeds[0], ephemeral=True)
+        for extra in embeds[1:]:
+            await interaction.followup.send(embed=extra, ephemeral=True)
 
     # =====================
     # /PURGE (with confirmation + optional user filter + no 14-day limitation)
