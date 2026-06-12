@@ -232,6 +232,12 @@ def normalize_event(event: Dict[str, Any]) -> Dict[str, Any]:
     event.setdefault("created_utc",  None)
     event.setdefault("capacities",   {})
 
+    # ── Directive tracking + participation gating (added by the Directive cog) ─
+    event.setdefault("restrict_role",          None)   # role name required to RSVP
+    event.setdefault("directive_officer_id",   None)
+    event.setdefault("directive_focus",        None)
+    event.setdefault("directive_cycle_start",  None)
+
     # ── ensure roles dict has an entry for every button ───────────────────────
     roles = event.setdefault("roles", {})
     for btn in event["enabled_buttons"]:
@@ -864,6 +870,7 @@ async def _do_post_event(
     interaction: discord.Interaction,
     partial:     Dict[str, Any],
     names:       List[str],
+    extra:       Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Validates channel/permissions, builds the event record, posts the message,
@@ -871,6 +878,11 @@ async def _do_post_event(
 
     The caller MUST have already deferred the interaction before calling this
     (interaction.response.defer(ephemeral=True)) — this function uses followup.
+
+    extra: optional extra keys merged into the event record before it is posted
+    and saved. Used by the Directive cog to tag an event for weekly progress
+    tracking (directive_officer_id / directive_focus / directive_cycle_start)
+    and to gate RSVP participation (restrict_role).
     """
     link_only = bool(partial.get("link_only", False))
     guild     = interaction.guild
@@ -930,6 +942,11 @@ async def _do_post_event(
         "created_utc":          datetime.now(timezone.utc).isoformat(),
         "short_id":             _short_event_id(event_id),
     }
+
+    # Merge caller-supplied extra fields (e.g. Directive tracking tags) before
+    # the record is posted and persisted.
+    if extra:
+        event.update(extra)
 
     view = EventView(event_id, names, redir, link_only=link_only)
 
@@ -1698,6 +1715,17 @@ class RSVPButton(discord.ui.Button):
         if not isinstance(interaction.user, discord.Member):
             await interaction.followup.send(
                 "Must be used in a server.", ephemeral=True
+            )
+            return
+
+        # Participation gating — directive ops restrict RSVP to a single role.
+        restrict_role = event.get("restrict_role")
+        if restrict_role and not any(
+            r.name == restrict_role for r in interaction.user.roles
+        ):
+            await interaction.followup.send(
+                f"❌ Only **{restrict_role}** members can sign up for this op.",
+                ephemeral=True,
             )
             return
 
@@ -2483,6 +2511,17 @@ class EventCreator(commands.Cog):
         data[event_id]     = event
         await save_events(data)
         await refresh(self.bot, event_id)
+
+        # ── Directive credit ──────────────────────────────────────────────────
+        # If this event was created from a weekly Directive focus, notify the
+        # Directive cog so the officer's progress ticks up by one.
+        if event.get("directive_officer_id"):
+            dcog = self.bot.cogs.get("DirectiveCog")
+            if dcog:
+                try:
+                    await dcog.credit_directive_completion(event)
+                except Exception as e:
+                    print(f"[event_creator] directive credit failed for {event_id}: {e}")
 
         # Clean up in-memory state
         self._vc_event_map.pop(vc_id, None)

@@ -1,30 +1,32 @@
 # cogs/directive.py
 #
-# ARC Directives — Task Management System
-# ========================================
-# - Permanent panel embed in #arc-directives with "Create Directive" button
-# - CREATE access: General, Director, CEO
-# - FINISH access: General, Director, CEO
-# - COMMIT / RETRACT / COMPLETED access: determined per-task by minimum rank
-# - All actions are logged to #directives-logs
-# - Completed tasks track per-member completion counts (repeatable tasks)
-# - Finishing a task starts a 30-minute countdown, then auto-deletes the embed
+# ARC Weekly Directives — Officer Focus Program
+# =============================================
+# Replaces the old free-form task board. Each week the panel in #arc-directives
+# shows THREE standing "directives" (focus tracks):
 #
-# Rank hierarchy (index 0 = highest):
-#   0  CEO            → ARC Security Corporation Leader
-#   1  Director       → ARC Security Administration Council
-#   2  General        → ARC General
-#   3  Fleet Commander→ ARC Commander
-#   4  Lieutenant     → ARC Lieutenant
-#   5  Petty Officer  → ARC Petty Officer
+#   ⚔️ Combat Focus (PVP & FW)
+#   💰 PVE Focus
+#   🎓 Training Focus
+#
+# - ARC Lieutenant and ARC Commander SIGN UP for exactly ONE focus per week.
+# - Each focus has a goal of "complete 3 ops per week".
+# - Officers create events directly from the panel. Those events are:
+#       • restricted so only ARC Security can participate, and
+#       • forced to use one of the focus's approved, standardized titles
+#         (so progress can be tracked).
+# - Progress ticks up by one when an approved-title event is FINALIZED/CLOSED
+#   (the Event cog calls credit_directive_completion() on finalize).
+# - The cycle resets 7 days after it started; results are posted to
+#   #directives-logs, then signups/progress clear and a new cycle begins.
+# - Officers may change focus mid-week — their existing progress carries over.
 
 import os
 import json
 import asyncio
 import datetime
-import uuid
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
@@ -37,48 +39,72 @@ DIRECTIVES_CHANNEL = "arc-directives"
 LOG_CHANNEL        = "directives-logs"
 
 # =====================
+# PROGRAM CONFIG
+# =====================
+GOAL          = 3              # ops to complete per week
+CYCLE_DAYS    = 7              # cycle length
+RESTRICT_ROLE = "ARC Security"  # only this role may RSVP to directive events
+MIN_ATTENDEES = 2              # an op counts only with creator + 1 other (≥15 min)
+GOAL_BONUS_AP = 200            # AP awarded once when an officer hits the weekly goal
+
+# Only these ranks may sign up for a focus / create directive events.
+ELIGIBLE_ROLES = {"ARC Lieutenant", "ARC Commander"}
+
+# Focus tracks. The `titles` are the ONLY approved event titles for that focus —
+# they must match exactly, since weekly progress is tracked by these titles.
+FOCUSES: Dict[str, Dict[str, Any]] = {
+    "combat": {
+        "label": "⚔️ Combat Focus (PVP & FW)",
+        "blurb": "Pick this if your week is about fights and the warzone.",
+        "color": discord.Color.red(),
+        "requirements": [
+            "Lead a small gang roam (≤10 pilots)",
+            "Join a corp/alliance PVP fleet ping",
+            "Run a plexing op (solo, duo, or small gang)",
+            "Defend or contest a system under militia call",
+            "Solo/duo a kill in contested or enemy space",
+            "Flip a Medium or Large plex",
+            "Scout or call intel that leads to a confirmed kill or warzone shift",
+        ],
+        "titles": ["Faction Warfare Roam", "PVP Hunt"],
+    },
+    "pve": {
+        "label": "💰 PVE Focus",
+        "blurb": "Pick this if your week is about funding.",
+        "color": discord.Color.gold(),
+        "requirements": [
+            "Run a PVE op (ratting, missions, or FW sites)",
+            "Mentor a newer member through a PVE fit/run",
+            "Run an escalation or higher-value site",
+            "Generate and report a notable ISK/LP contribution",
+        ],
+        "titles": ["Mining/PVE Fleet"],
+    },
+    "training": {
+        "label": "🎓 Training Focus",
+        "blurb": "Pick this if your week is about teaching.",
+        "color": discord.Color.blue(),
+        "requirements": [
+            "Teach a class from the existing syllabus, delivered as written "
+            "(no improvising on content)",
+            "Run a syllabus-based practical session (fitting workshop, fleet drill, etc.)",
+            "Provide 1-on-1 syllabus-based mentorship to a new/junior member",
+        ],
+        "titles": [
+            "Dscan and Threat Assessment",
+            "Scanning Class",
+            "Rolling Class",
+            "OpSec 101 Class",
+        ],
+    },
+}
+
+# =====================
 # PERSISTENCE
 # =====================
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 DATA_FILE = PERSIST_ROOT / "directives.json"
-
-# =====================
-# RANK SYSTEM
-# =====================
-# Index 0 = highest authority. A member can interact with a task if their
-# rank index is <= the task's min_rank_index (equal or higher authority).
-
-RANK_ROLES: List[str] = [
-    "ARC Security Corporation Leader",      # 0 — CEO
-    "ARC Security Administration Council",  # 1 — Director
-    "ARC General",                          # 2 — General
-    "ARC Commander",                        # 3 — Fleet Commander
-    "ARC Lieutenant",                       # 4 — Officer
-    "ARC Petty Officer",                    # 5 — Petty Officer
-]
-
-RANK_DISPLAY: List[str] = [
-    "CEO",
-    "Director",
-    "General",
-    "Fleet Commander",
-    "Lieutenant",
-    "Petty Officer",
-]
-
-RANK_ROLE_TO_INDEX: Dict[str, int] = {role: i for i, role in enumerate(RANK_ROLES)}
-
-# Minimum rank index required to CREATE / FINISH directives (General = 2)
-CREATE_MIN_RANK_IDX = 2
-FINISH_MIN_RANK_IDX = 2
-
-DELETE_DELAY_SECONDS = 30 * 60   # 30 minutes after finishing
-
-
-# =====================
-# PERSISTENCE HELPERS
-# =====================
 
 _file_lock = asyncio.Lock()
 
@@ -90,20 +116,27 @@ def _atomic_write(path: Path, data: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _empty_data() -> Dict[str, Any]:
+    return {"cycle": {"start": utcnow_iso(), "officers": {}}, "panels": {}}
+
+
 async def load_data() -> Dict[str, Any]:
     async with _file_lock:
         if not DATA_FILE.exists():
-            return {"directives": {}, "panels": {}}
+            return _empty_data()
         try:
             txt = DATA_FILE.read_text(encoding="utf-8").strip()
             if not txt:
-                return {"directives": {}, "panels": {}}
+                return _empty_data()
             data = json.loads(txt)
-            data.setdefault("directives", {})
+            if not isinstance(data, dict):
+                return _empty_data()
+            data.setdefault("cycle", {"start": utcnow_iso(), "officers": {}})
             data.setdefault("panels", {})
+            data["cycle"].setdefault("officers", {})
             return data
         except Exception:
-            return {"directives": {}, "panels": {}}
+            return _empty_data()
 
 
 async def save_data(data: Dict[str, Any]) -> None:
@@ -116,53 +149,41 @@ def utcnow_iso() -> str:
 
 
 # =====================
-# RANK PERMISSION HELPERS
+# CYCLE HELPERS
 # =====================
 
-def member_rank_index(member: discord.Member) -> Optional[int]:
-    """Return the index of the member's highest rank, or None if unranked."""
-    for i, role_name in enumerate(RANK_ROLES):
-        if any(r.name == role_name for r in member.roles):
-            return i
-    return None
+def _ensure_cycle(data: Dict[str, Any]) -> bool:
+    """Make sure a cycle exists. Returns True if it had to be (re)created."""
+    cycle = data.get("cycle")
+    if not isinstance(cycle, dict) or "start" not in cycle:
+        data["cycle"] = {"start": utcnow_iso(), "officers": {}}
+        return True
+    cycle.setdefault("officers", {})
+    return False
 
 
-def can_create(member: discord.Member) -> bool:
-    idx = member_rank_index(member)
-    return idx is not None and idx <= CREATE_MIN_RANK_IDX
+def _cycle_start_dt(data: Dict[str, Any]) -> datetime.datetime:
+    raw = data.get("cycle", {}).get("start") or utcnow_iso()
+    try:
+        dt = datetime.datetime.fromisoformat(raw)
+    except Exception:
+        dt = datetime.datetime.utcnow()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
 
 
-def can_finish(member: discord.Member) -> bool:
-    idx = member_rank_index(member)
-    return idx is not None and idx <= FINISH_MIN_RANK_IDX
+def _cycle_end_dt(data: Dict[str, Any]) -> datetime.datetime:
+    return _cycle_start_dt(data) + datetime.timedelta(days=CYCLE_DAYS)
 
 
-def can_interact(member: discord.Member, min_rank_idx: int) -> bool:
-    """Can the member commit/retract/complete this task?"""
-    idx = member_rank_index(member)
-    return idx is not None and idx <= min_rank_idx
+def _cycle_expired(data: Dict[str, Any]) -> bool:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now >= _cycle_end_dt(data)
 
 
-def parse_rank_input(text: str) -> Optional[int]:
-    """
-    Accept a rank as:
-      - A digit 1–6  (1 = CEO, 6 = Petty Officer)
-      - Display name (case-insensitive): "General", "Lieutenant", etc.
-      - Role name    (case-insensitive): "ARC General", etc.
-    Returns 0-based index or None if invalid.
-    """
-    text = text.strip()
-    if text.isdigit():
-        n = int(text)
-        if 1 <= n <= 6:
-            return n - 1
-    for i, name in enumerate(RANK_DISPLAY):
-        if text.lower() == name.lower():
-            return i
-    for i, role in enumerate(RANK_ROLES):
-        if text.lower() == role.lower():
-            return i
-    return None
+def has_eligible_role(member: discord.Member) -> bool:
+    return any(r.name in ELIGIBLE_ROLES for r in member.roles)
 
 
 # =====================
@@ -186,248 +207,234 @@ async def _log(guild: discord.Guild, message: str) -> None:
 # EMBED BUILDER
 # =====================
 
-def _resolve_name(guild: discord.Guild, uid: int) -> str:
-    m = guild.get_member(uid)
-    return m.display_name if m else f"<@{uid}>"
+def _progress_bar(completions: int) -> str:
+    done = min(completions, GOAL)
+    return "✅" * done + "⬜" * max(0, GOAL - done)
 
 
-def build_directive_embed(
-    directive: Dict[str, Any],
+def build_focus_embed(
+    focus_key: str,
+    data: Dict[str, Any],
     guild: Optional[discord.Guild] = None,
 ) -> discord.Embed:
-    status        = directive.get("status", "active")
-    min_rank_idx  = int(directive.get("min_rank_index", 5))
-    max_assignees = directive.get("max_assignees")         # None = unlimited
-    assignees     = directive.get("assignees", [])
-    completions   = directive.get("completions", {})       # {str(uid): int}
-    task_text     = directive.get("task", "")
-    d_id          = directive.get("id", "???")
+    focus = FOCUSES[focus_key]
 
-    color = discord.Color.blue() if status == "active" else discord.Color.greyple()
-
-    slot_str = (
-        f"{len(assignees)} / {max_assignees}"
-        if max_assignees
-        else f"{len(assignees)} / ∞"
-    )
-
-    # Assignee list
-    if assignees and guild:
-        assignee_text = "\n".join(
-            f"• {_resolve_name(guild, int(uid))}" for uid in assignees
-        )
-    else:
-        assignee_text = "_(none)_"
-
-    # Completion list
-    if completions and guild:
-        comp_text = "\n".join(
-            f"• {_resolve_name(guild, int(uid))}: **{count}×**"
-            for uid, count in completions.items()
-        )
-    else:
-        comp_text = "_(none)_"
-
-    status_str = "✅ Active" if status == "active" else "🏁 Finished"
-
+    bullets = "\n".join(f"• {r}" for r in focus["requirements"])
     embed = discord.Embed(
-        title="📋 Directive",
-        description=f"```{task_text}```",
-        color=color,
+        title=focus["label"],
+        description=(
+            f"_{focus['blurb']}_\n\n"
+            f"**Complete {GOAL} of the following per week:**\n{bullets}\n\n"
+            f"_An op only counts when the creator + at least 1 other member "
+            f"attend (≥15 min). Reach {GOAL}/{GOAL} to earn a "
+            f"**{GOAL_BONUS_AP} AP** bonus._"
+        ),
+        color=focus["color"],
         timestamp=datetime.datetime.utcnow(),
     )
-    embed.add_field(name="📊 Status",      value=status_str,                    inline=True)
-    embed.add_field(name="👥 Slots",       value=slot_str,                      inline=True)
-    embed.add_field(name="🔰 Min. Rank",  value=RANK_DISPLAY[min_rank_idx],    inline=True)
-    embed.add_field(name="👤 Assigned Members", value=assignee_text,           inline=False)
-    embed.add_field(name="✅ Completions",       value=comp_text,               inline=False)
 
-    if status == "finished":
-        finished_by = directive.get("finished_by")
-        finished_at = (directive.get("finished_at") or "")[:19].replace("T", " ")
-        who = (_resolve_name(guild, int(finished_by)) if (guild and finished_by)
-               else (f"<@{finished_by}>" if finished_by else "Unknown"))
-        embed.add_field(
-            name="🏁 Finished By",
-            value=f"{who} — `{finished_at} UTC`",
-            inline=False,
-        )
-        embed.set_footer(text=f"Directive ID: {d_id} • Deleting in 30 minutes")
+    embed.add_field(
+        name="✅ Approved Event Titles",
+        value="\n".join(f"• `{t}`" for t in focus["titles"]),
+        inline=False,
+    )
+
+    officers = data.get("cycle", {}).get("officers", {})
+    signed: List[Tuple[str, Dict[str, Any]]] = [
+        (uid, off) for uid, off in officers.items()
+        if off.get("focus") == focus_key
+    ]
+
+    if signed:
+        lines = []
+        for uid, off in sorted(
+            signed, key=lambda kv: int(kv[1].get("completions", 0)), reverse=True
+        ):
+            m = guild.get_member(int(uid)) if guild else None
+            name = m.display_name if m else f"<@{uid}>"
+            c = int(off.get("completions", 0))
+            trophy = " 🏆" if c >= GOAL else ""
+            lines.append(f"• {name} — **{c}/{GOAL}** {_progress_bar(c)}{trophy}")
+        value = "\n".join(lines)
     else:
-        created_by = directive.get("created_by")
-        who = (_resolve_name(guild, int(created_by)) if (guild and created_by)
-               else (f"<@{created_by}>" if created_by else "Unknown"))
-        embed.set_footer(text=f"Directive ID: {d_id} • Created by {who}")
+        value = "_(no officers signed up yet)_"
 
+    embed.add_field(
+        name=f"🎖 Signed-up Officers ({len(signed)})",
+        value=value,
+        inline=False,
+    )
+
+    end_ts = int(_cycle_end_dt(data).timestamp())
+    embed.add_field(name="🔄 Cycle Ends", value=f"<t:{end_ts}:R>", inline=False)
+    embed.set_footer(
+        text="Sign up for ONE focus per week • ARC Lieutenant & ARC Commander"
+    )
     return embed
 
 
 # =====================
-# VIEWS
+# EVENT-CREATION FLOW (title select → modal → Event cog)
 # =====================
 
-class PanelView(discord.ui.View):
-    """Permanent panel in #arc-directives with the Create Directive button."""
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="📋 Create Directive",
-        style=discord.ButtonStyle.primary,
-        custom_id="directive:panel:create",
-    )
-    async def create_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
-            return
-
-        if not can_create(interaction.user):
-            await interaction.response.send_message(
-                "❌ Only **Generals**, **Directors**, and **CEOs** can create directives.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.send_modal(CreateDirectiveModal())
-
-
-class DirectiveView(discord.ui.View):
+class DirectiveEventModal(discord.ui.Modal):
     """
-    Attached to each live directive embed.
-    The buttons have no callbacks — they are dispatched via on_interaction
-    so they can look up live data without a cog reference baked in.
+    Collects the remaining event details after a title has been picked.
+    Title is preset (from the select) and audience is forced to ARC-Security-only.
     """
 
-    def __init__(self, directive_id: str, *, disabled: bool = False):
-        super().__init__(timeout=None)
-
-        def _btn(label: str, style: discord.ButtonStyle, action: str):
-            b = discord.ui.Button(
-                label=label,
-                style=style,
-                custom_id=f"directive:{action}:{directive_id}",
-                disabled=disabled,
-            )
-            self.add_item(b)
-
-        _btn("✅ Commit",           discord.ButtonStyle.success,   "commit")
-        _btn("↩ Retract",           discord.ButtonStyle.secondary, "retract")
-        _btn("🏆 Completed",        discord.ButtonStyle.primary,   "completed")
-        _btn("🏁 Finish Directive", discord.ButtonStyle.danger,    "finish")
-
-
-# =====================
-# MODAL
-# =====================
-
-class CreateDirectiveModal(discord.ui.Modal, title="Create New Directive"):
-
-    task_input = discord.ui.TextInput(
-        label="Task Description",
+    description = discord.ui.TextInput(
+        label="Description",
         style=discord.TextStyle.paragraph,
-        placeholder="Describe what needs to be done...",
-        min_length=10,
+        placeholder="What is the op about? Forming up, location, comms…",
         max_length=1000,
         required=True,
     )
-    slots_input = discord.ui.TextInput(
-        label="Max Assignees  (leave blank = unlimited)",
-        placeholder="e.g. 3",
-        required=False,
-        max_length=5,
-    )
-    rank_input = discord.ui.TextInput(
-        label="Minimum Rank Required",
-        placeholder="1=CEO  2=Director  3=General  4=Fleet Cmdr  5=Lieutenant  6=Petty Officer",
+    datetime_utc = discord.ui.TextInput(
+        label="Date & Time (UTC)  —  YYYY-MM-DD HH:MM",
+        placeholder="e.g. 2026-06-15 20:00",
         required=True,
-        max_length=30,
     )
+    rsvp_buttons = discord.ui.TextInput(
+        label="RSVP buttons (comma list, blank = Accept,Decline)",
+        placeholder="Accept, Tentative, Decline",
+        required=False,
+        max_length=120,
+    )
+
+    def __init__(self, focus_key: str, title_value: str):
+        super().__init__(title=f"Create Op — {title_value[:40]}")
+        self.focus_key   = focus_key
+        self.title_value = title_value
 
     async def on_submit(self, interaction: discord.Interaction):
-        # --- Validate max slots ---
-        max_slots: Optional[int] = None
-        raw_slots = self.slots_input.value.strip()
-        if raw_slots:
-            if not raw_slots.isdigit() or int(raw_slots) < 1:
-                await interaction.response.send_message(
-                    "❌ Max Assignees must be a positive whole number, or leave it blank.",
-                    ephemeral=True,
-                )
-                return
-            max_slots = int(raw_slots)
-
-        # --- Validate rank ---
-        rank_idx = parse_rank_input(self.rank_input.value)
-        if rank_idx is None:
-            lines = "\n".join(f"  `{i+1}` — {name}" for i, name in enumerate(RANK_DISPLAY))
+        # Validate date with pure Python before any async I/O.
+        try:
+            dt = datetime.datetime.strptime(
+                self.datetime_utc.value.strip(), "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
             await interaction.response.send_message(
-                f"❌ Invalid rank. Enter a number 1–6 or a rank name:\n{lines}",
-                ephemeral=True,
+                "❌ Invalid date. Use `YYYY-MM-DD HH:MM` (UTC).", ephemeral=True
             )
             return
+
+        # Parse RSVP button names (dedup, title-case); default to Accept/Decline.
+        names: List[str] = []
+        raw = self.rsvp_buttons.value.strip()
+        if raw:
+            seen = set()
+            for part in raw.split(","):
+                n = part.strip().title()
+                if n and n.lower() not in seen:
+                    seen.add(n.lower())
+                    names.append(n)
+        if not names:
+            names = ["Accept", "Decline"]
 
         await interaction.response.defer(ephemeral=True)
 
-        guild = interaction.guild
-        if not guild:
-            await interaction.followup.send("❌ Must be used in a server.", ephemeral=True)
-            return
+        data        = await load_data()
+        cycle_start = data.get("cycle", {}).get("start")
 
-        ch = discord.utils.get(guild.text_channels, name=DIRECTIVES_CHANNEL)
-        if not ch:
+        partial = {
+            "creator_id":   interaction.user.id,
+            "target":       "security_only",
+            "event_name":   self.title_value,
+            "description":  self.description.value.strip(),
+            "timestamp":    int(dt.timestamp()),
+            "redirect_url": "",
+            "button_count": len(names),
+            "link_only":    False,
+        }
+        extra = {
+            "directive_officer_id":  interaction.user.id,
+            "directive_focus":       self.focus_key,
+            "directive_cycle_start": cycle_start,
+            "restrict_role":         RESTRICT_ROLE,
+        }
+
+        # Reuse the Event cog's full posting pipeline (channel/permission checks,
+        # persistence, persistent-view registration, confirmation followup).
+        try:
+            from cogs.event_creator import _do_post_event
+        except Exception as e:
             await interaction.followup.send(
-                f"❌ Channel `#{DIRECTIVES_CHANNEL}` not found.", ephemeral=True
+                f"❌ Event system unavailable: `{e}`", ephemeral=True
             )
             return
 
-        # --- Build directive record ---
-        d_id = uuid.uuid4().hex[:8]
-        directive: Dict[str, Any] = {
-            "id":            d_id,
-            "task":          self.task_input.value.strip(),
-            "max_assignees": max_slots,
-            "min_rank_index": rank_idx,
-            "created_by":    interaction.user.id,
-            "created_at":    utcnow_iso(),
-            "status":        "active",
-            "assignees":     [],
-            "completions":   {},
-            "guild_id":      guild.id,
-            "channel_id":    ch.id,
-            "message_id":    None,
-            "finished_at":   None,
-            "finished_by":   None,
-            "delete_at":     None,
-        }
+        await _do_post_event(interaction, partial, names, extra=extra)
 
-        embed = build_directive_embed(directive, guild)
-        view  = DirectiveView(d_id)
-        msg   = await ch.send(embed=embed, view=view)
 
-        directive["message_id"] = msg.id
-
-        data = await load_data()
-        data["directives"][d_id] = directive
-        await save_data(data)
-
-        # Register for persistence immediately
-        try:
-            interaction.client.add_view(view, message_id=msg.id)
-        except Exception:
-            pass
-
-        await _log(
-            guild,
-            f"📋 **Directive created** by {interaction.user.mention}\n"
-            f"**ID:** `{d_id}`\n"
-            f"**Task:** {directive['task'][:200]}\n"
-            f"**Min Rank:** {RANK_DISPLAY[rank_idx]}\n"
-            f"**Max Slots:** {max_slots or '∞'}",
+class TitleSelect(discord.ui.Select):
+    def __init__(self, focus_key: str):
+        self.focus_key = focus_key
+        options = [
+            discord.SelectOption(label=t, value=t)
+            for t in FOCUSES[focus_key]["titles"]
+        ]
+        super().__init__(
+            placeholder="Choose the approved op title…",
+            min_values=1,
+            max_values=1,
+            options=options,
         )
-        await interaction.followup.send(
-            f"✅ Directive `{d_id}` created in {ch.mention}.", ephemeral=True
+
+    async def callback(self, interaction: discord.Interaction):
+        title = self.values[0]
+        await interaction.response.send_modal(
+            DirectiveEventModal(self.focus_key, title)
         )
+
+
+class TitleSelectView(discord.ui.View):
+    def __init__(self, focus_key: str):
+        super().__init__(timeout=300)
+        self.add_item(TitleSelect(focus_key))
+
+
+# =====================
+# PANEL BUTTONS / VIEW
+# =====================
+
+class SignupButton(discord.ui.Button):
+    def __init__(self, focus_key: str):
+        super().__init__(
+            label="✅ Sign Up",
+            style=discord.ButtonStyle.success,
+            custom_id=f"directive:signup:{focus_key}",
+        )
+        self.focus_key = focus_key
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.cogs.get("DirectiveCog")
+        if cog:
+            await cog.handle_signup(interaction, self.focus_key)
+
+
+class CreateEventButton(discord.ui.Button):
+    def __init__(self, focus_key: str):
+        super().__init__(
+            label="⚔️ Create Event",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"directive:create:{focus_key}",
+        )
+        self.focus_key = focus_key
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.cogs.get("DirectiveCog")
+        if cog:
+            await cog.handle_create_event(interaction, self.focus_key)
+
+
+class FocusPanelView(discord.ui.View):
+    """Permanent per-focus panel: Sign Up + Create Event."""
+
+    def __init__(self, focus_key: str):
+        super().__init__(timeout=None)
+        self.add_item(SignupButton(focus_key))
+        self.add_item(CreateEventButton(focus_key))
 
 
 # =====================
@@ -435,22 +442,16 @@ class CreateDirectiveModal(discord.ui.Modal, title="Create New Directive"):
 # =====================
 
 class DirectiveCog(commands.Cog):
-    """ARC Directives — task management with rank-gated assignment."""
+    """ARC Weekly Directives — three focus tracks with weekly reset."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Per-directive asyncio locks to prevent race conditions
-        self._locks: Dict[str, asyncio.Lock] = {}
-        if not self.deletion_check.is_running():
-            self.deletion_check.start()
+        self._data_lock = asyncio.Lock()
+        if not self.reset_check.is_running():
+            self.reset_check.start()
 
     def cog_unload(self):
-        self.deletion_check.cancel()
-
-    def _lock(self, d_id: str) -> asyncio.Lock:
-        if d_id not in self._locks:
-            self._locks[d_id] = asyncio.Lock()
-        return self._locks[d_id]
+        self.reset_check.cancel()
 
     # ------------------------------------------------------------------
     # Startup
@@ -458,352 +459,396 @@ class DirectiveCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # Always register the panel view so the Create button survives restarts
-        self.bot.add_view(PanelView())
+        # Register the three persistent focus views (survive restarts).
+        for fk in FOCUSES:
+            self.bot.add_view(FocusPanelView(fk))
 
-        data = await load_data()
+        async with self._data_lock:
+            data = await load_data()
+            if _ensure_cycle(data):
+                await save_data(data)
 
-        # Register persistent views for active directives
-        count = 0
-        for d_id, directive in data.get("directives", {}).items():
-            if directive.get("status") != "active":
-                continue
-            msg_id = directive.get("message_id")
-            try:
-                view = DirectiveView(d_id)
-                if isinstance(msg_id, int):
-                    self.bot.add_view(view, message_id=msg_id)
-                else:
-                    self.bot.add_view(view)
-                count += 1
-            except Exception:
-                pass
-
-        print(f"[directive] Registered {count} active directive view(s).")
-
-        # Ensure the panel embed exists in every guild
         for guild in self.bot.guilds:
-            await self._ensure_panel(guild, data)
+            await self._ensure_panels(guild)
 
-    async def _ensure_panel(
+    async def _get_directives_channel(
+        self, guild: discord.Guild
+    ) -> Optional[discord.TextChannel]:
+        ch = discord.utils.get(guild.text_channels, name=DIRECTIVES_CHANNEL)
+        if ch:
+            return ch
+        try:
+            return await guild.create_text_channel(DIRECTIVES_CHANNEL)
+        except Exception:
+            return None
+
+    async def _ensure_panels(self, guild: discord.Guild) -> None:
+        """Post or refresh the three focus panels in #arc-directives."""
+        ch = await self._get_directives_channel(guild)
+        if not ch:
+            return
+
+        async with self._data_lock:
+            data = await load_data()
+            _ensure_cycle(data)
+            gp = data.setdefault("panels", {}).setdefault(str(guild.id), {})
+            changed = False
+
+            for fk in FOCUSES:
+                embed = build_focus_embed(fk, data, guild)
+                view  = FocusPanelView(fk)
+                msg_id = gp.get(fk)
+
+                if msg_id:
+                    try:
+                        existing = await ch.fetch_message(int(msg_id))
+                        await existing.edit(embed=embed, view=view)
+                        continue
+                    except Exception:
+                        pass  # message gone — fall through and repost
+
+                try:
+                    msg = await ch.send(embed=embed, view=view)
+                    gp[fk] = msg.id
+                    changed = True
+                except Exception:
+                    pass
+
+            if changed:
+                await save_data(data)
+
+    async def _refresh_panels(
         self, guild: discord.Guild, data: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Create or refresh the permanent panel embed in #arc-directives."""
-        ch = discord.utils.get(guild.text_channels, name=DIRECTIVES_CHANNEL)
-        if not ch:
-            try:
-                ch = await guild.create_text_channel(DIRECTIVES_CHANNEL)
-            except Exception:
-                return
-
+        """Edit all three existing focus panel messages with fresh embeds."""
         if data is None:
             data = await load_data()
-
-        panels   = data.setdefault("panels", {})
-        gkey     = str(guild.id)
-        msg_id   = panels.get(gkey)
-
-        embed = discord.Embed(
-            title="📋 ARC Directives",
-            description=(
-                "Press **Create Directive** to post a new task for the corps.\n\n"
-                "**Who can create:** General · Director · CEO\n"
-                "**Who can take tasks:** Set per-directive by minimum rank\n\n"
-                "Each directive supports unlimited completions — "
-                "the system tracks how many times each member finishes the task."
-            ),
-            color=discord.Color.dark_blue(),
-        )
-        embed.set_footer(text="ARC Security — Directives System")
-        view = PanelView()
-
-        # Try to edit the existing message first
-        if msg_id:
+        ch = discord.utils.get(guild.text_channels, name=DIRECTIVES_CHANNEL)
+        if not ch:
+            return
+        gp = data.get("panels", {}).get(str(guild.id), {})
+        for fk in FOCUSES:
+            msg_id = gp.get(fk)
+            if not msg_id:
+                continue
             try:
-                existing = await ch.fetch_message(int(msg_id))
-                await existing.edit(embed=embed, view=view)
-                return
+                msg = await ch.fetch_message(int(msg_id))
+                await msg.edit(
+                    embed=build_focus_embed(fk, data, guild),
+                    view=FocusPanelView(fk),
+                )
             except Exception:
                 pass
 
-        # Send a fresh panel
-        try:
-            msg = await ch.send(embed=embed, view=view)
-            panels[gkey] = msg.id
-            await save_data(data)
-        except Exception:
-            pass
-
     # ------------------------------------------------------------------
-    # Button dispatcher (all directive action buttons)
+    # Button handlers
     # ------------------------------------------------------------------
 
-    @commands.Cog.listener()
-    async def on_interaction(self, interaction: discord.Interaction):
-        if interaction.type != discord.InteractionType.component:
-            return
-        if not interaction.data or not isinstance(interaction.data, dict):
-            return
-
-        cid = str(interaction.data.get("custom_id", ""))
-
-        # Panel button is handled by PanelView's own callback — skip it here
-        if cid == "directive:panel:create":
-            return
-
-        # Only process our directive action buttons
-        if not cid.startswith("directive:"):
-            return
-
-        parts = cid.split(":", 2)
-        if len(parts) != 3:
-            return
-
-        _, action, d_id = parts
-        if action not in ("commit", "retract", "completed", "finish"):
-            return
-
-        await self._handle_action(interaction, action, d_id)
-
-    async def _handle_action(
-        self,
-        interaction: discord.Interaction,
-        action: str,
-        d_id: str,
+    async def handle_signup(
+        self, interaction: discord.Interaction, focus_key: str
     ) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
+            await interaction.response.send_message(
+                "Must be used in a server.", ephemeral=True
+            )
             return
 
-        guild  = interaction.guild
         member = interaction.user
+        if not has_eligible_role(member):
+            await interaction.response.send_message(
+                "❌ Only **ARC Lieutenant** and **ARC Commander** can sign up "
+                "for a weekly focus.",
+                ephemeral=True,
+            )
+            return
 
-        async with self._lock(d_id):
-            data      = await load_data()
-            directive = data.get("directives", {}).get(d_id)
+        focus = FOCUSES[focus_key]
 
-            if not isinstance(directive, dict):
+        async with self._data_lock:
+            data = await load_data()
+            _ensure_cycle(data)
+            officers = data["cycle"]["officers"]
+            uid = str(member.id)
+            existing = officers.get(uid)
+
+            if existing and existing.get("focus") == focus_key:
                 await interaction.response.send_message(
-                    "❌ Directive not found.", ephemeral=True
+                    f"You are already signed up for **{focus['label']}** "
+                    f"(**{int(existing.get('completions', 0))}/{GOAL}**).",
+                    ephemeral=True,
                 )
                 return
 
-            if directive.get("status") != "active":
-                await interaction.response.send_message(
-                    "⚠️ This directive has already been finished.", ephemeral=True
+            if existing:
+                # Switch focus — progress carries over.
+                old_focus = existing.get("focus")
+                existing["focus"] = focus_key
+                carried = int(existing.get("completions", 0))
+                reply = (
+                    f"🔁 Switched to **{focus['label']}**.\n"
+                    f"Your progress carried over: **{carried}/{GOAL}**."
                 )
-                return
-
-            min_rank_idx = int(directive.get("min_rank_index", 5))
-
-            # ---- Permission check ----
-            if action == "finish":
-                if not can_finish(member):
-                    await interaction.response.send_message(
-                        "❌ Only **Generals**, **Directors**, and **CEOs** can finish directives.",
-                        ephemeral=True,
-                    )
-                    return
+                log_line = (
+                    f"🔁 **{member.display_name}** switched focus "
+                    f"({FOCUSES.get(old_focus, {}).get('label', old_focus)} → "
+                    f"{focus['label']}) — carried **{carried}/{GOAL}**"
+                )
             else:
-                if not can_interact(member, min_rank_idx):
-                    await interaction.response.send_message(
-                        f"❌ This task requires at least **{RANK_DISPLAY[min_rank_idx]}** rank.",
-                        ephemeral=True,
-                    )
-                    return
-
-            uid     = member.id
-            uid_str = str(uid)
-            assignees   = directive.setdefault("assignees",   [])
-            completions = directive.setdefault("completions", {})
-
-            # ---- Action logic ----
-
-            if action == "commit":
-                if uid in assignees:
-                    await interaction.response.send_message(
-                        "⚠️ You are already committed to this task.", ephemeral=True
-                    )
-                    return
-                max_s = directive.get("max_assignees")
-                if max_s and len(assignees) >= int(max_s):
-                    await interaction.response.send_message(
-                        f"❌ This task is full ({int(max_s)}/{int(max_s)} slots taken).",
-                        ephemeral=True,
-                    )
-                    return
-                assignees.append(uid)
-                reply = "✅ You have committed to this task."
-                log_msg = (
-                    f"✅ **{member.display_name}** committed to directive `{d_id}`\n"
-                    f"**Task:** {directive['task'][:150]}"
+                officers[uid] = {"focus": focus_key, "completions": 0, "events": []}
+                reply = (
+                    f"✅ Signed up for **{focus['label']}**!\n"
+                    f"Goal: complete **{GOAL}** approved ops this week."
                 )
-
-            elif action == "retract":
-                if uid not in assignees:
-                    await interaction.response.send_message(
-                        "⚠️ You are not committed to this task.", ephemeral=True
-                    )
-                    return
-                assignees.remove(uid)
-                reply = "↩ You have retracted from this task."
-                log_msg = (
-                    f"↩ **{member.display_name}** retracted from directive `{d_id}`\n"
-                    f"**Task:** {directive['task'][:150]}"
+                log_line = (
+                    f"✅ **{member.display_name}** signed up for {focus['label']}"
                 )
-
-            elif action == "completed":
-                count = completions.get(uid_str, 0) + 1
-                completions[uid_str] = count
-                reply = f"🏆 Completion recorded! You have completed this task **{count}×** total."
-                log_msg = (
-                    f"🏆 **{member.display_name}** completed directive `{d_id}` "
-                    f"(**{count}× total**)\n"
-                    f"**Task:** {directive['task'][:150]}"
-                )
-
-            elif action == "finish":
-                directive["status"]      = "finished"
-                directive["finished_at"] = utcnow_iso()
-                directive["finished_by"] = uid
-                delete_dt = datetime.datetime.utcnow() + datetime.timedelta(seconds=DELETE_DELAY_SECONDS)
-                directive["delete_at"] = delete_dt.isoformat()
-
-                # Build completion summary for log
-                if completions:
-                    comp_lines = []
-                    for uid_s, c in completions.items():
-                        comp_lines.append(
-                            f"  • {_resolve_name(guild, int(uid_s))}: **{c}×**"
-                        )
-                    comp_summary = "\n".join(comp_lines)
-                else:
-                    comp_summary = "  _(none)_"
-
-                reply = "🏁 Directive finished. The post will be deleted in 30 minutes."
-                log_msg = (
-                    f"🏁 **{member.display_name}** finished directive `{d_id}`\n"
-                    f"**Task:** {directive['task'][:150]}\n"
-                    f"**Completion totals:**\n{comp_summary}"
-                )
-
-            else:
-                return   # should never reach here
 
             await save_data(data)
 
-        # Respond to user and log (outside the lock, non-critical)
         await interaction.response.send_message(reply, ephemeral=True)
-        await _log(guild, log_msg)
-        await self._refresh_embed(guild, directive)
+        await self._refresh_panels(interaction.guild, data)
+        await _log(interaction.guild, log_line)
 
-    # ------------------------------------------------------------------
-    # Embed refresh helper
-    # ------------------------------------------------------------------
-
-    async def _refresh_embed(
-        self, guild: discord.Guild, directive: Dict[str, Any]
+    async def handle_create_event(
+        self, interaction: discord.Interaction, focus_key: str
     ) -> None:
-        ch_id  = directive.get("channel_id")
-        msg_id = directive.get("message_id")
-        if not ch_id or not msg_id:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "Must be used in a server.", ephemeral=True
+            )
             return
 
-        ch = guild.get_channel(int(ch_id))
-        if not isinstance(ch, discord.TextChannel):
+        focus = FOCUSES[focus_key]
+        data = await load_data()
+        off = data.get("cycle", {}).get("officers", {}).get(str(interaction.user.id))
+
+        if not off or off.get("focus") != focus_key:
+            await interaction.response.send_message(
+                f"❌ You must **Sign Up** for {focus['label']} before creating "
+                "its events.",
+                ephemeral=True,
+            )
             return
 
+        await interaction.response.send_message(
+            f"Select the approved title for your **{focus['label']}** op:",
+            view=TitleSelectView(focus_key),
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Called by the Event cog when a directive-tagged event is finalized
+    # ------------------------------------------------------------------
+
+    async def credit_directive_completion(self, event: Dict[str, Any]) -> None:
+        officer_id = event.get("directive_officer_id")
+        if not officer_id:
+            return
+
+        guild_id = event.get("guild_id")
+        guild = self.bot.get_guild(int(guild_id)) if guild_id else None
+
+        # ── Minimum attendance: creator + at least 1 other (≥15 min in VC) ────
+        qualified = [
+            int(x) for x in (event.get("vc_qualified") or [])
+            if isinstance(x, int)
+        ]
+        creator_id = int(event.get("creator") or officer_id)
+        if creator_id not in qualified or len(qualified) < MIN_ATTENDEES:
+            if guild:
+                m = guild.get_member(int(officer_id))
+                name = m.display_name if m else f"<@{officer_id}>"
+                await _log(
+                    guild,
+                    f"⚠️ **{name}**'s op **{event.get('title')}** did not meet the "
+                    f"minimum (creator + 1 member, ≥15 min) — **not counted** "
+                    f"({len(qualified)} qualified).",
+                )
+            return
+
+        bonus_now = False
+        async with self._data_lock:
+            data = await load_data()
+            _ensure_cycle(data)
+
+            # Ignore stragglers finalized after a reset started a new cycle.
+            if event.get("directive_cycle_start") != data["cycle"]["start"]:
+                return
+
+            off = data["cycle"]["officers"].get(str(officer_id))
+            if not off:
+                return  # officer withdrew / was cleared
+
+            off["completions"] = int(off.get("completions", 0)) + 1
+            off.setdefault("events", []).append({
+                "title":        event.get("title"),
+                "event_id":     event.get("short_id") or event.get("message"),
+                "finalized_at": utcnow_iso(),
+            })
+            completions = off["completions"]
+
+            # Weekly-goal bonus — awarded exactly once per officer per cycle.
+            if completions >= GOAL and not off.get("goal_bonus_awarded"):
+                off["goal_bonus_awarded"] = True
+                bonus_now = True
+
+            await save_data(data)
+
+        if guild:
+            await self._refresh_panels(guild, data)
+            m = guild.get_member(int(officer_id))
+            name = m.display_name if m else f"<@{officer_id}>"
+            done = " 🏆 **Goal met!**" if completions >= GOAL else ""
+            await _log(
+                guild,
+                f"🏅 **{name}** finalized **{event.get('title')}** — "
+                f"**{completions}/{GOAL}** this week{done}",
+            )
+
+            if bonus_now:
+                awarded = await self._award_goal_bonus(guild, m) if m else False
+                if awarded:
+                    await _log(
+                        guild,
+                        f"💰 **{name}** earned the **{GOAL_BONUS_AP} AP** weekly "
+                        f"directive goal bonus!",
+                    )
+
+    async def _award_goal_bonus(
+        self, guild: discord.Guild, member: discord.Member
+    ) -> bool:
+        """Award the flat weekly-goal AP bonus via the AP system."""
         try:
-            msg = await ch.fetch_message(int(msg_id))
-        except Exception:
-            return
-
-        embed    = build_directive_embed(directive, guild)
-        finished = directive.get("status") == "finished"
-        view     = DirectiveView(directive["id"], disabled=finished)
-
+            from cogs.ap_tracking import award_ap_with_bonuses
+        except Exception as e:
+            print(f"[directive] goal bonus import failed: {e}")
+            return False
         try:
-            await msg.edit(embed=embed, view=view)
+            await award_ap_with_bonuses(
+                guild=guild,
+                earner=member,
+                base_amount=float(GOAL_BONUS_AP),
+                source="weekly directive goal",
+                reason=f"Completed the weekly directive goal ({GOAL}/{GOAL})",
+                log=True,
+                actor=None,
+                distribution_embed=True,
+                distribution_title="Weekly Directive Goal Bonus",
+            )
+            return True
+        except Exception as e:
+            print(f"[directive] goal bonus award failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Weekly reset loop
+    # ------------------------------------------------------------------
+
+    @tasks.loop(minutes=5)
+    async def reset_check(self):
+        async with self._data_lock:
+            data = await load_data()
+            if _ensure_cycle(data):
+                await save_data(data)
+            if not _cycle_expired(data):
+                return
+            # Snapshot officers before clearing.
+            officers_snapshot = dict(data["cycle"]["officers"])
+
+        # Post results to every guild's log channel.
+        for guild in self.bot.guilds:
+            await self._post_cycle_results(guild, officers_snapshot)
+
+        # Start a fresh cycle.
+        async with self._data_lock:
+            data = await load_data()
+            data["cycle"] = {"start": utcnow_iso(), "officers": {}}
+            await save_data(data)
+
+        for guild in self.bot.guilds:
+            await self._refresh_panels(guild)
+
+    @reset_check.before_loop
+    async def _before_reset_check(self):
+        await self.bot.wait_until_ready()
+
+    async def _post_cycle_results(
+        self, guild: discord.Guild, officers: Dict[str, Any]
+    ) -> None:
+        ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL)
+        if not ch:
+            try:
+                ch = await guild.create_text_channel(LOG_CHANNEL)
+            except Exception:
+                return
+
+        embed = discord.Embed(
+            title="📊 Weekly Directive Results",
+            color=discord.Color.dark_blue(),
+            timestamp=datetime.datetime.utcnow(),
+        )
+
+        if not officers:
+            embed.description = "No officers signed up this cycle."
+        else:
+            met = sum(
+                1 for off in officers.values()
+                if int(off.get("completions", 0)) >= GOAL
+            )
+            embed.description = (
+                f"**{len(officers)}** officer(s) participated — "
+                f"**{met}** met the {GOAL}-op goal. 🎯"
+            )
+            for fk, focus in FOCUSES.items():
+                members = [
+                    (uid, off) for uid, off in officers.items()
+                    if off.get("focus") == fk
+                ]
+                if not members:
+                    continue
+                lines = []
+                for uid, off in sorted(
+                    members, key=lambda kv: int(kv[1].get("completions", 0)),
+                    reverse=True,
+                ):
+                    m = guild.get_member(int(uid))
+                    name = m.display_name if m else f"<@{uid}>"
+                    c = int(off.get("completions", 0))
+                    status = "✅ Met goal" if c >= GOAL else "❌ Missed"
+                    lines.append(f"• {name} — **{c}/{GOAL}** — {status}")
+                embed.add_field(
+                    name=focus["label"], value="\n".join(lines), inline=False
+                )
+
+        embed.set_footer(text="A new weekly cycle has begun.")
+        try:
+            await ch.send(embed=embed)
         except Exception:
             pass
 
     # ------------------------------------------------------------------
-    # 30-minute deletion task
-    # ------------------------------------------------------------------
-
-    @tasks.loop(seconds=30)
-    async def deletion_check(self):
-        """
-        Every 30 seconds: delete embed messages for directives whose
-        30-minute post-finish window has elapsed, then remove them from storage.
-        """
-        now  = datetime.datetime.utcnow()
-        data = await load_data()
-
-        to_purge: List[str] = []
-        for d_id, directive in data.get("directives", {}).items():
-            if directive.get("status") != "finished":
-                continue
-            delete_at_str = directive.get("delete_at")
-            if not delete_at_str:
-                continue
-            try:
-                delete_at = datetime.datetime.fromisoformat(delete_at_str)
-            except Exception:
-                continue
-            if now >= delete_at:
-                to_purge.append(d_id)
-
-        if not to_purge:
-            return
-
-        for d_id in to_purge:
-            directive = data["directives"].get(d_id)
-            if not directive:
-                continue
-
-            guild_id = directive.get("guild_id")
-            ch_id    = directive.get("channel_id")
-            msg_id   = directive.get("message_id")
-
-            if guild_id and ch_id and msg_id:
-                guild = self.bot.get_guild(int(guild_id))
-                if guild:
-                    ch = guild.get_channel(int(ch_id))
-                    if isinstance(ch, discord.TextChannel):
-                        try:
-                            msg = await ch.fetch_message(int(msg_id))
-                            await msg.delete()
-                        except Exception:
-                            pass
-
-            del data["directives"][d_id]
-            print(f"[directive] Purged finished directive {d_id}.")
-
-        await save_data(data)
-
-    @deletion_check.before_loop
-    async def _before_deletion_check(self):
-        await self.bot.wait_until_ready()
-
-    # ------------------------------------------------------------------
-    # Admin slash command — force refresh panel
+    # Admin slash command — repost / refresh the panels
     # ------------------------------------------------------------------
 
     @app_commands.command(
         name="directive_setup",
-        description="Re-post or refresh the Directives panel (CEO / Director / General only).",
+        description="Re-post or refresh the three weekly Directive focus panels.",
     )
     async def directive_setup(self, interaction: discord.Interaction):
-        if not isinstance(interaction.user, discord.Member) or not can_create(interaction.user):
+        if not isinstance(interaction.user, discord.Member) or not (
+            interaction.user.guild_permissions.administrator
+            or has_eligible_role(interaction.user)
+        ):
             await interaction.response.send_message(
-                "❌ Only Generals, Directors, and CEOs can use this.", ephemeral=True
+                "❌ Only admins, Lieutenants, and Commanders can use this.",
+                ephemeral=True,
             )
             return
         await interaction.response.defer(ephemeral=True)
-        await self._ensure_panel(interaction.guild)
+        await self._ensure_panels(interaction.guild)
         await interaction.followup.send(
-            f"✅ Panel refreshed in `#{DIRECTIVES_CHANNEL}`.", ephemeral=True
+            f"✅ Directive focus panels refreshed in `#{DIRECTIVES_CHANNEL}`.",
+            ephemeral=True,
         )
 
 
