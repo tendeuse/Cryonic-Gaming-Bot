@@ -491,7 +491,11 @@ class DirectiveCog(commands.Cog):
         async with self._data_lock:
             data = await load_data()
             _ensure_cycle(data)
-            gp = data.setdefault("panels", {}).setdefault(str(guild.id), {})
+            panels = data.setdefault("panels", {})
+            gp = panels.get(str(guild.id))
+            if not isinstance(gp, dict):   # migrate stale/old-format value
+                gp = {}
+                panels[str(guild.id)] = gp
             changed = False
 
             for fk in FOCUSES:
@@ -527,6 +531,8 @@ class DirectiveCog(commands.Cog):
         if not ch:
             return
         gp = data.get("panels", {}).get(str(guild.id), {})
+        if not isinstance(gp, dict):
+            return
         for fk in FOCUSES:
             msg_id = gp.get(fk)
             if not msg_id:
