@@ -70,7 +70,7 @@ QUESTIONS: List[str] = [
     "Discord username and ID (e.g., username#0000 or @username)",
     "How old are you?",
     "What timezone are you in?",
-    "How long have you been a member of this server?",
+    "How long have you been in ARC Security?",
     "How many hours per week can you realistically dedicate to server duties?",
     "Have you ever held a moderation/officer role on this or another server? "
     "If so, describe your experience.",
