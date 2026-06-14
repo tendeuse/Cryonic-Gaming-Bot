@@ -81,7 +81,7 @@ PRESENCE_BONUS_EXCLUDED_ROLES: Set[str] = {
 }
 
 # Voice-channel attendance tracking
-ARC_MAIN_VC          = "ARC Main"      # destination VC after event ends
+ARC_MAIN_VC          = "ARC  Main (EVE Online)"      # destination VC after event ends
 EVENT_VC_MIN_SECONDS = 15 * 60         # 900 s  — minimum cumulative time to qualify
 VC_PRECREATE_SECONDS = 5 * 60          # 300 s  — create the event VC this long before start
 
