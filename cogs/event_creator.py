@@ -83,6 +83,7 @@ PRESENCE_BONUS_EXCLUDED_ROLES: Set[str] = {
 # Voice-channel attendance tracking
 ARC_MAIN_VC          = "ARC Main"      # destination VC after event ends
 EVENT_VC_MIN_SECONDS = 15 * 60         # 900 s  — minimum cumulative time to qualify
+VC_PRECREATE_SECONDS = 5 * 60          # 300 s  — create the event VC this long before start
 
 # Clicking these button names grants the "Event Participant" temp-role
 ROLE_ASSIGN_TYPES: Set[str] = {"accept", "damage", "logi", "salvager"}
@@ -2018,17 +2019,98 @@ class EventCreator(commands.Cog):
     # Presence loop — fires every 60 s
     # ----------------------------------------------------------------
 
+    async def _create_event_vc(
+        self,
+        guild:    discord.Guild,
+        event:    Dict[str, Any],
+        event_id: str,
+    ) -> Optional[discord.VoiceChannel]:
+        """
+        Create the temporary event voice channel and seed in-memory tracking.
+
+        Returns the new VoiceChannel, or None if creation failed (caller should
+        leave the event untouched and retry on the next loop). Does NOT mutate
+        the event record beyond what the caller persists — the caller is
+        responsible for writing event["event_vc_id"] and saving.
+        """
+        # ── Determine VC category (same as the announcement channel) ─────────
+        ann_channel = guild.get_channel(event.get("channel"))
+        category    = ann_channel.category if isinstance(
+            ann_channel, discord.TextChannel
+        ) else None
+
+        # ── Build permission overwrites for the event audience ───────────────
+        bot_member = guild.get_member(self.bot.user.id) if self.bot.user else None
+        overwrites = _build_vc_overwrites(
+            guild,
+            target=     event.get("target", "security_only"),
+            bot_member= bot_member,
+        )
+
+        vc_name = f"🔴 {str(event.get('title', 'Event'))[:90]}"
+        try:
+            event_vc = await guild.create_voice_channel(
+                name=       vc_name,
+                category=   category,
+                overwrites= overwrites,
+                reason=     f"Event attendance tracking: {event_id}",
+            )
+        except discord.Forbidden:
+            print(
+                f"[event_creator] Missing 'Manage Roles' permission — cannot "
+                f"set overwrites for event VC ({event_id}). "
+                "Creating without access restrictions as fallback."
+            )
+            try:
+                event_vc = await guild.create_voice_channel(
+                    name=     vc_name,
+                    category= category,
+                    reason=   f"Event attendance tracking (no overwrites): {event_id}",
+                )
+            except Exception as e2:
+                print(
+                    f"[event_creator] Fallback VC creation also failed for "
+                    f"{event_id}: {type(e2).__name__}: {e2}"
+                )
+                return None
+        except Exception as e:
+            print(
+                f"[event_creator] Failed to create event VC for {event_id}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+
+        # Seed in-memory tracking so on_voice_state_update starts counting
+        # cumulative time immediately (including early joiners before start).
+        self._vc_event_map[event_vc.id] = event_id
+        self._vc_join_times.setdefault(event_id, {})
+        self._vc_cumulative.setdefault(event_id, {})
+        for m in event_vc.members:
+            self._vc_join_times[event_id].setdefault(
+                m.id, int(datetime.now(timezone.utc).timestamp())
+            )
+        return event_vc
+
     @tasks.loop(seconds=60)
     async def presence_loop(self):
         """
-        When an event's scheduled time is reached and presence_started is
-        False, the bot:
-          1. Creates a temporary voice channel in the same category as the
-             announcement channel.
-          2. Pulls every RSVP'd (non-Decline) member who is currently in any
-             VC into the new event VC.
-          3. Begins tracking cumulative VC time for all members.
-          4. DMs the event creator a single "Mark Event as Done" button.
+        Two-phase event lifecycle, both driven from this loop:
+
+        Phase 1 — VC_PRECREATE_SECONDS (5 min) before the scheduled time:
+          • Creates the temporary voice channel in the same category as the
+            announcement channel so it is ready before members arrive.
+
+        Phase 2 — at the scheduled start time:
+          • Verifies the VC still exists; if it was never created or has since
+            been deleted, it is (re)created now.
+          • Pulls every RSVP'd (non-Decline) member currently in any VC into
+            the event VC.
+          • DMs the event creator a single "Mark Event as Done" button.
+          • Marks the event as started (presence_started=True).
+
+        Cumulative VC-time tracking runs continuously via on_voice_state_update
+        for any VC in _vc_event_map, so time accrues from the moment the VC is
+        created in Phase 1.
         """
         data    = await load_events()
         now_ts  = int(datetime.now(timezone.utc).timestamp())
@@ -2046,22 +2128,11 @@ class EventCreator(commands.Cog):
             if event.get("presence_started") is True:
                 continue
 
-            # Self-heal: if a VC id is already recorded but presence_started
-            # was lost (e.g. a concurrent save race overwrote it), mark the
-            # event as started and skip so we never create a duplicate VC.
-            if event.get("event_vc_id") is not None:
-                event["presence_started"] = True
-                data[event_id]            = event
-                changed                   = True
-                print(
-                    f"[event_creator] Self-healed presence_started for event "
-                    f"{event_id} (event_vc_id={event['event_vc_id']} was set "
-                    f"but presence_started was False)."
-                )
-                continue
-
             ts = event.get("timestamp")
-            if not isinstance(ts, int) or now_ts < ts:
+            if not isinstance(ts, int):
+                continue
+            # Not yet inside the pre-create window (5 min before start).
+            if now_ts < ts - VC_PRECREATE_SECONDS:
                 continue
 
             guild_id   = event.get("guild_id")
@@ -2074,67 +2145,34 @@ class EventCreator(commands.Cog):
             if not guild or not creator:
                 continue
 
-            # ── 1. Determine VC category (same as announcement channel) ──────
-            ann_channel = guild.get_channel(event.get("channel"))
-            category    = ann_channel.category if isinstance(
-                ann_channel, discord.TextChannel
-            ) else None
-
-            # ── 2. Build permission overwrites for the event audience ─────────
-            bot_member = guild.get_member(self.bot.user.id) if self.bot.user else None
-            overwrites = _build_vc_overwrites(
-                guild,
-                target=     event.get("target", "security_only"),
-                bot_member= bot_member,
-            )
-
-            # ── 3. Create the event voice channel ────────────────────────────
-            vc_name = f"🔴 {str(event.get('title', 'Event'))[:90]}"
-            try:
-                event_vc = await guild.create_voice_channel(
-                    name=       vc_name,
-                    category=   category,
-                    overwrites= overwrites,
-                    reason=     f"Event attendance tracking: {event_id}",
-                )
-            except discord.Forbidden:
+            # ── PHASE 1: ensure the event VC exists ──────────────────────────
+            # Reuse a previously-created VC if it is still alive; otherwise
+            # create it now. This both pre-creates the VC 5 min before start
+            # and self-heals if the VC was deleted or never created (e.g. the
+            # bot was offline during the pre-create window and is only now
+            # catching up at/after the start time).
+            vc_id    = event.get("event_vc_id")
+            event_vc = guild.get_channel(vc_id) if isinstance(vc_id, int) else None
+            if not isinstance(event_vc, discord.VoiceChannel):
+                event_vc = await self._create_event_vc(guild, event, event_id)
+                if event_vc is None:
+                    continue   # creation failed — retry next loop
+                event["event_vc_id"] = event_vc.id
+                data[event_id]       = event
+                changed              = True
+                when = "pre-created" if now_ts < ts else "created at start"
                 print(
-                    f"[event_creator] Missing 'Manage Roles' permission — cannot "
-                    f"set overwrites for event VC ({event_id}). "
-                    "Creating without access restrictions as fallback."
+                    f"[event_creator] Event '{event.get('title')}' VC "
+                    f"{when} (VC={event_vc.id})."
                 )
-                try:
-                    event_vc = await guild.create_voice_channel(
-                        name=     vc_name,
-                        category= category,
-                        reason=   f"Event attendance tracking (no overwrites): {event_id}",
-                    )
-                except Exception as e2:
-                    print(
-                        f"[event_creator] Fallback VC creation also failed for "
-                        f"{event_id}: {type(e2).__name__}: {e2}"
-                    )
-                    continue
-            except Exception as e:
-                print(
-                    f"[event_creator] Failed to create event VC for {event_id}: "
-                    f"{type(e).__name__}: {e}"
-                )
+
+            # ── PHASE 2 gate: wait until the scheduled start time ─────────────
+            # Before start, the VC simply sits ready; we do not pull members or
+            # notify the creator until the event actually begins.
+            if now_ts < ts:
                 continue
 
-            # ── 4. Mark event as started, record VC id ───────────────────────
-            event["presence_started"]      = True
-            event["presence_started_utc"]  = datetime.now(timezone.utc).isoformat()
-            event["event_vc_id"]           = event_vc.id
-            data[event_id]                 = event
-            changed                        = True
-
-            # Seed in-memory tracking
-            self._vc_event_map[event_vc.id] = event_id
-            self._vc_join_times.setdefault(event_id, {})
-            self._vc_cumulative.setdefault(event_id, {})
-
-            # ── 5. Pull RSVP'd members who are already in a VC ──────────────
+            # ── PHASE 2: pull RSVP'd members who are already in a VC ─────────
             participants = compute_participants(event)
             pulled       = 0
             pulled_set   = self._vc_pulled.setdefault(event_id, set())
@@ -2142,7 +2180,8 @@ class EventCreator(commands.Cog):
                 member = guild.get_member(pid)
                 if not member:
                     continue
-                if member.voice and member.voice.channel:
+                if member.voice and member.voice.channel \
+                        and member.voice.channel.id != event_vc.id:
                     try:
                         await member.move_to(
                             event_vc,
@@ -2153,13 +2192,20 @@ class EventCreator(commands.Cog):
                     except Exception:
                         pass  # member may have left VC between check and move
 
+            # ── Mark event as started ────────────────────────────────────────
+            event["presence_started"]     = True
+            event["presence_started_utc"] = datetime.now(timezone.utc).isoformat()
+            data[event_id]                = event
+            changed                       = True
+
+            vc_name = event_vc.name
             print(
                 f"[event_creator] Event '{event.get('title')}' started. "
                 f"VC={event_vc.id}, pulled {pulled}/{len(participants)} "
                 f"RSVP'd member(s)."
             )
 
-            # ── 6. DM the creator with the "Mark as Done" button ─────────────
+            # ── DM the creator with the "Mark as Done" button ────────────────
             try:
                 dm    = await creator.create_dm()
                 embed = discord.Embed(
