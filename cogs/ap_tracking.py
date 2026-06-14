@@ -15,7 +15,7 @@
 #
 # BONUS POLICY:
 # - CEO(s): each gets +10% of base (NOT divided)
-# - Directors: total pool = 10% of base, split evenly among Directors (excluding CEOs)
+# - Directors: 10% of base EACH (not divided), among Directors (excluding CEOs)
 # - Leadership bonus triggers only when earner has SECURITY_ROLE
 # - Unit tier bonuses are disabled in this version
 #
@@ -548,10 +548,10 @@ async def award_ap_with_bonuses(
                 append_audit(data, uid, ceo_bonus_each, ceo_source, reason=reason, actor_id=earner.id)
             mention_ids.extend(ceo_targets)
 
-        # Directors: TOTAL pool 10% split between them
+        # Directors: 10% EACH, not divided
         if directors_targets:
-            directors_pool  = base_amount * 0.10
-            directors_each  = directors_pool / float(len(directors_targets))
+            directors_each  = base_amount * 0.10
+            directors_pool  = directors_each * float(len(directors_targets))
             dir_source      = f"leadership bonus (Director) from {earner.display_name} via {source}"
             for uid in directors_targets:
                 await add_ap_raw(data, uid, directors_each)
@@ -608,10 +608,10 @@ async def award_ap_with_bonuses(
                 )
             else:
                 lines.append("CEO bonus: none (no CEO found).")
-            if directors_targets and directors_pool > 0:
+            if directors_targets and directors_each > 0:
                 lines.append(
-                    f"Directors bonus: pool **+{directors_pool:.2f} AP** (10% of base) split across "
-                    f"{len(directors_targets)} Director(s) (**+{directors_each:.2f} each**)."
+                    f"Directors bonus: each Director received **+{directors_each:.2f} AP** "
+                    f"(10% of base; not divided) across {len(directors_targets)} Director(s)."
                 )
             else:
                 lines.append("Directors bonus: none (no eligible Directors found).")
@@ -857,9 +857,9 @@ def _apply_ap_to_data(
                 append_audit(data, uid, ceo_bonus, ceo_src, reason=reason, actor_id=earner.id)
             mention_ids.extend(ceo_id_list)
 
-        # Directors: 10% pool split evenly
+        # Directors: +10% each (not divided)
         if eligible_directors:
-            dir_each = (base_amount * 0.10) / float(len(eligible_directors))
+            dir_each = base_amount * 0.10
             dir_src  = f"leadership bonus (Director) from {earner.display_name} via {source}"
             for uid in eligible_directors:
                 r = data.setdefault(str(uid), {"ap": 0, "last_chat": None})
