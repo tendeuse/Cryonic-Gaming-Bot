@@ -296,7 +296,7 @@ class DirectiveEventModal(discord.ui.Modal):
         required=True,
     )
     rsvp_buttons = discord.ui.TextInput(
-        label="RSVP buttons (comma list, blank = Accept,Decline)",
+        label="RSVP buttons (blank = Accept,Decline)",
         placeholder="Accept, Tentative, Decline",
         required=False,
         max_length=120,
