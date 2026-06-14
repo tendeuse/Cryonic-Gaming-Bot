@@ -302,6 +302,22 @@ def compute_participants(event: Dict[str, Any]) -> List[int]:
     return sorted(out)
 
 
+def compute_pull_targets(event: Dict[str, Any]) -> List[int]:
+    """
+    User IDs the bot should pull into / track inside the event VC.
+
+    This is the RSVP'd participants PLUS the event creator (host).  The creator
+    is never auto-RSVP'd, so without this they would never be pulled into the
+    event VC and would fail the directive's "creator attended" check even after
+    running the op themselves.
+    """
+    targets: Set[int] = set(compute_participants(event))
+    creator = event.get("creator")
+    if isinstance(creator, int):
+        targets.add(creator)
+    return sorted(targets)
+
+
 def current_confirmed_ids(event: Dict[str, Any]) -> List[int]:
     presence = event.get("presence", {})
     return sorted({int(k) for k, v in presence.items() if v is True})
@@ -2172,8 +2188,8 @@ class EventCreator(commands.Cog):
             if now_ts < ts:
                 continue
 
-            # ── PHASE 2: pull RSVP'd members who are already in a VC ─────────
-            participants = compute_participants(event)
+            # ── PHASE 2: pull RSVP'd members (and the creator) already in a VC ─
+            participants = compute_pull_targets(event)
             pulled       = 0
             pulled_set   = self._vc_pulled.setdefault(event_id, set())
             for pid in participants:
@@ -2290,7 +2306,7 @@ class EventCreator(commands.Cog):
             self._vc_join_times.setdefault(event_id, {})[member.id] = now
             return   # Nothing else to do
 
-        # ── C: RSVP'd member joined a NON-event VC ───────────────────────────
+        # ── C: RSVP'd member (or the creator) joined a NON-event VC ──────────
         # Pull them into the event VC for their guild ONLY if they have not
         # been pulled before. Once pulled (at event start or first join),
         # the member is free to leave voluntarily without being dragged back.
@@ -2313,7 +2329,7 @@ class EventCreator(commands.Cog):
                     continue
 
                 event        = normalize_event(event)
-                participants = set(compute_participants(event))
+                participants = set(compute_pull_targets(event))
 
                 if member.id in participants:
                     try:
@@ -2466,6 +2482,10 @@ class EventCreator(commands.Cog):
         ap_failures: List[str] = []
         if creator_m and not has_any_role(creator_m, PRESENCE_BONUS_EXCLUDED_ROLES):
             for uid in qualified_ids:
+                # The creator now qualifies (so the op counts for the directive),
+                # but they must not pay themselves the per-attendee AP/boost.
+                if uid == creator_id:
+                    continue
                 part_m = guild.get_member(uid)
                 if not part_m:
                     continue
@@ -2992,6 +3012,10 @@ class EventCreator(commands.Cog):
                 uid = int(uid_str)
             except ValueError:
                 continue
+            # The creator may now appear in the VC times (they get pulled in and
+            # tracked), but they never receive the per-attendee AP for themselves.
+            if uid == creator.id:
+                continue
             m = guild.get_member(uid)
             if m is None:
                 unresolved.append(uid)
@@ -3202,10 +3226,14 @@ class EventCreator(commands.Cog):
         creator_m  = guild.get_member(creator_id) if isinstance(creator_id, int) else None
         ts         = match_event.get("timestamp", 0)
 
-        # Resolve member objects and separate those who left the server
+        # Resolve member objects and separate those who left the server.
+        # The creator now qualifies for the op, but is never paid per-attendee
+        # AP for their own attendance — drop them from the payout list.
         qualified_members: List[discord.Member] = []
         unresolved_ids:    List[int]            = []
         for uid in qualified_ids_raw:
+            if uid == creator_id:
+                continue
             m = guild.get_member(uid)
             if m:
                 qualified_members.append(m)

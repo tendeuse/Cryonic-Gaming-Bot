@@ -646,32 +646,48 @@ class DirectiveCog(commands.Cog):
     # Called by the Event cog when a directive-tagged event is finalized
     # ------------------------------------------------------------------
 
-    async def credit_directive_completion(self, event: Dict[str, Any]) -> None:
+    async def credit_directive_completion(
+        self, event: Dict[str, Any], *, force: bool = False
+    ) -> str:
+        """
+        Tick an officer's directive progress for a finalized event.
+
+        Normally called by the Event cog on finalize.  Pass ``force=True`` (used
+        by the /directive_credit admin command) to bypass the VC-attendance gate
+        and credit the op manually.
+
+        Returns a short status code describing the outcome:
+          "no_directive" | "not_qualified" | "wrong_cycle" |
+          "no_officer" | "already_credited" | "credited"
+        """
         officer_id = event.get("directive_officer_id")
         if not officer_id:
-            return
+            return "no_directive"
 
         guild_id = event.get("guild_id")
         guild = self.bot.get_guild(int(guild_id)) if guild_id else None
 
         # ── Minimum attendance: creator + at least 1 other (≥15 min in VC) ────
-        qualified = [
-            int(x) for x in (event.get("vc_qualified") or [])
-            if isinstance(x, int)
-        ]
-        creator_id = int(event.get("creator") or officer_id)
-        if creator_id not in qualified or len(qualified) < MIN_ATTENDEES:
-            if guild:
-                m = guild.get_member(int(officer_id))
-                name = m.display_name if m else f"<@{officer_id}>"
-                await _log(
-                    guild,
-                    f"⚠️ **{name}**'s op **{event.get('title')}** did not meet the "
-                    f"minimum (creator + 1 member, ≥15 min) — **not counted** "
-                    f"({len(qualified)} qualified).",
-                )
-            return
+        # Skipped when force=True (admin manually vouching for the op).
+        if not force:
+            qualified = [
+                int(x) for x in (event.get("vc_qualified") or [])
+                if isinstance(x, int)
+            ]
+            creator_id = int(event.get("creator") or officer_id)
+            if creator_id not in qualified or len(qualified) < MIN_ATTENDEES:
+                if guild:
+                    m = guild.get_member(int(officer_id))
+                    name = m.display_name if m else f"<@{officer_id}>"
+                    await _log(
+                        guild,
+                        f"⚠️ **{name}**'s op **{event.get('title')}** did not meet "
+                        f"the minimum (creator + 1 member, ≥15 min) — **not "
+                        f"counted** ({len(qualified)} qualified).",
+                    )
+                return "not_qualified"
 
+        event_key = event.get("short_id") or event.get("message")
         bonus_now = False
         async with self._data_lock:
             data = await load_data()
@@ -679,16 +695,25 @@ class DirectiveCog(commands.Cog):
 
             # Ignore stragglers finalized after a reset started a new cycle.
             if event.get("directive_cycle_start") != data["cycle"]["start"]:
-                return
+                return "wrong_cycle"
 
             off = data["cycle"]["officers"].get(str(officer_id))
             if not off:
-                return  # officer withdrew / was cleared
+                return "no_officer"  # officer withdrew / was cleared
+
+            # Don't double-count an event that was already credited.
+            already = any(
+                e.get("event_id") == event_key
+                for e in off.get("events", [])
+                if isinstance(e, dict)
+            )
+            if event_key is not None and already:
+                return "already_credited"
 
             off["completions"] = int(off.get("completions", 0)) + 1
             off.setdefault("events", []).append({
                 "title":        event.get("title"),
-                "event_id":     event.get("short_id") or event.get("message"),
+                "event_id":     event_key,
                 "finalized_at": utcnow_iso(),
             })
             completions = off["completions"]
@@ -719,6 +744,8 @@ class DirectiveCog(commands.Cog):
                         f"💰 **{name}** earned the **{GOAL_BONUS_AP} AP** weekly "
                         f"directive goal bonus!",
                     )
+
+        return "credited"
 
     async def _award_goal_bonus(
         self, guild: discord.Guild, member: discord.Member
@@ -854,6 +881,94 @@ class DirectiveCog(commands.Cog):
         await self._ensure_panels(interaction.guild)
         await interaction.followup.send(
             f"✅ Directive focus panels refreshed in `#{DIRECTIVES_CHANNEL}`.",
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Admin slash command — manually credit a directive op
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="directive_credit",
+        description="Manually credit a directive op for its officer (bypasses the VC attendance check).",
+    )
+    @app_commands.describe(
+        event_id="Event ID from the embed footer, e.g. EVT-A3F72B (the UUID prefix also works).",
+    )
+    async def directive_credit(
+        self, interaction: discord.Interaction, event_id: str
+    ):
+        if not isinstance(interaction.user, discord.Member) or not (
+            interaction.user.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "❌ Only administrators can manually credit a directive op.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            from cogs.event_creator import load_events, normalize_event
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Could not load events: {e}", ephemeral=True
+            )
+            return
+
+        # ── Find the event by short_id (or UUID prefix) ──────────────────────
+        lookup = event_id.strip().upper()
+        data   = await load_events()
+        match_event: Optional[Dict[str, Any]] = None
+        for eid, ev in data.items():
+            if not isinstance(ev, dict):
+                continue
+            stored = str(ev.get("short_id", "")).upper()
+            if stored == lookup or eid.upper().startswith(lookup):
+                match_event = normalize_event(ev)
+                break
+
+        if match_event is None:
+            await interaction.followup.send(
+                f"❌ No event found with ID **{event_id}**.\n"
+                "The Event ID is shown in the event embed footer, e.g. "
+                "`EVT-A3F72B`.",
+                ephemeral=True,
+            )
+            return
+
+        if not match_event.get("directive_officer_id"):
+            await interaction.followup.send(
+                f"❌ **{match_event.get('title', 'That event')}** is not a "
+                "directive op (no focus officer attached), so there's nothing "
+                "to credit.",
+                ephemeral=True,
+            )
+            return
+
+        status     = await self.credit_directive_completion(match_event, force=True)
+        officer_id = match_event.get("directive_officer_id")
+        title      = match_event.get("title", "the op")
+
+        replies = {
+            "credited":
+                f"✅ Credited **{title}** to <@{officer_id}> toward their weekly "
+                "directive goal.",
+            "already_credited":
+                f"ℹ️ **{title}** was already credited to <@{officer_id}> — "
+                "no change made.",
+            "wrong_cycle":
+                f"⚠️ **{title}** belongs to a previous cycle (the week has since "
+                "reset), so it can't be credited toward the current week.",
+            "no_officer":
+                f"⚠️ <@{officer_id}> isn't signed up for a focus this cycle, so "
+                "there's nothing to credit. They need to **Sign Up** first.",
+            "no_directive":
+                f"❌ **{title}** has no directive officer attached.",
+        }
+        await interaction.followup.send(
+            replies.get(status, f"⚠️ Unexpected result: `{status}`"),
             ephemeral=True,
         )
 
