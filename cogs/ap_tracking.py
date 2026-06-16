@@ -15,7 +15,7 @@
 #
 # BONUS POLICY:
 # - CEO(s): each gets +10% of base (NOT divided)
-# - Directors: 10% of base EACH (not divided), among Directors (excluding CEOs)
+# - Directors: 5% of base EACH (not divided), among Directors (excluding CEOs)
 # - Leadership bonus triggers only when earner has SECURITY_ROLE
 # - Unit tier bonuses are disabled in this version
 #
@@ -548,9 +548,9 @@ async def award_ap_with_bonuses(
                 append_audit(data, uid, ceo_bonus_each, ceo_source, reason=reason, actor_id=earner.id)
             mention_ids.extend(ceo_targets)
 
-        # Directors: 10% EACH, not divided
+        # Directors: 5% EACH, not divided
         if directors_targets:
-            directors_each  = base_amount * 0.10
+            directors_each  = base_amount * 0.05
             directors_pool  = directors_each * float(len(directors_targets))
             dir_source      = f"leadership bonus (Director) from {earner.display_name} via {source}"
             for uid in directors_targets:
@@ -611,7 +611,7 @@ async def award_ap_with_bonuses(
             if directors_targets and directors_each > 0:
                 lines.append(
                     f"Directors bonus: each Director received **+{directors_each:.2f} AP** "
-                    f"(10% of base; not divided) across {len(directors_targets)} Director(s)."
+                    f"(5% of base; not divided) across {len(directors_targets)} Director(s)."
                 )
             else:
                 lines.append("Directors bonus: none (no eligible Directors found).")
@@ -857,9 +857,9 @@ def _apply_ap_to_data(
                 append_audit(data, uid, ceo_bonus, ceo_src, reason=reason, actor_id=earner.id)
             mention_ids.extend(ceo_id_list)
 
-        # Directors: +10% each (not divided)
+        # Directors: +5% each (not divided)
         if eligible_directors:
-            dir_each = base_amount * 0.10
+            dir_each = base_amount * 0.05
             dir_src  = f"leadership bonus (Director) from {earner.display_name} via {source}"
             for uid in eligible_directors:
                 r = data.setdefault(str(uid), {"ap": 0, "last_chat": None})
