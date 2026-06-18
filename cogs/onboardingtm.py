@@ -49,10 +49,11 @@ WARNING_CHANNEL_ID = 1448591790860144681
 ADMIN_ID = 415519873972699147
 
 # Deadline / notice thresholds (days from the thread's creation).
+# The ticket deadline is 15 days; the final admin notice fires on day 14.
 DEADLINE_DAYS = 15
 DAY8_THRESHOLD = 8
 DAY12_THRESHOLD = 12
-DAY15_THRESHOLD = 15
+FINAL_NOTICE_DAY = 14
 
 CHECK_INTERVAL_HOURS = 1
 
@@ -369,11 +370,16 @@ class OnboardingTMCog(commands.Cog):
             # ---- DAY 8 — First Notice ----
             if days_open >= DAY8_THRESHOLD and not t["day8_sent"]:
                 emb = self._notice_embed(
-                    title="⏰ First Notice — 8 Days Open",
+                    title="⏰ Day 8 Onboarding Reminder",
                     color=discord.Color.gold(),
                     ticket_id=ticket_id,
                     end_time=end_time,
-                    body=f"Onboarding ticket <#{ticket_id}> has been open for **{days_open} days**.",
+                    body=(
+                        "Morning\n\n"
+                        f"This is your Day 8 reminder to complete your onboarding ticket before **{end_time}**.\n\n"
+                        "Please make sure all required steps are finished by the deadline.\n\n"
+                        "Thank you for your attention to this matter, and fly safe among the stars!"
+                    ),
                 )
                 await channel.send(embed=emb)
                 await mark_sent(ticket_id, "day8_sent")
@@ -390,16 +396,16 @@ class OnboardingTMCog(commands.Cog):
                 await channel.send(embed=emb)
                 await mark_sent(ticket_id, "day12_sent")
 
-            # ---- DAY 15+ — Final Notice (admin ping) ----
-            if days_open >= DAY15_THRESHOLD and not t["day15_sent"]:
+            # ---- DAY 14 — Final Notice (admin ping, day before deadline) ----
+            if days_open >= FINAL_NOTICE_DAY and not t["day15_sent"]:
                 emb = self._notice_embed(
-                    title="🚨 Final Notice — 15-Day Threshold Broken",
+                    title="🚨 Final Notice — Deadline Approaching",
                     color=discord.Color.red(),
                     ticket_id=ticket_id,
                     end_time=end_time,
                     body=(
                         f"<@{ADMIN_ID}> (new ARC Ainu / Broen), onboarding ticket <#{ticket_id}> "
-                        f"has broken the **15-day threshold** ({days_open} days open)."
+                        f"has been open **{days_open} days** — the 15-day deadline ({end_time}) is nearly up."
                     ),
                 )
                 await channel.send(
