@@ -199,6 +199,20 @@ class OnboardingTMCog(commands.Cog):
                 continue
             await self._register_thread(thread)
 
+        # Cleanup: untrack any tracked ticket whose thread was closed (locked)
+        # or deleted while the bot was offline (its events would have been missed).
+        for t in await list_tickets():
+            tid = t["ticket_id"]
+            try:
+                ch = self.bot.get_channel(int(tid)) or await self.bot.fetch_channel(int(tid))
+            except discord.NotFound:
+                await close_ticket(tid)  # thread deleted
+                continue
+            except Exception:
+                continue  # transient resolve failure — leave it tracked
+            if isinstance(ch, discord.Thread) and ch.locked:
+                await close_ticket(tid)  # ticket closed by Tickety
+
     # ── Auto-tracking via thread events ────────────────────────────────────
 
     async def _register_thread(self, thread: discord.Thread) -> bool:
@@ -238,6 +252,20 @@ class OnboardingTMCog(commands.Cog):
         if payload.parent_id != PARENT_CHANNEL_ID:
             return
         await close_ticket(str(payload.thread_id))
+
+    async def _resolve_thread(self, ticket_id: str) -> Optional[discord.Thread]:
+        """Resolve a tracked ticket_id back to its thread (cache, then live fetch)."""
+        try:
+            tid = int(ticket_id)
+        except ValueError:
+            return None
+        ch = self.bot.get_channel(tid)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(tid)
+            except Exception:
+                return None
+        return ch if isinstance(ch, discord.Thread) else None
 
     # ── Embed builder ──────────────────────────────────────────────────────
 
@@ -367,22 +395,33 @@ class OnboardingTMCog(commands.Cog):
                 continue
             days_open = (now - open_time).days
 
-            # ---- DAY 8 — First Notice ----
+            # If the ticket thread has been closed (locked by Tickety), stop the
+            # timer now — this is the authoritative check even if the live event
+            # was missed (downtime / cache eviction).
+            thread = await self._resolve_thread(ticket_id)
+            if thread is not None and thread.locked:
+                await close_ticket(ticket_id)
+                continue
+
+            # ---- DAY 8 — Reminder posted INSIDE the ticket thread (recruit-facing) ----
             if days_open >= DAY8_THRESHOLD and not t["day8_sent"]:
-                emb = self._notice_embed(
-                    title="⏰ Day 8 Onboarding Reminder",
-                    color=discord.Color.gold(),
-                    ticket_id=ticket_id,
-                    end_time=end_time,
-                    body=(
-                        "Morning\n\n"
-                        f"This is your Day 8 reminder to complete your onboarding ticket before **{end_time}**.\n\n"
-                        "Please make sure all required steps are finished by the deadline.\n\n"
-                        "Thank you for your attention to this matter, and fly safe among the stars!"
-                    ),
-                )
-                await channel.send(embed=emb)
-                await mark_sent(ticket_id, "day8_sent")
+                if thread is None:
+                    print(f"[onboardingtm] Day 8: thread {ticket_id} not found; will retry next pass.")
+                else:
+                    emb = discord.Embed(
+                        title="⏰ Day 8 Onboarding Reminder",
+                        description=(
+                            "Morning\n\n"
+                            f"This is your Day 8 reminder to complete your onboarding ticket before **{end_time}**.\n\n"
+                            "Please make sure all required steps are finished by the deadline.\n\n"
+                            "Thank you for your attention to this matter, and fly safe among the stars!"
+                        ),
+                        color=discord.Color.gold(),
+                        timestamp=now,
+                    )
+                    emb.set_footer(text="Cryonic Gaming bot — Onboarding Ticket Monitor")
+                    await thread.send(embed=emb)
+                    await mark_sent(ticket_id, "day8_sent")
 
             # ---- DAY 12 — Second Notice ----
             if days_open >= DAY12_THRESHOLD and not t["day12_sent"]:
