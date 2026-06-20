@@ -254,6 +254,16 @@ def main() -> int:
     ap_members, ap_audit_n = migrate_ap_data()
     rel_n = migrate_sqlite()
 
+    # Safety: if we found NOTHING, the volume probably isn't mounted where we
+    # expect. Do NOT write the sentinel and fail loudly (exit 1) so the chained
+    # `&& python bot.py` halts and the bot does not start on an empty database.
+    if json_n == 0 and ap_members == 0 and rel_n == 0:
+        print("\n!! ABORT: no source data found under PERSIST_ROOT "
+              f"({PERSIST_ROOT}) or the CWD. The volume may not be mounted "
+              "there. Fix the mount / PERSIST_ROOT and redeploy. "
+              "(Sentinel NOT written — migration will retry.)")
+        return 1
+
     # Mark complete so subsequent boots skip the migration.
     db.kv_save(_DONE_KEY, {
         "completed_at": datetime.now(timezone.utc).isoformat(),
