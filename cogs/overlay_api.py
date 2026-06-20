@@ -31,12 +31,13 @@ import hashlib
 import hmac
 import os
 import secrets
-import sqlite3
 import threading
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import httpx
+
+from . import db as _db
 
 import discord
 from discord import app_commands
@@ -248,10 +249,10 @@ def build_api(bot: commands.Bot, db_path: str) -> "FastAPI":
         user_id: int = Depends(get_current_user),
     ):
         _db_execute(db_path,
-            "UPDATE missions SET assigned_to=?, status='in_progress', updated_at=? "
-            "WHERE id=? AND status='open'",
+            "UPDATE missions SET assigned_to=%s, status='in_progress', updated_at=%s "
+            "WHERE id=%s AND status='open'",
             (user_id, _now(), mission_id))
-        row = _db_fetchone(db_path, "SELECT * FROM missions WHERE id=?", (mission_id,))
+        row = _db_fetchone(db_path, "SELECT * FROM missions WHERE id=%s", (mission_id,))
         if row is None:
             raise HTTPException(status_code=404, detail="Mission not found")
         return _row_to_mission(row)
@@ -261,15 +262,15 @@ def build_api(bot: commands.Bot, db_path: str) -> "FastAPI":
         mission_id: int,
         user_id: int = Depends(get_current_user),
     ):
-        row = _db_fetchone(db_path, "SELECT * FROM missions WHERE id=?", (mission_id,))
+        row = _db_fetchone(db_path, "SELECT * FROM missions WHERE id=%s", (mission_id,))
         if row is None:
             raise HTTPException(status_code=404, detail="Mission not found")
         if row["assigned_to"] != user_id:
             raise HTTPException(status_code=403, detail="Not your mission")
         _db_execute(db_path,
-            "UPDATE missions SET status='completed', updated_at=? WHERE id=? AND status='in_progress'",
+            "UPDATE missions SET status='completed', updated_at=%s WHERE id=%s AND status='in_progress'",
             (_now(), mission_id))
-        return _row_to_mission(_db_fetchone(db_path, "SELECT * FROM missions WHERE id=?", (mission_id,)))
+        return _row_to_mission(_db_fetchone(db_path, "SELECT * FROM missions WHERE id=%s", (mission_id,)))
 
     # ------------------------------------------------------------------
     # EVE SSO OAuth2 — /eve/link  /eve/callback  /eve/status  /eve/unlink
@@ -362,9 +363,7 @@ h1{{color:#00b4d4}}p{{color:#8a99aa}}</style></head>
 
     @app.get("/overlay/api/v1/eve/unlink")
     async def eve_unlink(user_id: int = Depends(get_current_user)):
-        _ensure_eve_tokens_table(db_path)
-        with _db_connect(db_path) as conn:
-            conn.execute("DELETE FROM eve_tokens WHERE discord_user_id=?", (user_id,))
+        _db.execute("DELETE FROM eve_tokens WHERE discord_user_id=%s", (user_id,))
         return {"ok": True}
 
     # ------------------------------------------------------------------
@@ -691,51 +690,34 @@ async def _post_intel_to_discord(bot: commands.Bot, report: dict):
 # DB helpers (read from the same SQLite file as MissionCog)
 # ---------------------------------------------------------------------------
 
-def _db_connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _ensure_eve_tokens_table(db_path: str = None):
+    """No-op: the eve_tokens table is created centrally by db.init_db().
+    Kept so existing call sites stay valid."""
+    return
 
-def _ensure_eve_tokens_table(db_path: str):
-    """Create eve_tokens table if it doesn't exist (migration-safe)."""
-    with _db_connect(db_path) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS eve_tokens(
-                discord_user_id INTEGER PRIMARY KEY,
-                character_id    INTEGER NOT NULL,
-                character_name  TEXT    NOT NULL,
-                access_token    TEXT    NOT NULL,
-                refresh_token   TEXT    NOT NULL,
-                expires_at      REAL    NOT NULL
-            )
-        """)
-
-def _save_eve_token(db_path: str, discord_user_id: int, character_id: int,
+def _save_eve_token(db_path, discord_user_id: int, character_id: int,
                     character_name: str, access_token: str,
                     refresh_token: str, expires_in: int):
-    _ensure_eve_tokens_table(db_path)
     import time as _time
-    with _db_connect(db_path) as conn:
-        conn.execute("""
-            INSERT INTO eve_tokens
-                (discord_user_id, character_id, character_name,
-                 access_token, refresh_token, expires_at)
-            VALUES (?,?,?,?,?,?)
-            ON CONFLICT(discord_user_id) DO UPDATE SET
-                character_id=excluded.character_id,
-                character_name=excluded.character_name,
-                access_token=excluded.access_token,
-                refresh_token=excluded.refresh_token,
-                expires_at=excluded.expires_at
-        """, (discord_user_id, character_id, character_name,
-                access_token, refresh_token, _time.time() + expires_in))
+    _db.execute("""
+        INSERT INTO eve_tokens
+            (discord_user_id, character_id, character_name,
+             access_token, refresh_token, expires_at)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        ON DUPLICATE KEY UPDATE
+            character_id=VALUES(character_id),
+            character_name=VALUES(character_name),
+            access_token=VALUES(access_token),
+            refresh_token=VALUES(refresh_token),
+            expires_at=VALUES(expires_at)
+    """, (discord_user_id, character_id, character_name,
+            access_token, refresh_token, _time.time() + expires_in))
 
-def _get_eve_token(db_path: str, discord_user_id: int) -> Optional[sqlite3.Row]:
-    _ensure_eve_tokens_table(db_path)
-    return _db_fetchone(db_path,
-        "SELECT * FROM eve_tokens WHERE discord_user_id=?", (discord_user_id,))
+def _get_eve_token(db_path, discord_user_id: int) -> Optional[dict]:
+    return _db.fetchone(
+        "SELECT * FROM eve_tokens WHERE discord_user_id=%s", (discord_user_id,))
 
-async def _refresh_eve_token(db_path: str, row: sqlite3.Row) -> Optional[str]:
+async def _refresh_eve_token(db_path, row: dict) -> Optional[str]:
     """Refresh an expired EVE access token. Returns new access_token or None on failure."""
     try:
         import base64
@@ -769,29 +751,27 @@ async def _get_valid_access_token(db_path: str, discord_user_id: int) -> Optiona
         return await _refresh_eve_token(db_path, row)
     return row["access_token"]
 
-def _db_fetchone(db_path: str, sql: str, params=()) -> Optional[sqlite3.Row]:
-    with _db_connect(db_path) as conn:
-        return conn.execute(sql, params).fetchone()
+def _db_fetchone(db_path, sql: str, params=()) -> Optional[dict]:
+    return _db.fetchone(sql, params)
 
-def _db_execute(db_path: str, sql: str, params=()):
-    with _db_connect(db_path) as conn:
-        conn.execute(sql, params)
+def _db_execute(db_path, sql: str, params=()):
+    _db.execute(sql, params)
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def _fetch_missions(db_path: str, guild: Optional[discord.Guild], status: Optional[str]) -> list[MissionOut]:
+def _fetch_missions(db_path, guild: Optional[discord.Guild], status: Optional[str]) -> list[MissionOut]:
     if status:
-        rows = _db_connect(db_path).execute(
-            "SELECT * FROM missions WHERE status=? ORDER BY id DESC", (status,)
-        ).fetchall()
+        rows = _db.fetchall(
+            "SELECT * FROM missions WHERE status=%s ORDER BY id DESC", (status,)
+        )
     else:
-        rows = _db_connect(db_path).execute(
+        rows = _db.fetchall(
             "SELECT * FROM missions WHERE status != 'cancelled' ORDER BY id DESC"
-        ).fetchall()
+        )
     return [_row_to_mission(r) for r in rows]
 
-def _row_to_mission(row: sqlite3.Row) -> MissionOut:
+def _row_to_mission(row: dict) -> MissionOut:
     return MissionOut(
         id=row["id"],
         title=row["title"],

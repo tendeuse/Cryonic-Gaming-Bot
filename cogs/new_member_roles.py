@@ -15,6 +15,8 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+
+from . import db
 import asyncio
 import json
 import time
@@ -56,17 +58,12 @@ ROLE_OP_THROTTLE_SECONDS = 0.35
 # ----------------- Persistence -----------------
 
 def ensure_data():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "w") as f:
-            json.dump({"pending": {}, "rewarded": []}, f, indent=2)
+    # Storage now lives in MySQL kv_store; nothing to pre-create.
+    return
 
 
 def load_data():
-    ensure_data()
-    with open(DATA_FILE, "r") as f:
-        data = json.load(f)
-
+    data = db.kv_load("member_roles", {"pending": {}, "rewarded": []})
     if "pending" not in data or not isinstance(data["pending"], dict):
         data["pending"] = {}
     if "rewarded" not in data or not isinstance(data["rewarded"], list):
@@ -75,8 +72,7 @@ def load_data():
 
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    db.kv_save("member_roles", data)
 
 
 # ----------------- Robust Discord HTTP retry -----------------

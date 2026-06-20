@@ -47,6 +47,8 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
+from . import db
+
 # ============================================================
 # PATHS
 # ============================================================
@@ -105,31 +107,20 @@ def _get_lock() -> asyncio.Lock:
     return _lock
 
 
+def _key(path: str) -> str:
+    # Old filename stem becomes the MySQL kv_store key ("events"/"ap_boosts").
+    return os.path.splitext(os.path.basename(path))[0]
+
+
 def _atomic_write(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    db.kv_save(_key(path), data)
 
 
 async def load_events() -> Dict[str, Any]:
     async with _get_lock():
-        if not os.path.exists(DATA_PATH):
-            return {}
         try:
-            with open(DATA_PATH, "r", encoding="utf-8") as f:
-                txt = f.read().strip()
-            if not txt:
-                return {}
-            data = json.loads(txt)
+            data = db.kv_load(_key(DATA_PATH), {})
             return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            try:
-                os.replace(DATA_PATH, DATA_PATH + ".bak")
-            except Exception:
-                pass
-            return {}
         except Exception:
             return {}
 
@@ -149,13 +140,8 @@ async def save_event(event_id: str, event: Dict[str, Any]) -> None:
     """
     async with _get_lock():
         try:
-            if os.path.exists(DATA_PATH):
-                with open(DATA_PATH, "r", encoding="utf-8") as f:
-                    txt = f.read().strip()
-                data: Dict[str, Any] = json.loads(txt) if txt else {}
-                if not isinstance(data, dict):
-                    data = {}
-            else:
+            data: Dict[str, Any] = db.kv_load(_key(DATA_PATH), {})
+            if not isinstance(data, dict):
                 data = {}
         except Exception:
             data = {}
@@ -165,14 +151,8 @@ async def save_event(event_id: str, event: Dict[str, Any]) -> None:
 
 async def load_boosts() -> Dict[str, Any]:
     async with _get_lock():
-        if not os.path.exists(BOOSTS_PATH):
-            return {"participants": {}}
         try:
-            with open(BOOSTS_PATH, "r", encoding="utf-8") as f:
-                txt = f.read().strip()
-            if not txt:
-                return {"participants": {}}
-            data = json.loads(txt)
+            data = db.kv_load(_key(BOOSTS_PATH), {"participants": {}})
             if not isinstance(data, dict):
                 return {"participants": {}}
             data.setdefault("participants", {})

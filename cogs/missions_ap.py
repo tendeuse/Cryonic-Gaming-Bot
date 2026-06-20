@@ -19,60 +19,37 @@
 #       recorded_at   TEXT NOT NULL
 #   );
 
+import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-import sqlite3
-import os
 from datetime import datetime, timezone
 
-DB_PATH = os.environ.get("MISSION_DB_PATH", "/data/missions.db")
+from . import db
 
-def get_db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS ap_ledger (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            discord_id     TEXT NOT NULL,
-            character_name TEXT NOT NULL,
-            mission_name   TEXT NOT NULL,
-            faction        TEXT NOT NULL DEFAULT '',
-            level          INTEGER NOT NULL DEFAULT 4,
-            standing_gain  REAL NOT NULL DEFAULT 0,
-            ap             INTEGER NOT NULL DEFAULT 50,
-            recorded_at    TEXT NOT NULL
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS char_discord_map (
-            character_name TEXT PRIMARY KEY,
-            discord_id     TEXT NOT NULL
-        )
-    """)
-    con.commit()
-    return con
+# Tables (ap_ledger, char_discord_map) live in MySQL and are created by
+# db.init_db() at startup — see cogs/db.py.
 
-def get_discord_id_for_char(con: sqlite3.Connection, character_name: str) -> str | None:
-    row = con.execute(
-        "SELECT discord_id FROM char_discord_map WHERE character_name=?",
+def get_discord_id_for_char(character_name: str) -> str | None:
+    row = db.fetchone(
+        "SELECT discord_id FROM char_discord_map WHERE character_name=%s",
         (character_name,)
-    ).fetchone()
+    )
     return row["discord_id"] if row else None
 
-def get_total_ap(con: sqlite3.Connection, discord_id: str) -> int:
-    row = con.execute(
-        "SELECT COALESCE(SUM(ap),0) as total FROM ap_ledger WHERE discord_id=?",
+def get_total_ap(discord_id: str) -> int:
+    row = db.fetchone(
+        "SELECT COALESCE(SUM(ap),0) as total FROM ap_ledger WHERE discord_id=%s",
         (discord_id,)
-    ).fetchone()
-    return row["total"] if row else 0
+    )
+    return int(row["total"]) if row and row["total"] is not None else 0
 
-def get_mission_count(con: sqlite3.Connection, discord_id: str) -> int:
-    row = con.execute(
-        "SELECT COUNT(*) as cnt FROM ap_ledger WHERE discord_id=?",
+def get_mission_count(discord_id: str) -> int:
+    row = db.fetchone(
+        "SELECT COUNT(*) as cnt FROM ap_ledger WHERE discord_id=%s",
         (discord_id,)
-    ).fetchone()
-    return row["cnt"] if row else 0
+    )
+    return int(row["cnt"]) if row else 0
 
 
 class MissionsAP(commands.Cog):
@@ -83,16 +60,16 @@ class MissionsAP(commands.Cog):
     @app_commands.command(name="ap", description="Show your Activity Points balance from EVE missions")
     async def ap(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        with get_db() as con:
-            discord_id  = str(interaction.user.id)
-            total       = get_total_ap(con, discord_id)
-            count       = get_mission_count(con, discord_id)
-            # Recent missions
-            recent = con.execute(
-                "SELECT mission_name, faction, ap, recorded_at FROM ap_ledger "
-                "WHERE discord_id=? ORDER BY recorded_at DESC LIMIT 5",
-                (discord_id,)
-            ).fetchall()
+        discord_id  = str(interaction.user.id)
+        total       = await asyncio.to_thread(get_total_ap, discord_id)
+        count       = await asyncio.to_thread(get_mission_count, discord_id)
+        # Recent missions
+        recent = await asyncio.to_thread(
+            db.fetchall,
+            "SELECT mission_name, faction, ap, recorded_at FROM ap_ledger "
+            "WHERE discord_id=%s ORDER BY recorded_at DESC LIMIT 5",
+            (discord_id,),
+        )
 
         embed = discord.Embed(
             title="⚡ Activity Points — Mission Tracker",
@@ -121,15 +98,17 @@ class MissionsAP(commands.Cog):
     @app_commands.command(name="ap_leaderboard", description="Top pilots by Activity Points this month")
     async def ap_leaderboard(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        with get_db() as con:
-            rows = con.execute("""
-                SELECT discord_id, character_name,
+        rows = await asyncio.to_thread(
+            db.fetchall,
+            """
+                SELECT discord_id, MAX(character_name) as character_name,
                        SUM(ap) as total_ap, COUNT(*) as missions
                 FROM ap_ledger
                 GROUP BY discord_id
                 ORDER BY total_ap DESC
                 LIMIT 10
-            """).fetchall()
+            """,
+        )
 
         embed = discord.Embed(
             title="🏆 Mission AP Leaderboard",
@@ -161,13 +140,12 @@ class MissionsAP(commands.Cog):
     @app_commands.describe(character_name="Your exact EVE character name")
     async def link_character(self, interaction: discord.Interaction, character_name: str):
         await interaction.response.defer(ephemeral=True)
-        with get_db() as con:
-            con.execute(
-                "INSERT INTO char_discord_map(character_name, discord_id) VALUES(?,?) "
-                "ON CONFLICT(character_name) DO UPDATE SET discord_id=excluded.discord_id",
-                (character_name, str(interaction.user.id))
-            )
-            con.commit()
+        await asyncio.to_thread(
+            db.execute,
+            "INSERT INTO char_discord_map(character_name, discord_id) VALUES(%s,%s) "
+            "ON DUPLICATE KEY UPDATE discord_id=VALUES(discord_id)",
+            (character_name, str(interaction.user.id)),
+        )
         await interaction.followup.send(
             f"✅ **{character_name}** linked to your Discord account.\n"
             "AP from this character's missions will now appear in `/ap`.",
@@ -178,15 +156,13 @@ class MissionsAP(commands.Cog):
     @staticmethod
     def record_mission(character_name: str, mission_name: str, faction: str,
                        level: int, standing_gain: float, ap: int):
-        with get_db() as con:
-            discord_id = get_discord_id_for_char(con, character_name) or "unknown"
-            con.execute(
-                "INSERT INTO ap_ledger(discord_id, character_name, mission_name, "
-                "faction, level, standing_gain, ap, recorded_at) VALUES(?,?,?,?,?,?,?,?)",
-                (discord_id, character_name, mission_name, faction, level,
-                 standing_gain, ap, datetime.now(timezone.utc).isoformat())
-            )
-            con.commit()
+        discord_id = get_discord_id_for_char(character_name) or "unknown"
+        db.execute(
+            "INSERT INTO ap_ledger(discord_id, character_name, mission_name, "
+            "faction, level, standing_gain, ap, recorded_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+            (discord_id, character_name, mission_name, faction, level,
+             standing_gain, ap, datetime.now(timezone.utc).isoformat())
+        )
         return discord_id
 
 

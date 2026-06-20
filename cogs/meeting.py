@@ -50,6 +50,8 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
+from . import db
+
 
 # ============================================================
 # CONFIG
@@ -118,23 +120,14 @@ def _get_lock() -> asyncio.Lock:
 
 
 def _atomic_write(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    # Stored in MySQL kv_store keyed by the old filename stem ("meetings").
+    db.kv_save(os.path.splitext(os.path.basename(path))[0], data)
 
 
 async def _load_meetings() -> Dict[str, Any]:
     async with _get_lock():
-        if not os.path.exists(MEETINGS_PATH):
-            return {}
         try:
-            with open(MEETINGS_PATH, "r", encoding="utf-8") as f:
-                txt = f.read().strip()
-            if not txt:
-                return {}
-            data = json.loads(txt)
+            data = db.kv_load("meetings", {})
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}

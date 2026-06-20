@@ -29,6 +29,8 @@ import os
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+
+from . import db
 from pathlib import Path
 import aiohttp
 import asyncio
@@ -112,18 +114,16 @@ def utcnow_iso() -> str:
     return utcnow().isoformat()
 
 def load_json(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
+    # Stored in MySQL kv_store keyed by the old filename stem
+    # ("killmail_feed" / "killmail_feed_hs").
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        d = db.kv_load(path.stem, {})
+        return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 def save_json(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
-    tmp.replace(path)
+    db.kv_save(path.stem, data)
 
 def safe_int(x) -> Optional[int]:
     try:

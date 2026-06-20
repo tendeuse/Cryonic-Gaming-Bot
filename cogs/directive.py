@@ -32,6 +32,8 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
+from . import db
+
 # =====================
 # CHANNELS
 # =====================
@@ -110,10 +112,8 @@ _file_lock = asyncio.Lock()
 
 
 def _atomic_write(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
-    tmp.replace(path)
+    # Stored in MySQL kv_store under the old filename stem ("directives").
+    db.kv_save(path.stem, data)
 
 
 def _empty_data() -> Dict[str, Any]:
@@ -122,14 +122,9 @@ def _empty_data() -> Dict[str, Any]:
 
 async def load_data() -> Dict[str, Any]:
     async with _file_lock:
-        if not DATA_FILE.exists():
-            return _empty_data()
         try:
-            txt = DATA_FILE.read_text(encoding="utf-8").strip()
-            if not txt:
-                return _empty_data()
-            data = json.loads(txt)
-            if not isinstance(data, dict):
+            data = db.kv_load("directives", None)
+            if not isinstance(data, dict) or not data:
                 return _empty_data()
             data.setdefault("cycle", {"start": utcnow_iso(), "officers": {}})
             data.setdefault("panels", {})

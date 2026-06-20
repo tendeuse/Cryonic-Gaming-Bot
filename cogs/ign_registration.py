@@ -9,6 +9,8 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+
+from . import db
 from discord.ui import View, Button, Modal, TextInput
 
 # =====================
@@ -60,7 +62,8 @@ def panel_signature() -> str:
     return f"{PANEL_EMBED_TEXT}|{PANEL_BUTTON_LABEL}|v1"
 
 def load_state() -> Dict[str, Any]:
-    if not DATA_FILE.exists():
+    s = db.kv_load("ign_registry", None)
+    if not isinstance(s, dict):
         return {
             "users": {},
             "requests": {},
@@ -75,32 +78,17 @@ def load_state() -> Dict[str, Any]:
             "char_index": {},
             "corp_watch": {},
         }
-    try:
-        s = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        s.setdefault("users", {})
-        s.setdefault("requests", {})
-        s.setdefault("leave_warnings", {})
-        s.setdefault("panels", {})
-        s.setdefault("esi", {"refresh_token": None, "access_token": None, "access_expires_utc": None})
-        s.setdefault("char_index", {})
-        s.setdefault("corp_watch", {})
-        return s
-    except Exception:
-        return {
-            "users": {},
-            "requests": {},
-            "leave_warnings": {},
-            "panels": {},
-            "esi": {"refresh_token": None, "access_token": None, "access_expires_utc": None},
-            "char_index": {},
-            "corp_watch": {},
-        }
+    s.setdefault("users", {})
+    s.setdefault("requests", {})
+    s.setdefault("leave_warnings", {})
+    s.setdefault("panels", {})
+    s.setdefault("esi", {"refresh_token": None, "access_token": None, "access_expires_utc": None})
+    s.setdefault("char_index", {})
+    s.setdefault("corp_watch", {})
+    return s
 
 def save_state(state: Dict[str, Any]) -> None:
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = DATA_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=4), encoding="utf-8")
-    tmp.replace(DATA_FILE)
+    db.kv_save("ign_registry", state)
 
 def normalize_ign(s: str) -> str:
     return " ".join((s or "").strip().split())

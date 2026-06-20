@@ -12,6 +12,8 @@ import random
 from dataclasses import dataclass
 from typing import List, Dict
 import datetime
+
+from . import db
 import json
 from pathlib import Path
 
@@ -47,16 +49,15 @@ def utc_day_key() -> str:
 
 
 def load_attempts() -> Dict[str, Dict[str, int]]:
-    if not ATTEMPTS_FILE.exists():
-        return {}
     try:
-        return json.loads(ATTEMPTS_FILE.read_text(encoding="utf-8"))
+        d = db.kv_load(ATTEMPTS_FILE.stem, {})
+        return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 
 def save_attempts(data: Dict[str, Dict[str, int]]) -> None:
-    ATTEMPTS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    db.kv_save(ATTEMPTS_FILE.stem, data)
 
 
 def message_has_start_button(msg: discord.Message) -> bool:

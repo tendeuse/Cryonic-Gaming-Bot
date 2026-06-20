@@ -20,7 +20,6 @@
 import asyncio
 import json
 import os
-import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +28,8 @@ from typing import Any, Dict, List, Optional
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+
+from . import db as dbm
 
 # ============================================================
 # CONFIG
@@ -82,21 +83,6 @@ def fmt_duration(seconds: int) -> str:
     m, s = divmod(r, 60)
     return f"{h}h {m:02d}m {s:02d}s"
 
-def atomic_write(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
-
-def safe_load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, type(default)) else default
-    except Exception:
-        return default
-
 def has_role(member: discord.Member, name: str) -> bool:
     return any(r.name == name for r in member.roles)
 
@@ -110,32 +96,19 @@ def can_approve(member: discord.Member) -> bool:
 # SQLITE  (invite database)
 # ============================================================
 
-def _db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_FILE)
-    con.row_factory = sqlite3.Row
-    return con
-
 def init_db() -> None:
-    with _db() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS invites (
-                ign         TEXT PRIMARY KEY COLLATE NOCASE,
-                invited_by  TEXT NOT NULL,
-                invited_at  TEXT NOT NULL
-            )
-        """)
+    # The invites table is created centrally by db.init_db() at startup.
+    # Kept as a no-op so existing call sites still work.
+    return
 
 def _check_ign_sync(ign: str) -> Optional[dict]:
-    with _db() as con:
-        row = con.execute("SELECT * FROM invites WHERE ign = ?", (ign.strip(),)).fetchone()
-        return dict(row) if row else None
+    return dbm.fetchone("SELECT * FROM invites WHERE ign = %s", (ign.strip(),))
 
 def _add_invite_sync(ign: str, invited_by: str) -> None:
-    with _db() as con:
-        con.execute(
-            "INSERT OR REPLACE INTO invites (ign, invited_by, invited_at) VALUES (?,?,?)",
-            (ign.strip(), invited_by, utcnow_iso()),
-        )
+    dbm.execute(
+        "REPLACE INTO invites (ign, invited_by, invited_at) VALUES (%s,%s,%s)",
+        (ign.strip(), invited_by, utcnow_iso()),
+    )
 
 async def check_ign(ign: str) -> Optional[dict]:
     return await asyncio.to_thread(_check_ign_sync, ign)
@@ -412,7 +385,7 @@ class SchedulingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot     = bot
         self._lock   = asyncio.Lock()
-        self._state: dict = safe_load_json(STATE_FILE, {"guilds": {}})
+        self._state: dict = dbm.kv_load("scheduling_state", {"guilds": {}})
         self._state.setdefault("guilds", {})
         init_db()
 
@@ -433,7 +406,7 @@ class SchedulingCog(commands.Cog):
     async def cog_unload(self):
         self._overtime_check.cancel()
         async with self._lock:
-            atomic_write(STATE_FILE, self._state)
+            dbm.kv_save("scheduling_state", self._state)
 
     # ── State helpers ──────────────────────────────────────────────────────
 
@@ -441,7 +414,7 @@ class SchedulingCog(commands.Cog):
         return ensure_guild(self._state, guild_id)
 
     def _save(self):
-        atomic_write(STATE_FILE, self._state)
+        dbm.kv_save("scheduling_state", self._state)
 
     # ── Full guild setup ───────────────────────────────────────────────────
 

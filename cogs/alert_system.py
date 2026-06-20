@@ -16,6 +16,8 @@ import asyncio
 from typing import Dict, Any, Optional, List, Tuple, Set
 import io
 
+from . import db
+
 # =====================
 # CONFIG
 # =====================
@@ -121,21 +123,15 @@ def _default_state() -> Dict[str, Any]:
     return {"guilds": {}}
 
 def _safe_read_json(p: Path) -> Dict[str, Any]:
+    # Stored in MySQL kv_store under the old filename stem (e.g. "alert_system").
     try:
-        if not p.exists():
-            return {}
-        txt = p.read_text(encoding="utf-8").strip()
-        if not txt:
-            return {}
-        return json.loads(txt)
+        d = db.kv_load(p.stem, {})
+        return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 def _atomic_write_json(p: Path, d: Dict[str, Any]) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(d, indent=4), encoding="utf-8")
-    tmp.replace(p)
+    db.kv_save(p.stem, d)
 
 async def load_state() -> Dict[str, Any]:
     async with _file_lock:

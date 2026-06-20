@@ -50,6 +50,8 @@ from pathlib import Path
 from discord.ext import commands
 from discord import app_commands
 
+from . import db
+
 # ----------------------------
 # Persistence root (Railway)
 # ----------------------------
@@ -140,22 +142,16 @@ async def safe_send_modal(interaction: discord.Interaction, modal: discord.ui.Mo
 # JSON helpers (ATOMIC WRITES)
 # ----------------------------
 def _load_json(path: Path, default):
+    # Stored in MySQL kv_store keyed by the old filename stem.
     try:
-        if not path.exists():
-            return default
-        raw = path.read_text(encoding="utf-8").strip()
-        if not raw:
-            return default
-        return json.loads(raw)
+        d = db.kv_load(path.stem, None)
+        return d if d is not None else default
     except Exception:
         return default
 
 
 def _save_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
-    tmp.replace(path)
+    db.kv_save(path.stem, data)
 
 
 def ensure_shop_schema(data: dict) -> dict:

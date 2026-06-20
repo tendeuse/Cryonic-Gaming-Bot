@@ -4,6 +4,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from . import db
+
 
 # ──────────────────────────────────────────────
 # Constants
@@ -23,32 +25,27 @@ sent_embeds: dict[int, dict] = {}
 
 
 def load_sent_embeds() -> dict[int, dict]:
-    """Read sent_embeds from data.json. Returns an empty dict if missing."""
-    if not os.path.exists(DATA_FILE):
-        return {}
+    """Read sent_embeds from the MySQL kv_store. Returns {} if missing."""
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = db.kv_load("embed_builder", {})
+        if not isinstance(data, dict):
+            return {}
         return {int(k): v for k, v in data.get("sent_embeds", {}).items()}
-    except (json.JSONDecodeError, OSError):
+    except Exception:
         return {}
 
 
 def save_sent_embeds() -> None:
-    """Write sent_embeds back into data.json, preserving all other keys."""
+    """Write sent_embeds back into the kv_store, preserving other keys."""
     try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        else:
+        data = db.kv_load("embed_builder", {})
+        if not isinstance(data, dict):
             data = {}
-    except (json.JSONDecodeError, OSError):
+    except Exception:
         data = {}
 
     data["sent_embeds"] = {str(k): v for k, v in sent_embeds.items()}
-
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+    db.kv_save("embed_builder", data)
 
 
 # ──────────────────────────────────────────────

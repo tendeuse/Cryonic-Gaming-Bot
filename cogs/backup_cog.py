@@ -1,19 +1,19 @@
 # cogs/backup_cog.py
 
-import discord
-import os
-import zipfile
-import io
 import asyncio
+import io
+import json
+
+import discord
 from discord.ext import commands
 from discord import app_commands
-from pathlib import Path
+
+from . import db
 
 # --- CONFIGURATION ---
 # Your unique ID for strict ownership
-OWNER_ID = 306935804054208523 
-# Path to your Railway Volume
-PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
+OWNER_ID = 306935804054208523
+
 
 class BackupCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -21,7 +21,7 @@ class BackupCog(commands.Cog):
 
     @app_commands.command(
         name="export_volume",
-        description="[OWNER ONLY] Zips and downloads all files from the persistent volume."
+        description="[OWNER ONLY] Dumps the entire MySQL database (kv_store + tables) as a JSON backup."
     )
     async def export_volume(self, interaction: discord.Interaction):
         # 1. STRICT OWNER CHECK
@@ -32,40 +32,21 @@ class BackupCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            # 2. VERIFY DIRECTORY
-            if not PERSIST_ROOT.exists():
-                await interaction.followup.send(f"❌ Error: Volume path `{PERSIST_ROOT}` does not exist.")
-                return
+            # 2. DUMP MYSQL (off the event loop)
+            dump = await asyncio.to_thread(db.export_all)
+            payload = json.dumps(dump, indent=2, default=str, ensure_ascii=False).encode("utf-8")
 
-            # 3. ZIP FILES IN MEMORY
-            zip_buffer = io.BytesIO()
-            files_found = 0
-            
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for root, dirs, files in os.walk(PERSIST_ROOT):
-                    for file in files:
-                        # Skip hidden system files if necessary
-                        if file.startswith('.'):
-                            continue
-                            
-                        file_path = Path(root) / file
-                        # Create a clean internal path for the zip
-                        arcname = file_path.relative_to(PERSIST_ROOT)
-                        zip_file.write(file_path, arcname=arcname)
-                        files_found += 1
-                
-            if files_found == 0:
-                await interaction.followup.send("⚠️ Volume is empty. Nothing to backup.")
-                return
+            kv_count    = len(dump.get("kv_store", {}))
+            table_count = sum(len(v) for v in dump.get("tables", {}).values())
 
-            # 4. UPLOAD TO DISCORD
-            zip_buffer.seek(0)
-            file = discord.File(fp=zip_buffer, filename="railway_volume_backup.zip")
-
+            # 3. UPLOAD TO DISCORD
+            file = discord.File(fp=io.BytesIO(payload), filename="mysql_backup.json")
             await interaction.followup.send(
-                f"✅ **Backup Complete!**\nFound `{files_found}` files. Downloading...", 
-                file=file, 
-                ephemeral=True
+                f"✅ **Backup Complete!**\n"
+                f"Documents: `{kv_count}` kv keys · Rows: `{table_count}` across "
+                f"`{len(dump.get('tables', {}))}` tables.",
+                file=file,
+                ephemeral=True,
             )
 
         except Exception as e:
@@ -74,7 +55,7 @@ class BackupCog(commands.Cog):
 
     @app_commands.command(
         name="list_volume",
-        description="[OWNER ONLY] Lists all files currently in the persistent volume."
+        description="[OWNER ONLY] Lists kv_store keys and table row counts in MySQL."
     )
     async def list_volume(self, interaction: discord.Interaction):
         # 1. STRICT OWNER CHECK
@@ -85,22 +66,23 @@ class BackupCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            files_list = []
-            for root, dirs, files in os.walk(PERSIST_ROOT):
-                for file in files:
-                    if not file.startswith('.'):
-                        rel_path = Path(root).relative_to(PERSIST_ROOT) / file
-                        files_list.append(str(rel_path))
+            summary = await asyncio.to_thread(db.list_summary)
 
-            if not files_list:
-                await interaction.followup.send("The volume is empty.")
-            else:
-                # Format as a code block for readability
-                msg = "**Files in Volume:**\n```\n" + "\n".join(files_list) + "\n```"
-                await interaction.followup.send(msg, ephemeral=True)
+            kv_lines    = "\n".join(summary["kv_keys"]) or "(none)"
+            table_lines = "\n".join(f"{t}: {n}" for t, n in summary["table_counts"].items())
+
+            msg = (
+                "**MySQL kv_store keys:**\n```\n" + kv_lines + "\n```\n"
+                "**Table row counts:**\n```\n" + table_lines + "\n```"
+            )
+            # Discord 2000-char cap safety
+            if len(msg) > 1900:
+                msg = msg[:1900] + "\n…(truncated)```"
+            await interaction.followup.send(msg, ephemeral=True)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(BackupCog(bot))

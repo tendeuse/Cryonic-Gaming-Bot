@@ -307,23 +307,14 @@ def _get_file_lock() -> asyncio.Lock:
 
 
 def _atomic_write(data: Dict[str, Any]) -> None:
-    PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
-    tmp = DATA_FILE.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, default=str)
-    tmp.replace(DATA_FILE)
+    # default=str preserved the original JSON coercion of non-serialisable values.
+    _db.kv_save("arc_seat", json.loads(json.dumps(data, default=str)))
 
 
 async def load_seat_data() -> Dict[str, Any]:
     async with _get_file_lock():
-        if not DATA_FILE.exists():
-            return _default_data()
         try:
-            with open(DATA_FILE, encoding="utf-8") as f:
-                raw = f.read().strip()
-            if not raw:
-                return _default_data()
-            data = json.loads(raw)
+            data = _db.kv_load("arc_seat", None)
             if not isinstance(data, dict):
                 return _default_data()
             # Back-fill any missing top-level keys
@@ -348,33 +339,13 @@ async def save_seat_data(data: Dict[str, Any]) -> None:
 # composite primary key so each Discord user can have unlimited
 # EVE characters.
 
-import sqlite3 as _sqlite3
-
-
-def _seat_db_connect() -> _sqlite3.Connection:
-    PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
-    conn = _sqlite3.connect(SEAT_DB_PATH)
-    conn.row_factory = _sqlite3.Row
-    return conn
+from . import db as _db
 
 
 def _seat_db_ensure() -> None:
-    """Create the seat_tokens table if it doesn't exist (migration-safe)."""
-    try:
-        with _seat_db_connect() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS seat_tokens (
-                    discord_user_id INTEGER NOT NULL,
-                    character_id    INTEGER NOT NULL,
-                    character_name  TEXT    NOT NULL,
-                    access_token    TEXT    NOT NULL,
-                    refresh_token   TEXT    NOT NULL,
-                    expires_at      REAL    NOT NULL,
-                    PRIMARY KEY (discord_user_id, character_id)
-                )
-            """)
-    except Exception as e:
-        print(f"[ARC-SEAT] DB init error: {e}")
+    """No-op: the seat_tokens table is created centrally by db.init_db().
+    Kept so existing call sites stay valid."""
+    return
 
 
 def _seat_get_token(
@@ -383,14 +354,11 @@ def _seat_get_token(
 ) -> Optional[Dict[str, Any]]:
     """Read a specific character's token row. Returns dict or None."""
     try:
-        _seat_db_ensure()
-        with _seat_db_connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM seat_tokens "
-                "WHERE discord_user_id=? AND character_id=?",
-                (discord_user_id, character_id),
-            ).fetchone()
-            return dict(row) if row else None
+        return _db.fetchone(
+            "SELECT * FROM seat_tokens "
+            "WHERE discord_user_id=%s AND character_id=%s",
+            (discord_user_id, character_id),
+        )
     except Exception as e:
         print(f"[ARC-SEAT] Token read error: {e}")
         return None
@@ -399,13 +367,10 @@ def _seat_get_token(
 def _seat_get_all_tokens(discord_user_id: int) -> List[Dict[str, Any]]:
     """Return all token rows for a Discord user."""
     try:
-        _seat_db_ensure()
-        with _seat_db_connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM seat_tokens WHERE discord_user_id=?",
-                (discord_user_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+        return _db.fetchall(
+            "SELECT * FROM seat_tokens WHERE discord_user_id=%s",
+            (discord_user_id,),
+        )
     except Exception as e:
         print(f"[ARC-SEAT] Token read-all error: {e}")
         return []
@@ -414,10 +379,7 @@ def _seat_get_all_tokens(discord_user_id: int) -> List[Dict[str, Any]]:
 def _seat_get_all_tokens_global() -> List[Dict[str, Any]]:
     """Return every token row in the DB (used by refresh loop)."""
     try:
-        _seat_db_ensure()
-        with _seat_db_connect() as conn:
-            rows = conn.execute("SELECT * FROM seat_tokens").fetchall()
-            return [dict(r) for r in rows]
+        return _db.fetchall("SELECT * FROM seat_tokens")
     except Exception as e:
         print(f"[ARC-SEAT] Token read-global error: {e}")
         return []
@@ -433,23 +395,21 @@ def _seat_save_token(
 ) -> None:
     """Upsert a character token into seat_tokens."""
     try:
-        _seat_db_ensure()
-        with _seat_db_connect() as conn:
-            conn.execute("""
-                INSERT INTO seat_tokens
-                    (discord_user_id, character_id, character_name,
-                     access_token, refresh_token, expires_at)
-                VALUES (?,?,?,?,?,?)
-                ON CONFLICT(discord_user_id, character_id) DO UPDATE SET
-                    character_name=excluded.character_name,
-                    access_token=excluded.access_token,
-                    refresh_token=excluded.refresh_token,
-                    expires_at=excluded.expires_at
-            """, (
-                discord_user_id, character_id, character_name,
-                access_token, refresh_token,
-                time.time() + expires_in,
-            ))
+        _db.execute("""
+            INSERT INTO seat_tokens
+                (discord_user_id, character_id, character_name,
+                 access_token, refresh_token, expires_at)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+                character_name=VALUES(character_name),
+                access_token=VALUES(access_token),
+                refresh_token=VALUES(refresh_token),
+                expires_at=VALUES(expires_at)
+        """, (
+            discord_user_id, character_id, character_name,
+            access_token, refresh_token,
+            time.time() + expires_in,
+        ))
     except Exception as e:
         print(f"[ARC-SEAT] Token save error: {e}")
 
@@ -457,13 +417,11 @@ def _seat_save_token(
 def _seat_delete_token(discord_user_id: int, character_id: int) -> None:
     """Remove a specific character's token."""
     try:
-        _seat_db_ensure()
-        with _seat_db_connect() as conn:
-            conn.execute(
-                "DELETE FROM seat_tokens "
-                "WHERE discord_user_id=? AND character_id=?",
-                (discord_user_id, character_id),
-            )
+        _db.execute(
+            "DELETE FROM seat_tokens "
+            "WHERE discord_user_id=%s AND character_id=%s",
+            (discord_user_id, character_id),
+        )
     except Exception as e:
         print(f"[ARC-SEAT] Token delete error: {e}")
 
@@ -1068,12 +1026,10 @@ def migrate_from_ign_registry() -> Dict[str, Any]:
     Tokens are NOT migrated — members must re-auth via /seat_auth.
     Returns {} if no migration data is found.
     """
-    if not IGN_DATA_FILE.exists():
-        return {}
-
     try:
-        with open(IGN_DATA_FILE, encoding="utf-8") as f:
-            ign_data = json.load(f)
+        ign_data = _db.kv_load("ign_registry", None)
+        if not isinstance(ign_data, dict):
+            return {}
     except Exception as e:
         print(f"[ARC-SEAT] Migration read error: {e}")
         return {}
@@ -1538,10 +1494,9 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             tokens["access_token"], tokens["refresh_token"], expires,
         )
 
-        # ── 2. Update arc_seat.json  (sync atomic write — no asyncio lock) ───
+        # ── 2. Update arc_seat doc  (sync write — no asyncio lock) ───
         try:
-            raw  = DATA_FILE.read_text(encoding="utf-8").strip() if DATA_FILE.exists() else ""
-            data = json.loads(raw) if raw else _default_data()
+            data = _db.kv_load("arc_seat", None)
             if not isinstance(data, dict):
                 data = _default_data()
         except Exception:
@@ -2347,10 +2302,9 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         # Total sig-tagging attempts from JSON (root-level file, no lock needed)
         sig_attempts_total = 0
         sig_attempts_detail: List[str] = []
-        attempts_path = Path("signature_tagging_attempts.json")
         try:
-            if attempts_path.exists():
-                raw = json.loads(attempts_path.read_text(encoding="utf-8"))
+            raw = _db.kv_load("signature_tagging_attempts", {})
+            if isinstance(raw, dict):
                 uid_str = str(discord_member.id)
                 for day, day_data in sorted(raw.items(), reverse=True):
                     if uid_str in day_data:
@@ -2423,14 +2377,12 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         uid     = discord_id
         uid_str = str(uid)
 
-        # Read events.json synchronously — this is an internal read with no writes
+        # Read the shared "events" doc — internal read with no writes
         events_data: Dict[str, Any] = {}
-        events_path = Path("/data/events.json")
         try:
-            if events_path.exists():
-                raw = events_path.read_text(encoding="utf-8").strip()
-                if raw:
-                    events_data = json.loads(raw)
+            loaded = _db.kv_load("events", {})
+            if isinstance(loaded, dict):
+                events_data = loaded
         except Exception:
             pass
 

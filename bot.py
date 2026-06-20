@@ -83,6 +83,19 @@ class MyBot(commands.Bot):
         print("[BOOT] setup_hook() start")
 
         try:
+            # ---- Initialise the MySQL schema BEFORE loading cogs ----
+            # All persisted state lives in Railway MySQL now (not the /data
+            # volume). Create every table up front so no cog races to do it.
+            try:
+                from cogs import db
+                db.init_db()
+                print("[BOOT] MySQL schema initialised.")
+            except Exception as e:
+                print("[BOOT] FATAL: could not initialise MySQL. "
+                      "Check the MYSQL* env vars are linked to this service.")
+                traceback.print_exception(type(e), e, e.__traceback__)
+                raise
+
             # ---- Ensure cogs package exists ----
             cogs_dir = Path("cogs")
             print("[BOOT] CWD:", os.getcwd())

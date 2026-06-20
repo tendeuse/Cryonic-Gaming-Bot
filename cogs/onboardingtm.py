@@ -26,7 +26,6 @@
 
 import asyncio
 import os
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -34,6 +33,8 @@ from typing import List, Optional
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+
+from . import db as dbm
 
 # ============================================================
 # CONFIG
@@ -90,56 +91,33 @@ def can_manage(member: discord.Member) -> bool:
 # SQLITE  (ticket database)
 # ============================================================
 
-def _db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_FILE)
-    con.row_factory = sqlite3.Row
-    return con
-
 def init_db() -> None:
-    with _db() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS tickets (
-                ticket_id  TEXT PRIMARY KEY,
-                name       TEXT NOT NULL DEFAULT '',
-                open_time  TEXT NOT NULL,
-                end_time   TEXT NOT NULL,
-                day8_sent  INTEGER NOT NULL DEFAULT 0,
-                day12_sent INTEGER NOT NULL DEFAULT 0,
-                day15_sent INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        # Forward-compat migration for older DBs without the name column.
-        cols = {r["name"] for r in con.execute("PRAGMA table_info(tickets)").fetchall()}
-        if "name" not in cols:
-            con.execute("ALTER TABLE tickets ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+    # The tickets table is created centrally by db.init_db() at startup.
+    # Kept as a no-op so the cog's existing call still works.
+    return
 
 def _register_ticket_sync(ticket_id: str, name: str, open_time: str, end_time: str) -> bool:
     """Insert a ticket. Returns True if newly inserted, False if it already existed."""
-    with _db() as con:
-        cur = con.execute(
-            "INSERT OR IGNORE INTO tickets (ticket_id, name, open_time, end_time) VALUES (?, ?, ?, ?)",
-            (ticket_id, name, open_time, end_time),
-        )
-        return cur.rowcount > 0
+    _, rowcount = dbm.execute(
+        "INSERT IGNORE INTO tickets (ticket_id, name, open_time, end_time) VALUES (%s, %s, %s, %s)",
+        (ticket_id, name, open_time, end_time),
+    )
+    return rowcount > 0
 
 def _close_ticket_sync(ticket_id: str) -> bool:
     """Returns True if a row was removed."""
-    with _db() as con:
-        cur = con.execute("DELETE FROM tickets WHERE ticket_id = ?", (ticket_id,))
-        return cur.rowcount > 0
+    _, rowcount = dbm.execute("DELETE FROM tickets WHERE ticket_id = %s", (ticket_id,))
+    return rowcount > 0
 
 def _list_tickets_sync() -> List[dict]:
-    with _db() as con:
-        rows = con.execute(
-            "SELECT ticket_id, name, open_time, end_time, day8_sent, day12_sent, day15_sent "
-            "FROM tickets ORDER BY open_time ASC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+    return dbm.fetchall(
+        "SELECT ticket_id, name, open_time, end_time, day8_sent, day12_sent, day15_sent "
+        "FROM tickets ORDER BY open_time ASC"
+    )
 
 def _mark_sent_sync(ticket_id: str, column: str) -> None:
     # column is only ever passed from a fixed allow-list below.
-    with _db() as con:
-        con.execute(f"UPDATE tickets SET {column} = 1 WHERE ticket_id = ?", (ticket_id,))
+    dbm.execute(f"UPDATE tickets SET {column} = 1 WHERE ticket_id = %s", (ticket_id,))
 
 # Async wrappers (keep the event loop unblocked, matching the other cogs).
 

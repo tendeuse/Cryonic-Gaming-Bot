@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional
 
 import discord
 from discord import app_commands
+
+from . import db
 from discord.ext import commands
 
 # ============================================================
@@ -72,23 +74,13 @@ def _get_lock() -> asyncio.Lock:
 
 
 def _atomic_write(data: Dict[str, Any]) -> None:
-    PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
-    tmp = DATA_FILE.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    tmp.replace(DATA_FILE)
+    db.kv_save("corp_transfer_tickets", data)
 
 
 async def _load() -> Dict[str, Any]:
     async with _get_lock():
-        if not DATA_FILE.exists():
-            return {"panels": {}, "tickets": {}}
         try:
-            with open(DATA_FILE, encoding="utf-8") as f:
-                raw = f.read().strip()
-            if not raw:
-                return {"panels": {}, "tickets": {}}
-            data = json.loads(raw)
+            data = db.kv_load("corp_transfer_tickets", {"panels": {}, "tickets": {}})
             data.setdefault("panels", {})
             data.setdefault("tickets", {})
             return data
@@ -926,10 +918,9 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
         # ── Signature tagging attempt history from JSON ───────────────────────
         sig_attempts_total = 0
         sig_attempts_detail: List[str] = []
-        attempts_path = Path("signature_tagging_attempts.json")
         try:
-            if attempts_path.exists():
-                raw = json.loads(attempts_path.read_text(encoding="utf-8"))
+            raw = db.kv_load("signature_tagging_attempts", {})
+            if isinstance(raw, dict):
                 uid_str = str(member.id)
                 for day, day_data in sorted(raw.items(), reverse=True):
                     if uid_str in day_data:
@@ -1005,12 +996,10 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
         uid_str = str(uid)
 
         events_data: Dict[str, Any] = {}
-        events_path = PERSIST_ROOT / "events.json"
         try:
-            if events_path.exists():
-                raw = events_path.read_text(encoding="utf-8").strip()
-                if raw:
-                    events_data = json.loads(raw)
+            loaded = db.kv_load("events", {})
+            if isinstance(loaded, dict):
+                events_data = loaded
         except Exception:
             pass
 

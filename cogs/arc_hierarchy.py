@@ -55,6 +55,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
+from . import db
+
 # =====================
 # PERSISTENCE (Railway Volume)
 # =====================
@@ -155,11 +157,8 @@ def _default_data() -> Dict[str, Any]:
     }
 
 def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    payload = json.dumps(data, indent=2, ensure_ascii=False)
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(p)
+    # Stored in MySQL kv_store under the old filename stem ("arc_hierarchy").
+    db.kv_save(p.stem, data)
 
 def _coerce_dict(v: Any) -> Dict[str, Any]:
     return v if isinstance(v, dict) else {}
@@ -200,15 +199,8 @@ def _migrate_legacy_units_to_corps(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_data() -> Dict[str, Any]:
     try:
-        if not DATA_FILE.exists():
-            return _default_data()
-
-        txt = DATA_FILE.read_text(encoding="utf-8").strip()
-        if not txt:
-            return _default_data()
-
-        data = json.loads(txt)
-        if not isinstance(data, dict):
+        data = db.kv_load("arc_hierarchy", None)
+        if not isinstance(data, dict) or not data:
             return _default_data()
 
         data = _migrate_legacy_units_to_corps(data)

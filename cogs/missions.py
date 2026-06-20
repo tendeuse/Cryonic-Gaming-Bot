@@ -21,22 +21,19 @@ Access control:
   - All members can assign themselves and complete their own missions.
 """
 
-import os
-import sqlite3
 import traceback
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 import discord
 from discord.ext import commands
+
+from . import db as _db
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
-_DB_PATH = Path(os.getenv("MISSION_DB_PATH", "/data/missions.db"))
 
 MISSION_MANAGER_ROLES: set[str] = {
     "ARC Security Administration Council",
@@ -80,105 +77,79 @@ def can_manage_missions(member: discord.Member) -> bool:
 # ---------------------------------------------------------------------------
 
 class MissionDB:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.path = path
-        self._init_schema()
+    """Thin wrapper over the shared MySQL pool (cogs/db.py).
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+    The ``missions`` table is created centrally by ``db.init_db()`` at startup.
+    The optional ``path`` arg is ignored — kept so existing construction
+    (``MissionDB(...)``) still works.
+    """
 
-    def _init_schema(self):
-        with self._connect() as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS missions (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title       TEXT    NOT NULL,
-                    description TEXT    NOT NULL DEFAULT '',
-                    reward      TEXT    NOT NULL DEFAULT '',
-                    status      TEXT    NOT NULL DEFAULT 'open'
-                                CHECK(status IN ('open','in_progress','completed','cancelled')),
-                    created_by  INTEGER NOT NULL,
-                    assigned_to INTEGER,
-                    guild_id    INTEGER NOT NULL,
-                    created_at  TEXT    NOT NULL,
-                    updated_at  TEXT    NOT NULL
-                );
-            """)
+    def __init__(self, path: Any = None):
+        pass
 
     def create_mission(self, title, description, reward, created_by, guild_id) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                "INSERT INTO missions (title,description,reward,created_by,guild_id,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (title, description, reward, created_by, guild_id, now, now),
-            )
-            return cur.lastrowid
+        lastrowid, _ = _db.execute(
+            "INSERT INTO missions (title,description,reward,created_by,guild_id,created_at,updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (title, description, reward, created_by, guild_id, now, now),
+        )
+        return lastrowid
 
-    def get_mission(self, mission_id: int) -> Optional[sqlite3.Row]:
-        with self._connect() as conn:
-            return conn.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+    def get_mission(self, mission_id: int) -> Optional[dict]:
+        return _db.fetchone("SELECT * FROM missions WHERE id=%s", (mission_id,))
 
     def list_missions(self, guild_id: int, status: Optional[str] = None) -> list:
-        with self._connect() as conn:
-            if status:
-                return conn.execute(
-                    "SELECT * FROM missions WHERE guild_id=? AND status=? ORDER BY id DESC",
-                    (guild_id, status),
-                ).fetchall()
-            return conn.execute(
-                "SELECT * FROM missions WHERE guild_id=? AND status!='cancelled' ORDER BY id DESC",
-                (guild_id,),
-            ).fetchall()
+        if status:
+            return _db.fetchall(
+                "SELECT * FROM missions WHERE guild_id=%s AND status=%s ORDER BY id DESC",
+                (guild_id, status),
+            )
+        return _db.fetchall(
+            "SELECT * FROM missions WHERE guild_id=%s AND status!='cancelled' ORDER BY id DESC",
+            (guild_id,),
+        )
 
     def assign_mission(self, mission_id: int, user_id: int) -> bool:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE missions SET assigned_to=?,status='in_progress',updated_at=? "
-                "WHERE id=? AND status='open'",
-                (user_id, now, mission_id),
-            )
-            return cur.rowcount > 0
+        _, rowcount = _db.execute(
+            "UPDATE missions SET assigned_to=%s,status='in_progress',updated_at=%s "
+            "WHERE id=%s AND status='open'",
+            (user_id, now, mission_id),
+        )
+        return rowcount > 0
 
     def complete_mission(self, mission_id: int, user_id: int, force: bool = False) -> bool:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            if force:
-                cur = conn.execute(
-                    "UPDATE missions SET status='completed',updated_at=? "
-                    "WHERE id=? AND status='in_progress'",
-                    (now, mission_id),
-                )
-            else:
-                cur = conn.execute(
-                    "UPDATE missions SET status='completed',updated_at=? "
-                    "WHERE id=? AND assigned_to=? AND status='in_progress'",
-                    (now, mission_id, user_id),
-                )
-            return cur.rowcount > 0
+        if force:
+            _, rowcount = _db.execute(
+                "UPDATE missions SET status='completed',updated_at=%s "
+                "WHERE id=%s AND status='in_progress'",
+                (now, mission_id),
+            )
+        else:
+            _, rowcount = _db.execute(
+                "UPDATE missions SET status='completed',updated_at=%s "
+                "WHERE id=%s AND assigned_to=%s AND status='in_progress'",
+                (now, mission_id, user_id),
+            )
+        return rowcount > 0
 
     def cancel_mission(self, mission_id: int) -> bool:
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE missions SET status='cancelled',updated_at=? "
-                "WHERE id=? AND status NOT IN ('completed','cancelled')",
-                (now, mission_id),
-            )
-            return cur.rowcount > 0
+        _, rowcount = _db.execute(
+            "UPDATE missions SET status='cancelled',updated_at=%s "
+            "WHERE id=%s AND status NOT IN ('completed','cancelled')",
+            (now, mission_id),
+        )
+        return rowcount > 0
 
 
 # ---------------------------------------------------------------------------
 # Embed builder
 # ---------------------------------------------------------------------------
 
-def mission_embed(row: sqlite3.Row, guild: discord.Guild) -> discord.Embed:
+def mission_embed(row: dict, guild: discord.Guild) -> discord.Embed:
     status = row["status"]
     embed  = discord.Embed(
         title=f"{STATUS_EMOJI.get(status,'❓')}  Mission #{row['id']} — {row['title']}",
@@ -461,10 +432,10 @@ class MissionCog(commands.Cog, name="Missions"):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.db  = MissionDB(_DB_PATH)
+        self.db  = MissionDB()
         # Register persistent view so buttons survive restarts
         bot.add_view(MissionControlView())
-        print(f"[MissionCog] DB ready at {_DB_PATH}")
+        print("[MissionCog] DB ready (MySQL).")
 
     # ------------------------------------------------------------------
     # Channel helper — find by exact name, create if missing

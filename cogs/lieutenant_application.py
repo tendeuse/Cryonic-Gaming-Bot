@@ -33,6 +33,8 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
+from . import db
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -107,23 +109,13 @@ def _get_lock() -> asyncio.Lock:
 
 
 def _atomic_write(data: Dict[str, Any]) -> None:
-    PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
-    tmp = DATA_FILE.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    tmp.replace(DATA_FILE)
+    db.kv_save("lieutenant_application", data)
 
 
 async def _load() -> Dict[str, Any]:
     async with _get_lock():
-        if not DATA_FILE.exists():
-            return {"panels": {}, "sessions": {}}
         try:
-            with open(DATA_FILE, encoding="utf-8") as f:
-                raw = f.read().strip()
-            if not raw:
-                return {"panels": {}, "sessions": {}}
-            data = json.loads(raw)
+            data = db.kv_load("lieutenant_application", {"panels": {}, "sessions": {}})
             data.setdefault("panels", {})
             data.setdefault("sessions", {})
             return data

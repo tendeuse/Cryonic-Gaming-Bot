@@ -45,6 +45,8 @@ import io
 import csv
 from discord.ext import commands, tasks
 from discord import app_commands
+
+from . import db
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -54,9 +56,7 @@ from typing import Optional, Dict, Any, List, Tuple
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
-DATA_FILE   = PERSIST_ROOT / "ap_data.json"
-EXPORT_DIR  = PERSIST_ROOT / "ap_exports"
-EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+DATA_FILE   = PERSIST_ROOT / "ap_data.json"  # name only — data lives in MySQL kv_store
 
 # Hierarchy data (owned by arc_hierarchy.py) - still present for compatibility
 HIERARCHY_FILE    = PERSIST_ROOT / "arc_hierarchy.json"
@@ -138,37 +138,16 @@ def _default_ap_data() -> Dict[str, Any]:
     return {}
 
 def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
-    """
-    Atomic JSON write:
-    - write to .tmp in same directory
-    - replace target
-    Reduces risk of corruption on crash/redeploy.
-    """
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    payload = json.dumps(data, indent=4)
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(p)
+    # Stored in MySQL kv_store keyed by the old filename stem.
+    db.kv_save(p.stem, data)
 
 async def load() -> Dict[str, Any]:
     async with file_lock:
-        if not DATA_FILE.exists():
-            return _default_ap_data()
         try:
-            txt = DATA_FILE.read_text(encoding="utf-8").strip()
-            if not txt:
-                return _default_ap_data()
-            data = json.loads(txt)
+            data = db.kv_load("ap_data", None)
             if not isinstance(data, dict):
                 return _default_ap_data()
             return data
-        except json.JSONDecodeError:
-            try:
-                bak = DATA_FILE.with_suffix(DATA_FILE.suffix + ".bak")
-                DATA_FILE.replace(bak)
-            except Exception:
-                pass
-            return _default_ap_data()
         except Exception:
             return _default_ap_data()
 
@@ -211,14 +190,9 @@ def safe_float_ap(value) -> float:
         return 0.0
 
 def load_hierarchy() -> Dict[str, Any]:
-    # Not used for bonuses in this version; kept so the file dependency doesn't break anything.
-    if not HIERARCHY_FILE.exists():
-        return {"members": {}, "units": {}}
+    # Reads the shared "arc_hierarchy" doc (written by arc_hierarchy.py).
     try:
-        txt = HIERARCHY_FILE.read_text(encoding="utf-8").strip()
-        if not txt:
-            return {"members": {}, "units": {}}
-        data = json.loads(txt)
+        data = db.kv_load("arc_hierarchy", None)
         if not isinstance(data, dict):
             return {"members": {}, "units": {}}
         data.setdefault("members", {})
@@ -328,13 +302,9 @@ def _load_boosts_file() -> Dict[str, Any]:
       }
     }
     """
-    if not BOOSTS_FILE.exists():
-        return {"participants": {}}
+    # Shared "ap_boosts" doc (also written by event_creator.py).
     try:
-        txt = BOOSTS_FILE.read_text(encoding="utf-8").strip()
-        if not txt:
-            return {"participants": {}}
-        data = json.loads(txt)
+        data = db.kv_load("ap_boosts", None)
         if not isinstance(data, dict):
             return {"participants": {}}
         data.setdefault("participants", {})
@@ -346,12 +316,41 @@ def _load_boosts_file() -> Dict[str, Any]:
 
 def _save_boosts_file(data: Dict[str, Any]) -> None:
     try:
-        BOOSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = BOOSTS_FILE.with_suffix(BOOSTS_FILE.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
-        tmp.replace(BOOSTS_FILE)
+        db.kv_save("ap_boosts", data)
     except Exception:
         pass
+
+# -------------------------
+# AP backups (was: ap_backup_*.json files in EXPORT_DIR on the volume)
+# Now stored in MySQL kv_store under "ap_backups", capped per guild so they
+# don't grow unbounded the way the on-disk export folder did.
+# -------------------------
+MAX_AP_BACKUPS_PER_GUILD = 25
+
+def _load_backups_doc() -> Dict[str, Any]:
+    d = db.kv_load("ap_backups", {})
+    return d if isinstance(d, dict) else {}
+
+def add_ap_backup(guild_id: int, name: str, data: Dict[str, Any]) -> None:
+    doc = _load_backups_doc()
+    lst = doc.setdefault(str(guild_id), [])
+    lst.insert(0, {
+        "name": name,
+        "created_utc": datetime.datetime.utcnow().isoformat(),
+        "data": data,
+    })
+    del lst[MAX_AP_BACKUPS_PER_GUILD:]   # keep only the newest N
+    db.kv_save("ap_backups", doc)
+
+def list_ap_backups(guild_id: int) -> List[Dict[str, Any]]:
+    """Backups for this guild, newest first (each: name/created_utc/data)."""
+    return list(_load_backups_doc().get(str(guild_id), []))
+
+def get_ap_backup(guild_id: int, name: str) -> Optional[Dict[str, Any]]:
+    for entry in _load_backups_doc().get(str(guild_id), []):
+        if entry.get("name") == name:
+            return entry
+    return None
 
 def _apply_participant_boosts(
     boosts_data: Dict[str, Any],
@@ -448,18 +447,13 @@ def append_audit(
             "actor_id": <int or absent>
         }
     """
-    rec   = data.setdefault(str(member_id), {"ap": 0, "last_chat": None})
-    audit = rec.setdefault(AUDIT_KEY, [])
-    entry: Dict[str, Any] = {
-        "ts":     utcnow(),
-        "delta":  round(delta, 4),
-        "source": source,
-    }
-    if reason:
-        entry["reason"] = reason
-    if actor_id is not None:
-        entry["actor_id"] = actor_id
-    audit.append(entry)
+    # Audit entries live in the ap_audit MySQL table (not inside ap_data) so the
+    # AP document stays small. `data` is accepted for signature compatibility.
+    db.execute(
+        "INSERT INTO ap_audit (user_id, ts, delta, source, reason, actor_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (int(member_id), utcnow(), round(delta, 4), source, reason or None, actor_id),
+    )
 
 
 def build_audit_csv(entries: List[Dict[str, Any]], member_display: str) -> bytes:
@@ -719,8 +713,9 @@ async def wipe_ap_in_data(data: Dict[str, Any]) -> None:
     Note: last_chat is tracked in-memory on the cog, not in this file.
     """
     for _, rec in iter_member_records(data):
-        rec["ap"]        = 0
-        rec[AUDIT_KEY]   = []   # clear audit so next cycle starts fresh
+        rec["ap"] = 0
+    # Audit lives in MySQL now; clear it so the next cycle starts fresh.
+    db.execute("DELETE FROM ap_audit")
 
 # -------------------------
 # Persistent View
@@ -1481,15 +1476,10 @@ class APTracking(commands.Cog):
         csv_bytes = render_grouped_csv(groups)
         ts        = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-        backup_json_path = EXPORT_DIR / f"ap_backup_{interaction.guild.id}_{ts}.json"
-        backup_csv_path  = EXPORT_DIR / f"ap_export_{interaction.guild.id}_{ts}.csv"
-
+        # Store the JSON backup in MySQL (capped per guild) instead of the
+        # Railway volume. The CSV is delivered as a Discord attachment below.
         try:
-            backup_json_path.write_text(json.dumps(data, indent=4), encoding="utf-8")
-        except Exception:
-            pass
-        try:
-            backup_csv_path.write_bytes(csv_bytes)
+            add_ap_backup(interaction.guild.id, f"ap_backup_{interaction.guild.id}_{ts}.json", data)
         except Exception:
             pass
 
@@ -1556,9 +1546,12 @@ class APTracking(commands.Cog):
         else:
             target = member
 
-        data    = await load()
-        rec     = data.get(str(target.id), {})
-        entries = rec.get(AUDIT_KEY, []) if isinstance(rec, dict) else []
+        entries = await asyncio.to_thread(
+            db.fetchall,
+            "SELECT ts, delta, source, reason, actor_id FROM ap_audit "
+            "WHERE user_id=%s ORDER BY id",
+            (target.id,),
+        )
 
         if not entries:
             await interaction.response.send_message(
@@ -1646,18 +1639,9 @@ class APTracking(commands.Cog):
     # Backup restore helpers
     # -------------------------
 
-    def _list_guild_backups(self, guild_id: int) -> List[Path]:
-        """
-        Return all backup JSON files for this guild, newest first.
-        Filename format: ap_backup_{guild_id}_{timestamp}.json
-        """
-        prefix = f"ap_backup_{guild_id}_"
-        files = sorted(
-            [p for p in EXPORT_DIR.glob(f"{prefix}*.json")],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        return files
+    def _list_guild_backups(self, guild_id: int) -> List[Dict[str, Any]]:
+        """Backup entries for this guild, newest first (name/created_utc/data)."""
+        return list_ap_backups(guild_id)
 
     # -------------------------
     # /ap_list_backups
@@ -1686,10 +1670,10 @@ class APTracking(commands.Cog):
             return
 
         lines: List[str] = []
-        for i, path in enumerate(backups[:15]):  # cap display at 15
-            mtime = datetime.datetime.utcfromtimestamp(path.stat().st_mtime)
+        for i, entry in enumerate(backups[:15]):  # cap display at 15
+            created = str(entry.get("created_utc", ""))[:16].replace("T", " ")
             label = "  ← most recent" if i == 0 else ""
-            lines.append(f"`{path.name}` — `{mtime.strftime('%Y-%m-%d %H:%M UTC')}`{label}")
+            lines.append(f"`{entry.get('name','?')}` — `{created} UTC`{label}")
 
         embed = discord.Embed(
             title="AP Backup Files",
@@ -1726,13 +1710,13 @@ class APTracking(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        # ── 1. Locate backup file ─────────────────────────────────────────────
+        # ── 1. Locate backup ──────────────────────────────────────────────────
         if backup_name:
-            backup_path = EXPORT_DIR / backup_name.strip()
-            if not backup_path.exists():
+            backup_entry = get_ap_backup(interaction.guild.id, backup_name.strip())
+            if backup_entry is None:
                 await interaction.followup.send(
-                    f"❌ Backup file `{backup_name}` not found.\n"
-                    "Use `/ap_list_backups` to see available files.",
+                    f"❌ Backup `{backup_name}` not found.\n"
+                    "Use `/ap_list_backups` to see available backups.",
                     ephemeral=True,
                 )
                 return
@@ -1740,27 +1724,26 @@ class APTracking(commands.Cog):
             backups = self._list_guild_backups(interaction.guild.id)
             if not backups:
                 await interaction.followup.send(
-                    "❌ No backup files found for this server.\n"
+                    "❌ No backups found for this server.\n"
                     "Backups are created automatically each time `/export_ap` is run.",
                     ephemeral=True,
                 )
                 return
-            backup_path = backups[0]
+            backup_entry = backups[0]
 
         # ── 2. Load backup ────────────────────────────────────────────────────
         try:
-            backup_raw = backup_path.read_text(encoding="utf-8").strip()
-            backup_data: Dict[str, Any] = json.loads(backup_raw)
+            backup_data: Dict[str, Any] = backup_entry.get("data") or {}
             if not isinstance(backup_data, dict):
-                raise ValueError("Backup root is not a dict.")
+                raise ValueError("Backup payload is not a dict.")
         except Exception as e:
             await interaction.followup.send(
-                f"❌ Failed to read backup file: `{e}`", ephemeral=True
+                f"❌ Failed to read backup: `{e}`", ephemeral=True
             )
             return
 
-        mtime = datetime.datetime.utcfromtimestamp(backup_path.stat().st_mtime)
-        backup_label = f"`{backup_path.name}` (saved `{mtime.strftime('%Y-%m-%d %H:%M UTC')}`)"
+        created = str(backup_entry.get("created_utc", ""))[:16].replace("T", " ")
+        backup_label = f"`{backup_entry.get('name','?')}` (saved `{created} UTC`)"
 
         # ── 3. Restore AP values into current data ────────────────────────────
         # Only overwrites the `ap` field — preserves audit logs, claim fields,
@@ -1797,7 +1780,7 @@ class APTracking(commands.Cog):
                 int(uid_str),
                 backup_ap,
                 source="ap_restore_backup",
-                reason=f"Restored from {backup_path.name}",
+                reason=f"Restored from {backup_entry.get('name','?')}",
                 actor_id=interaction.user.id,
             )
             restored += 1
@@ -1967,14 +1950,15 @@ class APTracking(commands.Cog):
             )
             return
 
-        # ── 2. Count already-credited chat AP from audit logs ─────────────────
-        def _count_credited_chat_entries(rec: Dict[str, Any]) -> int:
+        # ── 2. Count already-credited chat AP from the ap_audit table ─────────
+        def _count_credited_chat_entries(uid: int) -> int:
             """Count audit entries with source 'chat' since the last wipe."""
-            count = 0
-            for entry in rec.get(AUDIT_KEY, []):
-                if entry.get("source") == "chat" and entry.get("delta", 0) > 0:
-                    count += 1
-            return count
+            row = db.fetchone(
+                "SELECT COUNT(*) AS n FROM ap_audit "
+                "WHERE user_id=%s AND source='chat' AND delta>0",
+                (uid,),
+            )
+            return int(row["n"]) if row else 0
 
         # ── 3. Award the difference ───────────────────────────────────────────
         data = await load()   # re-load fresh to avoid stale snapshot
@@ -1992,8 +1976,7 @@ class APTracking(commands.Cog):
                 continue
 
             expected_windows = len(buckets)
-            rec = data.get(str(member_id), {})
-            already_credited = _count_credited_chat_entries(rec) if isinstance(rec, dict) else 0
+            already_credited = _count_credited_chat_entries(member_id)
 
             missing = expected_windows - already_credited
             if missing <= 0:

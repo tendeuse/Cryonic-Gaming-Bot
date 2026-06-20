@@ -14,6 +14,8 @@ from discord.ext import commands
 from discord import app_commands
 from pathlib import Path
 
+from . import db as _db
+
 # =========================
 # CONFIG (ENV)
 # =========================
@@ -176,45 +178,10 @@ ORE_TO_COMPRESSED_NAME: Dict[str, str] = {
 # DB (caching + paid status)
 # =========================
 def db_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS type_cache (
-            type_id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            cached_at INTEGER NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS price_cache (
-            type_id INTEGER PRIMARY KEY,
-            jita_buy REAL NOT NULL,
-            cached_at INTEGER NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS char_name_cache (
-            character_id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            cached_at INTEGER NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS buyback_paid (
-            contract_id INTEGER PRIMARY KEY,
-            paid_at INTEGER NOT NULL,
-            paid_by_discord_id INTEGER NOT NULL,
-            paid_by_tag TEXT NOT NULL
-        )
-        """
-    )
-    return conn
+    # Tables (type_cache, price_cache, char_name_cache, buyback_paid) are
+    # created centrally by db.init_db(). This returns a sqlite3-style adapter
+    # over the shared MySQL pool so the existing call sites work unchanged.
+    return _db.legacy_conn()
 
 def _utc_iso(ts: int) -> str:
     return datetime.datetime.utcfromtimestamp(ts).replace(tzinfo=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
@@ -596,9 +563,8 @@ class BuybackContracts(commands.Cog):
 
     def _load_ign_registry_state(self) -> Dict[str, Any]:
         try:
-            if not IGN_REGISTRY_PATH.exists():
-                return {}
-            return json.loads(IGN_REGISTRY_PATH.read_text(encoding="utf-8"))
+            d = _db.kv_load("ign_registry", {})
+            return d if isinstance(d, dict) else {}
         except Exception:
             return {}
 

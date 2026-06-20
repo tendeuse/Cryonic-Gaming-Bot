@@ -32,6 +32,8 @@ from typing import Optional, Tuple
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+
+from . import db
 from discord.ui import View
 
 from googleapiclient.discovery import build
@@ -100,22 +102,16 @@ async def safe_remove_cog(bot: commands.Bot, name: str) -> None:
 # =====================
 
 def _load_file(p: Path):
+    # Stored in MySQL kv_store keyed by the old filename stem.
     try:
-        if not p.exists():
-            return {}
-        raw = p.read_text(encoding="utf-8").strip()
-        if not raw:
-            return {}
-        return json.loads(raw)
+        d = db.kv_load(p.stem, {})
+        return d if isinstance(d, (dict, list)) else {}
     except Exception:
         return {}
 
 
 def _atomic_write_json(p: Path, d) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(d, indent=4), encoding="utf-8")
-    tmp.replace(p)
+    db.kv_save(p.stem, d)
 
 
 async def load(p: Path):
