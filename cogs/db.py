@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Optional
 from urllib.parse import urlparse, unquote
@@ -94,20 +95,60 @@ def get_pool() -> PooledDB:
         _pool = PooledDB(
             creator=pymysql,
             maxconnections=10,
-            mincached=1,
+            mincached=0,         # don't eagerly connect at pool creation (see wait_until_ready)
             blocking=True,
             ping=4,              # ping a connection before handing it out (reconnect if dropped)
             autocommit=True,
             charset="utf8mb4",
             cursorclass=DictCursor,
+            connect_timeout=10,
             # Some kv documents (e.g. arc_seat) are tens of MB; raise the client
             # packet ceiling well above PyMySQL's 16MB default. The server's own
             # max_allowed_packet (64MB on MySQL 8) still applies.
             max_allowed_packet=128 * 1024 * 1024,
             **cfg,
         )
-        print(f"[DB] MySQL pool initialised -> {cfg['host']}:{cfg['port']}/{cfg['database']}")
+        print(f"[DB] MySQL pool configured -> {cfg['host']}:{cfg['port']}/{cfg['database']}")
     return _pool
+
+
+def wait_until_ready(timeout: float = 120.0, interval: float = 3.0) -> None:
+    """Block until MySQL accepts a connection, or raise after `timeout` seconds.
+
+    Railway's private network (mysql.railway.internal) takes a few seconds to
+    come up after a container starts, so the very first connection attempt can
+    time out. Retry instead of crashing the boot.
+    """
+    deadline = time.time() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            with cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            if attempt > 1:
+                print(f"[DB] MySQL reachable after {attempt} attempt(s).")
+            return
+        except Exception as e:
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"MySQL not reachable after {timeout:.0f}s: {type(e).__name__}: {e}"
+                ) from e
+            print(f"[DB] waiting for MySQL... ({type(e).__name__}); retrying in {interval:.0f}s")
+            # The failed attempt may have cached a dead connection; drop the pool.
+            _reset_pool()
+            time.sleep(interval)
+
+
+def _reset_pool() -> None:
+    global _pool
+    try:
+        if _pool is not None:
+            _pool.close()
+    except Exception:
+        pass
+    _pool = None
 
 
 @contextmanager
@@ -384,7 +425,11 @@ _SCHEMA: tuple[str, ...] = (
 
 
 def init_db() -> None:
-    """Create the key-value store and every relational table (idempotent)."""
+    """Create the key-value store and every relational table (idempotent).
+
+    Waits for MySQL to become reachable first (Railway private networking can
+    take a few seconds to initialise at container start)."""
+    wait_until_ready()
     with cursor(commit=True) as cur:
         for stmt in _SCHEMA:
             cur.execute(stmt)
