@@ -26,6 +26,7 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Make `from cogs import db` work whether run as a module or a script.
@@ -226,6 +227,9 @@ def migrate_sqlite() -> int:
 # Main
 # ---------------------------------------------------------------------------
 
+_DONE_KEY = "_migration_done"
+
+
 def main() -> int:
     print("=== Cryonic-Gaming-Bot: volume -> MySQL migration ===")
     print(f"PERSIST_ROOT   = {PERSIST_ROOT}")
@@ -234,9 +238,30 @@ def main() -> int:
     print("\nEnsuring MySQL schema ...")
     db.init_db()
 
+    # Run-once guard: after a successful migration a sentinel is written to
+    # kv_store. On later boots this script no-ops, so it is safe to leave
+    # `python scripts/migrate_to_mysql.py && python bot.py` as the start command
+    # — it will NOT re-import (and overwrite live data with) stale volume files.
+    # Set FORCE_MIGRATION=1 to deliberately re-run.
+    if not os.getenv("FORCE_MIGRATION"):
+        done = db.kv_load(_DONE_KEY, None)
+        if done:
+            print(f"\nMigration already completed at {done.get('completed_at')} — skipping.")
+            print("(Set FORCE_MIGRATION=1 to force a re-run.)")
+            return 0
+
     json_n = migrate_json()
     ap_members, ap_audit_n = migrate_ap_data()
     rel_n = migrate_sqlite()
+
+    # Mark complete so subsequent boots skip the migration.
+    db.kv_save(_DONE_KEY, {
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "json_documents": json_n,
+        "ap_members": ap_members,
+        "ap_audit_rows": ap_audit_n,
+        "relational_rows": rel_n,
+    })
 
     print("\n=== Done ===")
     print(f"JSON documents: {json_n}")
