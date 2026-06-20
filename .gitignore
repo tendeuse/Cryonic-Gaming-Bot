@@ -10,3 +10,6 @@ __pycache__/
 
 # Local data (optional but recommended)
 data/*.json
+
+# Local-only: video/deck builder project (not part of the bot)
+corp_videos/
