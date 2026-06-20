@@ -118,8 +118,14 @@ class MyBot(commands.Bot):
             loaded = []
             failed = []
 
+            # Shared helper modules in cogs/ that are NOT Discord cogs
+            # (imported via `from . import db`, no setup() entry point).
+            NON_COG_MODULES = {"db"}
+
             for filename in sorted(os.listdir(cogs_dir)):
                 if not filename.endswith(".py") or filename.startswith("__"):
+                    continue
+                if filename[:-3] in NON_COG_MODULES:
                     continue
 
                 ext = f"cogs.{filename[:-3]}"
