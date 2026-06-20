@@ -49,14 +49,32 @@ from dbutils.pooled_db import PooledDB
 _pool: Optional[PooledDB] = None
 
 
+def _parse_url(url: str) -> dict:
+    p = urlparse(url)
+    return {
+        "host": p.hostname or "localhost",
+        "port": p.port or 3306,
+        "user": unquote(p.username) if p.username else "root",
+        "password": unquote(p.password) if p.password else "",
+        "database": (p.path or "/railway").lstrip("/") or "railway",
+    }
+
+
 def _config() -> dict:
     """Resolve MySQL connection parameters from the environment.
 
-    Prefers the discrete Railway MySQL variables; falls back to a single
-    connection URL (``MYSQL_URL`` / ``DATABASE_URL``). Raises if neither is
-    present so startup fails fast with a clear message instead of silently
-    trying to use a missing volume.
+    Priority:
+      1. ``MYSQL_PUBLIC_URL`` — Railway's public TCP proxy. Preferred because the
+         private network (``mysql.railway.internal``, IPv6-only) is not always
+         reachable from another service; the public proxy always is.
+      2. The discrete ``MYSQL*`` variables (internal host).
+      3. A single ``MYSQL_URL`` / ``DATABASE_URL``.
+    Raises if none are present so startup fails fast with a clear message.
     """
+    public_url = os.getenv("MYSQL_PUBLIC_URL")
+    if public_url:
+        return _parse_url(public_url)
+
     host = os.getenv("MYSQLHOST") or os.getenv("MYSQL_HOST")
     if host:
         return {
@@ -71,19 +89,11 @@ def _config() -> dict:
 
     url = os.getenv("MYSQL_URL") or os.getenv("DATABASE_URL")
     if url:
-        p = urlparse(url)
-        return {
-            "host": p.hostname or "localhost",
-            "port": p.port or 3306,
-            "user": unquote(p.username) if p.username else "root",
-            "password": unquote(p.password) if p.password else "",
-            "database": (p.path or "/railway").lstrip("/") or "railway",
-        }
+        return _parse_url(url)
 
     raise RuntimeError(
-        "MySQL is not configured. Set the Railway MySQL plugin vars "
-        "(MYSQLHOST / MYSQLPORT / MYSQLUSER / MYSQLPASSWORD / MYSQLDATABASE) "
-        "or a single MYSQL_URL / DATABASE_URL on this service."
+        "MySQL is not configured. Set MYSQL_PUBLIC_URL (Railway public proxy), "
+        "the discrete MYSQL* vars, or a single MYSQL_URL / DATABASE_URL."
     )
 
 
