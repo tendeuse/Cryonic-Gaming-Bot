@@ -13,10 +13,10 @@
 #   - 200 AP bonus every time an officer hosts 3 events in a week (repeatable —
 #     6 events = 400 AP). The weekly host count resets every Monday (UTC).
 #   - Two panels in #arc-directives, each with a "Create Event" button:
-#       • Petty Officer panel  → only the 3 unrestricted ops.
-#       • Officer panel (Lt+)  → all 7 titles; the 4 "class" titles are gated to
-#         ARC Lieutenant or above and forced to the ARC Security audience.
-#   - ARC Lieutenant + ARC Commander are MANDATED to host ≥3 events per week.
+#       • Petty Officer panel    → only the 3 unrestricted ops.
+#       • Officer panel (Ensign+) → all 7 titles; the 4 "class" titles are gated
+#         to ARC Ensign or above and forced to the ARC Security audience.
+#   - ARC Ensign + ARC Lieutenant + ARC Commander are MANDATED to host ≥3 events/week.
 #     At the Monday rollover the bot posts a prompt in #directives-logs (pinging
 #     the ARC Tendeuse role) for every mandated officer who fell short, with
 #     Justify / Demote buttons usable only by ARC General or above. Demotion is
@@ -89,7 +89,7 @@ RANK_KEY_BY_ROLE = {
 # =====================
 # EVENT TITLES
 # =====================
-# Restricted "class" titles — ARC Lieutenant+ only, ARC-Security-only audience.
+# Restricted "class" titles — ARC Ensign+ only, ARC-Security-only audience.
 RESTRICTED_TITLES = [
     "Dscan and Threat Assessment",
     "Scanning Class",
@@ -211,6 +211,10 @@ def is_tracked_officer(member: discord.Member) -> bool:
     return effective_rank_role(member) is not None
 
 
+def is_ensign_or_above(member: discord.Member) -> bool:
+    return _rank_index(effective_rank_role(member)) >= _rank_index(ENSIGN_ROLE)
+
+
 def is_lieutenant_or_above(member: discord.Member) -> bool:
     return _rank_index(effective_rank_role(member)) >= _rank_index(LIEUTENANT_ROLE)
 
@@ -282,13 +286,10 @@ def _leaderboard_lines(
 
 def build_petty_embed(data: Dict[str, Any], guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(
-        title="🎯 ARC Directives — Petty Officer & Ensign Ops",
+        title="🎯 ARC Directives — Petty Officer Ops",
         description=(
             "Host fleets to support the corp. Every **3 events** you host in a "
             f"week earns a **{AP_BONUS} AP** bonus (repeatable).\n\n"
-            f"⚠️ **ARC Ensign must host at least {WEEKLY_QUOTA} events per week** "
-            "(Monday→Sunday) unless justified to **ARC General or above** — "
-            "otherwise you may be demoted.\n\n"
             "Use **Create Event** below to schedule one of the available ops."
         ),
         color=discord.Color.teal(),
@@ -303,33 +304,33 @@ def build_petty_embed(data: Dict[str, Any], guild: discord.Guild) -> discord.Emb
         name="🏅 This Week",
         value=_leaderboard_lines(
             data, guild,
-            lambda m: is_tracked_officer(m) and not is_lieutenant_or_above(m),
+            lambda m: effective_rank_role(m) == PETTY_OFFICER_ROLE,
         ),
         inline=False,
     )
     embed.add_field(
         name="🗓 Week", value=_week_range_str(data.get("week_start", "")), inline=False
     )
-    embed.set_footer(text="ARC Petty Officer & Ensign • host events, earn AP")
+    embed.set_footer(text="ARC Petty Officer • host events, earn AP")
     return embed
 
 
 def build_officer_embed(data: Dict[str, Any], guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(
-        title="🎖 ARC Directives — Officer Ops",
+        title="🎖 ARC Directives — Officer Ops (Ensign & above)",
         description=(
             "Host fleets and run classes. Every **3 events** you host in a week "
             f"earns a **{AP_BONUS} AP** bonus (repeatable).\n\n"
-            f"**ARC Lieutenant & ARC Commander must host at least {WEEKLY_QUOTA} "
-            "events per week** (Monday→Sunday) unless justified to **ARC General "
-            "or above** — otherwise you may be demoted.\n\n"
+            f"**ARC Ensign, ARC Lieutenant & ARC Commander must host at least "
+            f"{WEEKLY_QUOTA} events per week** (Monday→Sunday) unless justified to "
+            "**ARC General or above** — otherwise you may be demoted.\n\n"
             "Use **Create Event** below to schedule an op or class."
         ),
         color=discord.Color.dark_gold(),
         timestamp=datetime.datetime.utcnow(),
     )
     embed.add_field(
-        name="🎓 Classes (ARC Lieutenant+ · ARC Security audience)",
+        name="🎓 Classes (ARC Ensign+ · ARC Security audience)",
         value="\n".join(f"• `{t}`" for t in RESTRICTED_TITLES),
         inline=False,
     )
@@ -340,13 +341,15 @@ def build_officer_embed(data: Dict[str, Any], guild: discord.Guild) -> discord.E
     )
     embed.add_field(
         name="🏅 This Week",
-        value=_leaderboard_lines(data, guild, is_lieutenant_or_above),
+        value=_leaderboard_lines(data, guild, is_ensign_or_above),
         inline=False,
     )
     embed.add_field(
         name="🗓 Week", value=_week_range_str(data.get("week_start", "")), inline=False
     )
-    embed.set_footer(text="ARC Lieutenant and above • mandated: 3 events / week")
+    embed.set_footer(
+        text="ARC Ensign and above • mandated (Ensign/Lt/Cmdr): 3 events / week"
+    )
     return embed
 
 
@@ -388,10 +391,10 @@ class DirectiveEventModal(discord.ui.Modal):
         member = interaction.user
         if is_restricted_title(self.title_value) and (
             not isinstance(member, discord.Member)
-            or not is_lieutenant_or_above(member)
+            or not is_ensign_or_above(member)
         ):
             await interaction.response.send_message(
-                f"❌ Only **{LIEUTENANT_ROLE}** or above can run **"
+                f"❌ Only **{ENSIGN_ROLE}** or above can run **"
                 f"{self.title_value}**.",
                 ephemeral=True,
             )
@@ -530,7 +533,7 @@ class PettyCreateButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         cog = interaction.client.cogs.get("DirectiveCog")
         if cog:
-            await cog.handle_create(interaction, OPEN_TITLES, require_lt=False)
+            await cog.handle_create(interaction, "petty")
 
 
 class OfficerCreateButton(discord.ui.Button):
@@ -544,7 +547,7 @@ class OfficerCreateButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         cog = interaction.client.cogs.get("DirectiveCog")
         if cog:
-            await cog.handle_create(interaction, ALL_TITLES, require_lt=True)
+            await cog.handle_create(interaction, "officer")
 
 
 class PettyPanelView(discord.ui.View):
@@ -727,9 +730,7 @@ class DirectiveCog(commands.Cog):
     async def handle_create(
         self,
         interaction: discord.Interaction,
-        titles: List[str],
-        *,
-        require_lt: bool,
+        panel: str,
     ) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
@@ -738,20 +739,25 @@ class DirectiveCog(commands.Cog):
             return
 
         member = interaction.user
-        if require_lt:
-            if not is_lieutenant_or_above(member):
+        if panel == "officer":
+            # Officer panel: ARC Ensign and above — may host every op, including
+            # the 4 classes (ARC-Security-only audience).
+            if not is_ensign_or_above(member):
                 await interaction.response.send_message(
-                    f"❌ This panel is for **{LIEUTENANT_ROLE}** and above.",
+                    f"❌ This panel is for **{ENSIGN_ROLE}** and above.",
                     ephemeral=True,
                 )
                 return
+            titles = ALL_TITLES
         else:
+            # Petty Officer panel: open ops only.
             if not is_tracked_officer(member):
                 await interaction.response.send_message(
                     "❌ Only ARC officers can host directive events.",
                     ephemeral=True,
                 )
                 return
+            titles = OPEN_TITLES
 
         await interaction.response.send_message(
             "Select the op title to create:",
