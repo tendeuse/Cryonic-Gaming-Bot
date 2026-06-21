@@ -76,7 +76,7 @@ IMMUNE_ROLES: Set[str] = {
     "ARC Commander",
     "ARC Lieutenant",
     "Moderator",
-    "Admin",
+    "Administrator",
 }
 
 # Cross-channel duplicate detection.
