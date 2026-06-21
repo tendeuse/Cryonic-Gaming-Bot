@@ -69,6 +69,7 @@ HIERARCHY_LOG_CH      = "arc-hierarchy-log"
 # Only these roles may run /create_event
 CREATOR_ROLES: Set[str] = {
     "ARC Petty Officer",
+    "ARC Ensign",
     "ARC Lieutenant",
     "ARC Commander",
     "ARC General",

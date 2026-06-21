@@ -57,6 +57,7 @@ TENDEUSE_ROLE = "ARC Tendeuse"  # pinged on every demotion prompt
 # RANK LADDER (low → high)
 # =====================
 PETTY_OFFICER_ROLE = "ARC Petty Officer"
+ENSIGN_ROLE        = "ARC Ensign"
 LIEUTENANT_ROLE    = "ARC Lieutenant"
 COMMANDER_ROLE     = "ARC Commander"
 GENERAL_ROLE       = "ARC General"
@@ -65,6 +66,7 @@ CEO_ROLE           = "ARC Security Corporation Leader"
 
 RANK_LADDER: List[str] = [
     PETTY_OFFICER_ROLE,
+    ENSIGN_ROLE,
     LIEUTENANT_ROLE,
     COMMANDER_ROLE,
     GENERAL_ROLE,
@@ -73,11 +75,12 @@ RANK_LADDER: List[str] = [
 ]
 
 # Ranks that must host ≥ WEEKLY_QUOTA events per week (demotion risk).
-MANDATED_ROLES = {LIEUTENANT_ROLE, COMMANDER_ROLE}
+MANDATED_ROLES = {ENSIGN_ROLE, LIEUTENANT_ROLE, COMMANDER_ROLE}
 
 # Map a ladder role name → arc_hierarchy rank key (for demotion).
 RANK_KEY_BY_ROLE = {
     PETTY_OFFICER_ROLE: "petty_officer",
+    ENSIGN_ROLE:        "ensign",
     LIEUTENANT_ROLE:    "lieutenant",
     COMMANDER_ROLE:     "commander",
     GENERAL_ROLE:       "general",
@@ -279,10 +282,13 @@ def _leaderboard_lines(
 
 def build_petty_embed(data: Dict[str, Any], guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(
-        title="🎯 ARC Directives — Petty Officer Ops",
+        title="🎯 ARC Directives — Petty Officer & Ensign Ops",
         description=(
             "Host fleets to support the corp. Every **3 events** you host in a "
             f"week earns a **{AP_BONUS} AP** bonus (repeatable).\n\n"
+            f"⚠️ **ARC Ensign must host at least {WEEKLY_QUOTA} events per week** "
+            "(Monday→Sunday) unless justified to **ARC General or above** — "
+            "otherwise you may be demoted.\n\n"
             "Use **Create Event** below to schedule one of the available ops."
         ),
         color=discord.Color.teal(),
@@ -297,14 +303,14 @@ def build_petty_embed(data: Dict[str, Any], guild: discord.Guild) -> discord.Emb
         name="🏅 This Week",
         value=_leaderboard_lines(
             data, guild,
-            lambda m: effective_rank_role(m) == PETTY_OFFICER_ROLE,
+            lambda m: is_tracked_officer(m) and not is_lieutenant_or_above(m),
         ),
         inline=False,
     )
     embed.add_field(
         name="🗓 Week", value=_week_range_str(data.get("week_start", "")), inline=False
     )
-    embed.set_footer(text="ARC Petty Officer • host events, earn AP")
+    embed.set_footer(text="ARC Petty Officer & Ensign • host events, earn AP")
     return embed
 
 

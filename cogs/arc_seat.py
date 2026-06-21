@@ -163,6 +163,7 @@ PROMPT_AUTHORIZED_ROLES: Set[str] = {
 # Rank roles flagged for manual review (NOT auto-removed)
 ARC_RANK_ROLES: Set[str] = {
     "ARC Petty Officer",
+    "ARC Ensign",
     "ARC Lieutenant",
     "ARC Commander",
     "ARC General",

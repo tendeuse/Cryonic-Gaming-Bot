@@ -17,6 +17,7 @@
 #   - ARC General
 #   - ARC Commander
 #   - ARC Lieutenant        (was "ARC Officer" role)
+#   - ARC Ensign            (between Petty Officer and Lieutenant)
 #   - ARC Petty Officer     (NEW: below Lieutenant, above line members)
 #   - Line members are "security" rank (no rank-role; corp role covers membership)
 #
@@ -79,6 +80,7 @@ COMMANDER_ROLE = "ARC Commander"
 
 # UPDATED ROLE NAMES
 LIEUTENANT_ROLE = "ARC Lieutenant"          # renamed from "ARC Officer"
+ENSIGN_ROLE = "ARC Ensign"                  # between Petty Officer and Lieutenant
 PETTY_OFFICER_ROLE = "ARC Petty Officer"    # NEW
 
 # Legacy role name (we will try to rename it, and also strip it if found)
@@ -102,6 +104,7 @@ DIRECTIVES_CH = "arc-directives"
 # =====================
 RANK_SECURITY = "security"
 RANK_PETTY_OFFICER = "petty_officer"
+RANK_ENSIGN = "ensign"
 RANK_LIEUTENANT = "lieutenant"
 RANK_COMMANDER = "commander"
 RANK_GENERAL = "general"
@@ -112,6 +115,7 @@ RANK_CEO = "ceo"
 ROLE_BY_RANK = {
     RANK_SECURITY: None,
     RANK_PETTY_OFFICER: PETTY_OFFICER_ROLE,
+    RANK_ENSIGN: ENSIGN_ROLE,
     RANK_LIEUTENANT: LIEUTENANT_ROLE,
     RANK_COMMANDER: COMMANDER_ROLE,
     RANK_GENERAL: GENERAL_ROLE,
@@ -121,7 +125,8 @@ ROLE_BY_RANK = {
 
 PROMOTE_TO = {
     RANK_SECURITY: RANK_PETTY_OFFICER,
-    RANK_PETTY_OFFICER: RANK_LIEUTENANT,
+    RANK_PETTY_OFFICER: RANK_ENSIGN,
+    RANK_ENSIGN: RANK_LIEUTENANT,
     RANK_LIEUTENANT: RANK_COMMANDER,
     RANK_COMMANDER: RANK_GENERAL,
     RANK_GENERAL: None,
@@ -130,7 +135,8 @@ PROMOTE_TO = {
 DEMOTE_TO = {
     RANK_GENERAL: RANK_COMMANDER,
     RANK_COMMANDER: RANK_LIEUTENANT,
-    RANK_LIEUTENANT: RANK_PETTY_OFFICER,
+    RANK_LIEUTENANT: RANK_ENSIGN,
+    RANK_ENSIGN: RANK_PETTY_OFFICER,
     RANK_PETTY_OFFICER: RANK_SECURITY,
 }
 
@@ -277,7 +283,7 @@ def ensure_member_record(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
         rec["rank"] = RANK_LIEUTENANT
 
     # Guard against unknown values
-    if rec["rank"] not in (RANK_SECURITY, RANK_PETTY_OFFICER, RANK_LIEUTENANT, RANK_COMMANDER, RANK_GENERAL):
+    if rec["rank"] not in (RANK_SECURITY, RANK_PETTY_OFFICER, RANK_ENSIGN, RANK_LIEUTENANT, RANK_COMMANDER, RANK_GENERAL):
         rec["rank"] = RANK_SECURITY
 
     return rec
@@ -431,7 +437,7 @@ async def bootstrap_rank_roles(guild: discord.Guild) -> None:
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    for role_name in (PETTY_OFFICER_ROLE, LIEUTENANT_ROLE, COMMANDER_ROLE, GENERAL_ROLE):
+    for role_name in (PETTY_OFFICER_ROLE, ENSIGN_ROLE, LIEUTENANT_ROLE, COMMANDER_ROLE, GENERAL_ROLE):
         if get_role(guild, role_name) is None:
             try:
                 await guild.create_role(name=role_name, reason="ARC rank bootstrap")
@@ -454,7 +460,7 @@ async def sync_member_corp_from_roles(member: discord.Member, *, reason: str) ->
 # =====================
 def _rank_order() -> List[str]:
     # Lowest -> Highest (security has no role)
-    return [RANK_SECURITY, RANK_PETTY_OFFICER, RANK_LIEUTENANT, RANK_COMMANDER, RANK_GENERAL]
+    return [RANK_SECURITY, RANK_PETTY_OFFICER, RANK_ENSIGN, RANK_LIEUTENANT, RANK_COMMANDER, RANK_GENERAL]
 
 def _roles_above_rank(guild: discord.Guild, rank: str) -> List[discord.Role]:
     """
@@ -477,6 +483,7 @@ def _roles_above_rank(guild: discord.Guild, rank: str) -> List[discord.Role]:
 
     rank_to_role_name = {
         RANK_PETTY_OFFICER: PETTY_OFFICER_ROLE,
+        RANK_ENSIGN: ENSIGN_ROLE,
         RANK_LIEUTENANT: LIEUTENANT_ROLE,
         RANK_COMMANDER: COMMANDER_ROLE,
         RANK_GENERAL: GENERAL_ROLE,
@@ -553,6 +560,7 @@ def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
     generals: List[discord.Member] = []
     commanders: List[discord.Member] = []
     lieutenants: List[discord.Member] = []
+    ensigns: List[discord.Member] = []
     petty_officers: List[discord.Member] = []
 
     corp_counts = {
@@ -590,6 +598,9 @@ def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
         elif rank == RANK_LIEUTENANT:
             lieutenants.append(m)
             corp_counts[corp_key]["ranked"] += 1
+        elif rank == RANK_ENSIGN:
+            ensigns.append(m)
+            corp_counts[corp_key]["ranked"] += 1
         elif rank == RANK_PETTY_OFFICER:
             petty_officers.append(m)
             corp_counts[corp_key]["ranked"] += 1
@@ -615,6 +626,8 @@ def build_flowchart_text(guild: discord.Guild, data: Dict[str, Any]) -> str:
     lines.extend(_format_rank_block("Commanders", commanders))
     lines.append("")
     lines.extend(_format_rank_block("Lieutenants", lieutenants))
+    lines.append("")
+    lines.extend(_format_rank_block("Ensigns", ensigns))
     lines.append("")
     lines.extend(_format_rank_block("Petty Officers", petty_officers))
     lines.append("")
@@ -754,6 +767,7 @@ class ARCHierarchyCog(commands.Cog):
             RANK_GENERAL: [],
             RANK_COMMANDER: [],
             RANK_LIEUTENANT: [],
+            RANK_ENSIGN: [],
             RANK_PETTY_OFFICER: [],
             RANK_SECURITY: [],
         }
@@ -797,6 +811,8 @@ class ARCHierarchyCog(commands.Cog):
         lines.extend(fmt_group(RANK_COMMANDER, "Commanders"))
         lines.append("")
         lines.extend(fmt_group(RANK_LIEUTENANT, "Lieutenants"))
+        lines.append("")
+        lines.extend(fmt_group(RANK_ENSIGN, "Ensigns"))
         lines.append("")
         lines.extend(fmt_group(RANK_PETTY_OFFICER, "Petty Officers"))
         lines.append("")
