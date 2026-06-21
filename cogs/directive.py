@@ -1,28 +1,31 @@
 # cogs/directive.py
 #
-# ARC Weekly Directives — Officer Focus Program
-# =============================================
-# Replaces the old free-form task board. Each week the panel in #arc-directives
-# shows THREE standing "directives" (focus tracks):
+# ARC Officer Activity Tracker
+# ============================
+# Replaces the old three-focus-track program. Tracks how many events each ARC
+# officer HOSTS during a Monday→Sunday week and rewards / enforces activity.
 #
-#   ⚔️ Combat Focus (PVP & FW)
-#   💰 PVE Focus
-#   🎓 Training Focus
+# Tracked ranks (low → high):
+#   ARC Petty Officer · ARC Lieutenant · ARC Commander · ARC General ·
+#   ARC Security Administration Council · ARC Security Corporation Leader
 #
-# - ARC Lieutenant and ARC Commander SIGN UP for exactly ONE focus per week.
-# - Each focus has a goal of "complete 3 ops per week".
-# - Officers create events directly from the panel. Those events are:
-#       • restricted so only ARC Security can participate, and
-#       • forced to use one of the focus's approved, standardized titles
-#         (so progress can be tracked).
-# - Progress ticks up by one when an approved-title event is FINALIZED/CLOSED
-#   (the Event cog calls credit_directive_completion() on finalize).
-# - The cycle resets 7 days after it started; results are posted to
-#   #directives-logs, then signups/progress clear and a new cycle begins.
-# - Officers may change focus mid-week — their existing progress carries over.
+# Behaviour:
+#   - 200 AP bonus every time an officer hosts 3 events in a week (repeatable —
+#     6 events = 400 AP). The weekly host count resets every Monday (UTC).
+#   - Two panels in #arc-directives, each with a "Create Event" button:
+#       • Petty Officer panel  → only the 3 unrestricted ops.
+#       • Officer panel (Lt+)  → all 7 titles; the 4 "class" titles are gated to
+#         ARC Lieutenant or above and forced to the ARC Security audience.
+#   - ARC Lieutenant + ARC Commander are MANDATED to host ≥3 events per week.
+#     At the Monday rollover the bot posts a prompt in #directives-logs (pinging
+#     the ARC Tendeuse role) for every mandated officer who fell short, with
+#     Justify / Demote buttons usable only by ARC General or above. Demotion is
+#     manual — nothing happens automatically.
+#   - An event only counts when it is FINALIZED and met the minimum attendance
+#     (creator + at least 1 other, ≥15 min in VC). The Event cog calls
+#     credit_directive_completion() on finalize.
 
 import os
-import json
 import asyncio
 import datetime
 from pathlib import Path
@@ -43,63 +46,65 @@ LOG_CHANNEL        = "directives-logs"
 # =====================
 # PROGRAM CONFIG
 # =====================
-GOAL          = 3              # ops to complete per week
-CYCLE_DAYS    = 7              # cycle length
-RESTRICT_ROLE = "ARC Security"  # only this role may RSVP to directive events
-MIN_ATTENDEES = 2              # an op counts only with creator + 1 other (≥15 min)
-GOAL_BONUS_AP = 200            # AP awarded once when an officer hits the weekly goal
+WEEKLY_QUOTA  = 3              # events a mandated officer must host per week
+AP_PER_EVENTS = 3             # every N hosted events …
+AP_BONUS      = 200           # … grants this much AP (repeatable per week)
+RESTRICT_ROLE = "ARC Security"  # RSVP gate for the restricted class events
+MIN_ATTENDEES = 2             # an op counts only with creator + 1 other (≥15 min)
+TENDEUSE_ROLE = "ARC Tendeuse"  # pinged on every demotion prompt
 
-# Only these ranks may sign up for a focus / create directive events.
-ELIGIBLE_ROLES = {"ARC Lieutenant", "ARC Commander"}
+# =====================
+# RANK LADDER (low → high)
+# =====================
+PETTY_OFFICER_ROLE = "ARC Petty Officer"
+LIEUTENANT_ROLE    = "ARC Lieutenant"
+COMMANDER_ROLE     = "ARC Commander"
+GENERAL_ROLE       = "ARC General"
+DIRECTOR_ROLE      = "ARC Security Administration Council"
+CEO_ROLE           = "ARC Security Corporation Leader"
 
-# Focus tracks. The `titles` are the ONLY approved event titles for that focus —
-# they must match exactly, since weekly progress is tracked by these titles.
-FOCUSES: Dict[str, Dict[str, Any]] = {
-    "combat": {
-        "label": "⚔️ Combat Focus (PVP & FW)",
-        "blurb": "Pick this if your week is about fights and the warzone.",
-        "color": discord.Color.red(),
-        "requirements": [
-            "Lead a small gang roam (≤10 pilots)",
-            "Join a corp/alliance PVP fleet ping",
-            "Run a plexing op (solo, duo, or small gang)",
-            "Defend or contest a system under militia call",
-            "Solo/duo a kill in contested or enemy space",
-            "Flip a Medium or Large plex",
-            "Scout or call intel that leads to a confirmed kill or warzone shift",
-        ],
-        "titles": ["Faction Warfare Roam", "PVP Hunt"],
-    },
-    "pve": {
-        "label": "💰 PVE Focus",
-        "blurb": "Pick this if your week is about funding.",
-        "color": discord.Color.gold(),
-        "requirements": [
-            "Run a PVE op (ratting, missions, or FW sites)",
-            "Mentor a newer member through a PVE fit/run",
-            "Run an escalation or higher-value site",
-            "Generate and report a notable ISK/LP contribution",
-        ],
-        "titles": ["Mining/PVE Fleet"],
-    },
-    "training": {
-        "label": "🎓 Training Focus",
-        "blurb": "Pick this if your week is about teaching.",
-        "color": discord.Color.blue(),
-        "requirements": [
-            "Teach a class from the existing syllabus, delivered as written "
-            "(no improvising on content)",
-            "Run a syllabus-based practical session (fitting workshop, fleet drill, etc.)",
-            "Provide 1-on-1 syllabus-based mentorship to a new/junior member",
-        ],
-        "titles": [
-            "Dscan and Threat Assessment",
-            "Scanning Class",
-            "Rolling Class",
-            "OpSec 101 Class",
-        ],
-    },
+RANK_LADDER: List[str] = [
+    PETTY_OFFICER_ROLE,
+    LIEUTENANT_ROLE,
+    COMMANDER_ROLE,
+    GENERAL_ROLE,
+    DIRECTOR_ROLE,
+    CEO_ROLE,
+]
+
+# Ranks that must host ≥ WEEKLY_QUOTA events per week (demotion risk).
+MANDATED_ROLES = {LIEUTENANT_ROLE, COMMANDER_ROLE}
+
+# Map a ladder role name → arc_hierarchy rank key (for demotion).
+RANK_KEY_BY_ROLE = {
+    PETTY_OFFICER_ROLE: "petty_officer",
+    LIEUTENANT_ROLE:    "lieutenant",
+    COMMANDER_ROLE:     "commander",
+    GENERAL_ROLE:       "general",
 }
+
+# =====================
+# EVENT TITLES
+# =====================
+# Restricted "class" titles — ARC Lieutenant+ only, ARC-Security-only audience.
+RESTRICTED_TITLES = [
+    "Dscan and Threat Assessment",
+    "Scanning Class",
+    "Rolling Class",
+    "OpSec 101 Class",
+]
+# Open ops — any tracked officer, no RSVP role restriction.
+OPEN_TITLES = [
+    "Mining/PVE Fleet",
+    "PVP Hunt",
+    "Faction Warfare Fleet",
+]
+ALL_TITLES = RESTRICTED_TITLES + OPEN_TITLES
+
+
+def is_restricted_title(title: str) -> bool:
+    return title in RESTRICTED_TITLES
+
 
 # =====================
 # PERSISTENCE
@@ -111,13 +116,31 @@ DATA_FILE = PERSIST_ROOT / "directives.json"
 _file_lock = asyncio.Lock()
 
 
-def _atomic_write(path: Path, data: Dict[str, Any]) -> None:
-    # Stored in MySQL kv_store under the old filename stem ("directives").
-    db.kv_save(path.stem, data)
+def utcnow_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
+
+def _monday_of(d: datetime.date) -> datetime.date:
+    return d - datetime.timedelta(days=d.weekday())
+
+
+def current_monday() -> str:
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    return _monday_of(today).isoformat()
 
 
 def _empty_data() -> Dict[str, Any]:
-    return {"cycle": {"start": utcnow_iso(), "officers": {}}, "panels": {}}
+    return {
+        "week_start":        current_monday(),
+        "hosts":             {},
+        "panels":            {},
+        "pending_demotions": {},
+    }
+
+
+def _atomic_write(path: Path, data: Dict[str, Any]) -> None:
+    # Stored in MySQL kv_store under the old filename stem ("directives").
+    db.kv_save(path.stem, data)
 
 
 async def load_data() -> Dict[str, Any]:
@@ -126,9 +149,18 @@ async def load_data() -> Dict[str, Any]:
             data = await asyncio.to_thread(db.kv_load, "directives", None)
             if not isinstance(data, dict) or not data:
                 return _empty_data()
-            data.setdefault("cycle", {"start": utcnow_iso(), "officers": {}})
+            # Drop any stale fields from the old focus-track schema and ensure
+            # the keys we rely on exist.
+            data.setdefault("week_start", current_monday())
+            data.setdefault("hosts", {})
             data.setdefault("panels", {})
-            data["cycle"].setdefault("officers", {})
+            data.setdefault("pending_demotions", {})
+            if not isinstance(data["hosts"], dict):
+                data["hosts"] = {}
+            if not isinstance(data["panels"], dict):
+                data["panels"] = {}
+            if not isinstance(data["pending_demotions"], dict):
+                data["pending_demotions"] = {}
             return data
         except Exception:
             return _empty_data()
@@ -139,46 +171,57 @@ async def save_data(data: Dict[str, Any]) -> None:
         await asyncio.to_thread(_atomic_write, DATA_FILE, data)
 
 
-def utcnow_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
+def _host_record(data: Dict[str, Any], uid: int) -> Dict[str, Any]:
+    rec = data["hosts"].get(str(uid))
+    if not isinstance(rec, dict):
+        rec = {"count": 0, "bonuses_awarded": 0, "events": []}
+        data["hosts"][str(uid)] = rec
+    rec.setdefault("count", 0)
+    rec.setdefault("bonuses_awarded", 0)
+    rec.setdefault("events", [])
+    return rec
 
 
 # =====================
-# CYCLE HELPERS
+# RANK HELPERS
 # =====================
 
-def _ensure_cycle(data: Dict[str, Any]) -> bool:
-    """Make sure a cycle exists. Returns True if it had to be (re)created."""
-    cycle = data.get("cycle")
-    if not isinstance(cycle, dict) or "start" not in cycle:
-        data["cycle"] = {"start": utcnow_iso(), "officers": {}}
-        return True
-    cycle.setdefault("officers", {})
-    return False
+def effective_rank_role(member: discord.Member) -> Optional[str]:
+    """Highest ladder role the member holds, or None if they hold none."""
+    held = {r.name for r in member.roles}
+    for role_name in reversed(RANK_LADDER):
+        if role_name in held:
+            return role_name
+    return None
 
 
-def _cycle_start_dt(data: Dict[str, Any]) -> datetime.datetime:
-    raw = data.get("cycle", {}).get("start") or utcnow_iso()
+def _rank_index(role_name: Optional[str]) -> int:
+    if role_name is None:
+        return -1
     try:
-        dt = datetime.datetime.fromisoformat(raw)
-    except Exception:
-        dt = datetime.datetime.utcnow()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-    return dt
+        return RANK_LADDER.index(role_name)
+    except ValueError:
+        return -1
 
 
-def _cycle_end_dt(data: Dict[str, Any]) -> datetime.datetime:
-    return _cycle_start_dt(data) + datetime.timedelta(days=CYCLE_DAYS)
+def is_tracked_officer(member: discord.Member) -> bool:
+    return effective_rank_role(member) is not None
 
 
-def _cycle_expired(data: Dict[str, Any]) -> bool:
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return now >= _cycle_end_dt(data)
+def is_lieutenant_or_above(member: discord.Member) -> bool:
+    return _rank_index(effective_rank_role(member)) >= _rank_index(LIEUTENANT_ROLE)
 
 
-def has_eligible_role(member: discord.Member) -> bool:
-    return any(r.name in ELIGIBLE_ROLES for r in member.roles)
+def is_general_or_above(member: discord.Member) -> bool:
+    return _rank_index(effective_rank_role(member)) >= _rank_index(GENERAL_ROLE)
+
+
+def is_mandated(member: discord.Member) -> bool:
+    return effective_rank_role(member) in MANDATED_ROLES
+
+
+def has_role(member: discord.Member, name: str) -> bool:
+    return discord.utils.get(member.roles, name=name) is not None
 
 
 # =====================
@@ -199,72 +242,105 @@ async def _log(guild: discord.Guild, message: str) -> None:
 
 
 # =====================
-# EMBED BUILDER
+# EMBED BUILDERS
 # =====================
 
-def _progress_bar(completions: int) -> str:
-    done = min(completions, GOAL)
-    return "✅" * done + "⬜" * max(0, GOAL - done)
+def _week_range_str(week_start: str) -> str:
+    try:
+        start = datetime.date.fromisoformat(week_start)
+    except Exception:
+        start = datetime.date.today()
+    end = start + datetime.timedelta(days=6)
+    return f"{start.isoformat()} → {end.isoformat()} (UTC)"
 
 
-def build_focus_embed(
-    focus_key: str,
+def _leaderboard_lines(
     data: Dict[str, Any],
-    guild: Optional[discord.Guild] = None,
-) -> discord.Embed:
-    focus = FOCUSES[focus_key]
+    guild: discord.Guild,
+    predicate,
+) -> str:
+    """Render this week's host counts for members matching `predicate`."""
+    hosts = data.get("hosts", {})
+    rows: List[Tuple[str, int]] = []
+    for uid, rec in hosts.items():
+        m = guild.get_member(int(uid))
+        if not m or not predicate(m):
+            continue
+        rows.append((m.display_name, int(rec.get("count", 0))))
+    if not rows:
+        return "_(no events hosted yet this week)_"
+    rows.sort(key=lambda r: r[1], reverse=True)
+    out = []
+    for name, c in rows:
+        trophy = " 🏆" if c >= WEEKLY_QUOTA else ""
+        out.append(f"• {name} — **{c}** event(s){trophy}")
+    return "\n".join(out)
 
-    bullets = "\n".join(f"• {r}" for r in focus["requirements"])
+
+def build_petty_embed(data: Dict[str, Any], guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(
-        title=focus["label"],
+        title="🎯 ARC Directives — Petty Officer Ops",
         description=(
-            f"_{focus['blurb']}_\n\n"
-            f"**Complete {GOAL} of the following per week:**\n{bullets}\n\n"
-            f"_An op only counts when the creator + at least 1 other member "
-            f"attend (≥15 min). Reach {GOAL}/{GOAL} to earn a "
-            f"**{GOAL_BONUS_AP} AP** bonus._"
+            "Host fleets to support the corp. Every **3 events** you host in a "
+            f"week earns a **{AP_BONUS} AP** bonus (repeatable).\n\n"
+            "Use **Create Event** below to schedule one of the available ops."
         ),
-        color=focus["color"],
+        color=discord.Color.teal(),
         timestamp=datetime.datetime.utcnow(),
     )
-
     embed.add_field(
-        name="✅ Approved Event Titles",
-        value="\n".join(f"• `{t}`" for t in focus["titles"]),
+        name="🚀 Available Ops (ARC Security only or both corps)",
+        value="\n".join(f"• `{t}`" for t in OPEN_TITLES),
         inline=False,
     )
-
-    officers = data.get("cycle", {}).get("officers", {})
-    signed: List[Tuple[str, Dict[str, Any]]] = [
-        (uid, off) for uid, off in officers.items()
-        if off.get("focus") == focus_key
-    ]
-
-    if signed:
-        lines = []
-        for uid, off in sorted(
-            signed, key=lambda kv: int(kv[1].get("completions", 0)), reverse=True
-        ):
-            m = guild.get_member(int(uid)) if guild else None
-            name = m.display_name if m else f"<@{uid}>"
-            c = int(off.get("completions", 0))
-            trophy = " 🏆" if c >= GOAL else ""
-            lines.append(f"• {name} — **{c}/{GOAL}** {_progress_bar(c)}{trophy}")
-        value = "\n".join(lines)
-    else:
-        value = "_(no officers signed up yet)_"
-
     embed.add_field(
-        name=f"🎖 Signed-up Officers ({len(signed)})",
-        value=value,
+        name="🏅 This Week",
+        value=_leaderboard_lines(
+            data, guild,
+            lambda m: effective_rank_role(m) == PETTY_OFFICER_ROLE,
+        ),
         inline=False,
     )
-
-    end_ts = int(_cycle_end_dt(data).timestamp())
-    embed.add_field(name="🔄 Cycle Ends", value=f"<t:{end_ts}:R>", inline=False)
-    embed.set_footer(
-        text="Sign up for ONE focus per week • ARC Lieutenant & ARC Commander"
+    embed.add_field(
+        name="🗓 Week", value=_week_range_str(data.get("week_start", "")), inline=False
     )
+    embed.set_footer(text="ARC Petty Officer • host events, earn AP")
+    return embed
+
+
+def build_officer_embed(data: Dict[str, Any], guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎖 ARC Directives — Officer Ops",
+        description=(
+            "Host fleets and run classes. Every **3 events** you host in a week "
+            f"earns a **{AP_BONUS} AP** bonus (repeatable).\n\n"
+            f"**ARC Lieutenant & ARC Commander must host at least {WEEKLY_QUOTA} "
+            "events per week** (Monday→Sunday) unless justified to **ARC General "
+            "or above** — otherwise you may be demoted.\n\n"
+            "Use **Create Event** below to schedule an op or class."
+        ),
+        color=discord.Color.dark_gold(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    embed.add_field(
+        name="🎓 Classes (ARC Lieutenant+ · ARC Security audience)",
+        value="\n".join(f"• `{t}`" for t in RESTRICTED_TITLES),
+        inline=False,
+    )
+    embed.add_field(
+        name="🚀 Fleets / Ops (ARC Security only or both corps)",
+        value="\n".join(f"• `{t}`" for t in OPEN_TITLES),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏅 This Week",
+        value=_leaderboard_lines(data, guild, is_lieutenant_or_above),
+        inline=False,
+    )
+    embed.add_field(
+        name="🗓 Week", value=_week_range_str(data.get("week_start", "")), inline=False
+    )
+    embed.set_footer(text="ARC Lieutenant and above • mandated: 3 events / week")
     return embed
 
 
@@ -273,10 +349,7 @@ def build_focus_embed(
 # =====================
 
 class DirectiveEventModal(discord.ui.Modal):
-    """
-    Collects the remaining event details after a title has been picked.
-    Title is preset (from the select) and audience is forced to ARC-Security-only.
-    """
+    """Collects remaining event details after a title has been picked."""
 
     description = discord.ui.TextInput(
         label="Description",
@@ -297,12 +370,27 @@ class DirectiveEventModal(discord.ui.Modal):
         max_length=120,
     )
 
-    def __init__(self, focus_key: str, title_value: str):
+    def __init__(self, title_value: str, target: str):
         super().__init__(title=f"Create Op — {title_value[:40]}")
-        self.focus_key   = focus_key
         self.title_value = title_value
+        # Restricted class events are always ARC-Security-only; open ops carry
+        # the audience the host chose ("security_only" or "public" = both corps).
+        self.target = "security_only" if is_restricted_title(title_value) else target
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Re-validate permission at submit time (roles may have changed).
+        member = interaction.user
+        if is_restricted_title(self.title_value) and (
+            not isinstance(member, discord.Member)
+            or not is_lieutenant_or_above(member)
+        ):
+            await interaction.response.send_message(
+                f"❌ Only **{LIEUTENANT_ROLE}** or above can run **"
+                f"{self.title_value}**.",
+                ephemeral=True,
+            )
+            return
+
         # Validate date with pure Python before any async I/O.
         try:
             dt = datetime.datetime.strptime(
@@ -329,12 +417,12 @@ class DirectiveEventModal(discord.ui.Modal):
 
         await interaction.response.defer(ephemeral=True)
 
-        data        = await load_data()
-        cycle_start = data.get("cycle", {}).get("start")
+        data       = await load_data()
+        week_start = data.get("week_start", current_monday())
 
         partial = {
             "creator_id":   interaction.user.id,
-            "target":       "security_only",
+            "target":       self.target,
             "event_name":   self.title_value,
             "description":  self.description.value.strip(),
             "timestamp":    int(dt.timestamp()),
@@ -344,13 +432,13 @@ class DirectiveEventModal(discord.ui.Modal):
         }
         extra = {
             "directive_officer_id":  interaction.user.id,
-            "directive_focus":       self.focus_key,
-            "directive_cycle_start": cycle_start,
-            "restrict_role":         RESTRICT_ROLE,
+            "directive_cycle_start": week_start,
         }
+        # Only the restricted class events gate RSVP to ARC Security.
+        if is_restricted_title(self.title_value):
+            extra["restrict_role"] = RESTRICT_ROLE
 
-        # Reuse the Event cog's full posting pipeline (channel/permission checks,
-        # persistence, persistent-view registration, confirmation followup).
+        # Reuse the Event cog's full posting pipeline.
         try:
             from cogs.event_creator import _do_post_event
         except Exception as e:
@@ -363,14 +451,10 @@ class DirectiveEventModal(discord.ui.Modal):
 
 
 class TitleSelect(discord.ui.Select):
-    def __init__(self, focus_key: str):
-        self.focus_key = focus_key
-        options = [
-            discord.SelectOption(label=t, value=t)
-            for t in FOCUSES[focus_key]["titles"]
-        ]
+    def __init__(self, titles: List[str]):
+        options = [discord.SelectOption(label=t, value=t) for t in titles]
         super().__init__(
-            placeholder="Choose the approved op title…",
+            placeholder="Choose the op title…",
             min_values=1,
             max_values=1,
             options=options,
@@ -378,58 +462,136 @@ class TitleSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         title = self.values[0]
-        await interaction.response.send_modal(
-            DirectiveEventModal(self.focus_key, title)
+        # Restricted classes are ARC-Security-only — skip straight to the modal.
+        if is_restricted_title(title):
+            await interaction.response.send_modal(
+                DirectiveEventModal(title, "security_only")
+            )
+            return
+        # Open ops let the host pick the audience (ARC Security only / both corps).
+        await interaction.response.send_message(
+            f"Choose the audience for **{title}**:",
+            view=AudienceView(title),
+            ephemeral=True,
         )
 
 
 class TitleSelectView(discord.ui.View):
-    def __init__(self, focus_key: str):
+    def __init__(self, titles: List[str]):
         super().__init__(timeout=300)
-        self.add_item(TitleSelect(focus_key))
+        self.add_item(TitleSelect(titles))
 
 
-# =====================
-# PANEL BUTTONS / VIEW
-# =====================
-
-class SignupButton(discord.ui.Button):
-    def __init__(self, focus_key: str):
-        super().__init__(
-            label="✅ Sign Up",
-            style=discord.ButtonStyle.success,
-            custom_id=f"directive:signup:{focus_key}",
-        )
-        self.focus_key = focus_key
+class AudienceButton(discord.ui.Button):
+    def __init__(self, title_value: str, target: str, label: str, style):
+        super().__init__(label=label, style=style)
+        self.title_value = title_value
+        self.target = target
 
     async def callback(self, interaction: discord.Interaction):
-        cog = interaction.client.cogs.get("DirectiveCog")
-        if cog:
-            await cog.handle_signup(interaction, self.focus_key)
+        await interaction.response.send_modal(
+            DirectiveEventModal(self.title_value, self.target)
+        )
 
 
-class CreateEventButton(discord.ui.Button):
-    def __init__(self, focus_key: str):
+class AudienceView(discord.ui.View):
+    """Audience picker shown for the open (non-restricted) ops."""
+
+    def __init__(self, title_value: str):
+        super().__init__(timeout=300)
+        self.add_item(AudienceButton(
+            title_value, "security_only",
+            "🔒 ARC Security only", discord.ButtonStyle.secondary,
+        ))
+        self.add_item(AudienceButton(
+            title_value, "public",
+            "🌐 Both Corps (Security + Subsidized)", discord.ButtonStyle.primary,
+        ))
+
+
+# =====================
+# PANEL VIEWS
+# =====================
+
+class PettyCreateButton(discord.ui.Button):
+    def __init__(self):
         super().__init__(
-            label="⚔️ Create Event",
+            label="🚀 Create Event",
             style=discord.ButtonStyle.primary,
-            custom_id=f"directive:create:{focus_key}",
+            custom_id="directive:create:petty",
         )
-        self.focus_key = focus_key
 
     async def callback(self, interaction: discord.Interaction):
         cog = interaction.client.cogs.get("DirectiveCog")
         if cog:
-            await cog.handle_create_event(interaction, self.focus_key)
+            await cog.handle_create(interaction, OPEN_TITLES, require_lt=False)
 
 
-class FocusPanelView(discord.ui.View):
-    """Permanent per-focus panel: Sign Up + Create Event."""
+class OfficerCreateButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="🎖 Create Event",
+            style=discord.ButtonStyle.primary,
+            custom_id="directive:create:officer",
+        )
 
-    def __init__(self, focus_key: str):
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.cogs.get("DirectiveCog")
+        if cog:
+            await cog.handle_create(interaction, ALL_TITLES, require_lt=True)
+
+
+class PettyPanelView(discord.ui.View):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(SignupButton(focus_key))
-        self.add_item(CreateEventButton(focus_key))
+        self.add_item(PettyCreateButton())
+
+
+class OfficerPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(OfficerCreateButton())
+
+
+# =====================
+# DEMOTION PROMPT VIEW
+# =====================
+
+class DemotionJustifyButton(discord.ui.Button):
+    def __init__(self, uid: int):
+        super().__init__(
+            label="✅ Justify",
+            style=discord.ButtonStyle.success,
+            custom_id=f"directive:justify:{uid}",
+        )
+        self.uid = uid
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.cogs.get("DirectiveCog")
+        if cog:
+            await cog.handle_demotion_decision(interaction, self.uid, demote=False)
+
+
+class DemotionDemoteButton(discord.ui.Button):
+    def __init__(self, uid: int):
+        super().__init__(
+            label="⬇️ Demote",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"directive:demote:{uid}",
+        )
+        self.uid = uid
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.cogs.get("DirectiveCog")
+        if cog:
+            await cog.handle_demotion_decision(interaction, self.uid, demote=True)
+
+
+class DemotionPromptView(discord.ui.View):
+    def __init__(self, uid: int):
+        super().__init__(timeout=None)
+        self.add_item(DemotionJustifyButton(uid))
+        self.add_item(DemotionDemoteButton(uid))
 
 
 # =====================
@@ -437,7 +599,7 @@ class FocusPanelView(discord.ui.View):
 # =====================
 
 class DirectiveCog(commands.Cog):
-    """ARC Weekly Directives — three focus tracks with weekly reset."""
+    """ARC Officer Activity Tracker — weekly host counts, AP bonuses, demotions."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -454,14 +616,25 @@ class DirectiveCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # Register the three persistent focus views (survive restarts).
-        for fk in FOCUSES:
-            self.bot.add_view(FocusPanelView(fk))
+        # Persistent panel views.
+        self.bot.add_view(PettyPanelView())
+        self.bot.add_view(OfficerPanelView())
 
         async with self._data_lock:
             data = await load_data()
-            if _ensure_cycle(data):
-                await save_data(data)
+            await save_data(data)
+
+        # Re-bind any open demotion prompts so their buttons keep working.
+        for guild in self.bot.guilds:
+            pend = data.get("pending_demotions", {}).get(str(guild.id), {})
+            if isinstance(pend, dict):
+                for uid, msg_id in pend.items():
+                    try:
+                        self.bot.add_view(
+                            DemotionPromptView(int(uid)), message_id=int(msg_id)
+                        )
+                    except Exception:
+                        pass
 
         for guild in self.bot.guilds:
             await self._ensure_panels(guild)
@@ -478,37 +651,36 @@ class DirectiveCog(commands.Cog):
             return None
 
     async def _ensure_panels(self, guild: discord.Guild) -> None:
-        """Post or refresh the three focus panels in #arc-directives."""
+        """Post or refresh the two panels in #arc-directives."""
         ch = await self._get_directives_channel(guild)
         if not ch:
             return
 
         async with self._data_lock:
             data = await load_data()
-            _ensure_cycle(data)
             panels = data.setdefault("panels", {})
             gp = panels.get(str(guild.id))
-            if not isinstance(gp, dict):   # migrate stale/old-format value
+            if not isinstance(gp, dict):
                 gp = {}
                 panels[str(guild.id)] = gp
             changed = False
 
-            for fk in FOCUSES:
-                embed = build_focus_embed(fk, data, guild)
-                view  = FocusPanelView(fk)
-                msg_id = gp.get(fk)
-
+            specs = [
+                ("petty",   build_petty_embed(data, guild),   PettyPanelView()),
+                ("officer", build_officer_embed(data, guild), OfficerPanelView()),
+            ]
+            for key, embed, view in specs:
+                msg_id = gp.get(key)
                 if msg_id:
                     try:
                         existing = await ch.fetch_message(int(msg_id))
                         await existing.edit(embed=embed, view=view)
                         continue
                     except Exception:
-                        pass  # message gone — fall through and repost
-
+                        pass  # message gone — repost
                 try:
                     msg = await ch.send(embed=embed, view=view)
-                    gp[fk] = msg.id
+                    gp[key] = msg.id
                     changed = True
                 except Exception:
                     pass
@@ -519,7 +691,7 @@ class DirectiveCog(commands.Cog):
     async def _refresh_panels(
         self, guild: discord.Guild, data: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Edit all three existing focus panel messages with fresh embeds."""
+        """Edit both existing panel messages with fresh embeds."""
         if data is None:
             data = await load_data()
         ch = discord.utils.get(guild.text_channels, name=DIRECTIVES_CHANNEL)
@@ -528,25 +700,30 @@ class DirectiveCog(commands.Cog):
         gp = data.get("panels", {}).get(str(guild.id), {})
         if not isinstance(gp, dict):
             return
-        for fk in FOCUSES:
-            msg_id = gp.get(fk)
+        specs = [
+            ("petty",   build_petty_embed(data, guild),   PettyPanelView()),
+            ("officer", build_officer_embed(data, guild), OfficerPanelView()),
+        ]
+        for key, embed, view in specs:
+            msg_id = gp.get(key)
             if not msg_id:
                 continue
             try:
                 msg = await ch.fetch_message(int(msg_id))
-                await msg.edit(
-                    embed=build_focus_embed(fk, data, guild),
-                    view=FocusPanelView(fk),
-                )
+                await msg.edit(embed=embed, view=view)
             except Exception:
                 pass
 
     # ------------------------------------------------------------------
-    # Button handlers
+    # Create-event button handler
     # ------------------------------------------------------------------
 
-    async def handle_signup(
-        self, interaction: discord.Interaction, focus_key: str
+    async def handle_create(
+        self,
+        interaction: discord.Interaction,
+        titles: List[str],
+        *,
+        require_lt: bool,
     ) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
@@ -555,85 +732,24 @@ class DirectiveCog(commands.Cog):
             return
 
         member = interaction.user
-        if not has_eligible_role(member):
-            await interaction.response.send_message(
-                "❌ Only **ARC Lieutenant** and **ARC Commander** can sign up "
-                "for a weekly focus.",
-                ephemeral=True,
-            )
-            return
-
-        focus = FOCUSES[focus_key]
-
-        async with self._data_lock:
-            data = await load_data()
-            _ensure_cycle(data)
-            officers = data["cycle"]["officers"]
-            uid = str(member.id)
-            existing = officers.get(uid)
-
-            if existing and existing.get("focus") == focus_key:
+        if require_lt:
+            if not is_lieutenant_or_above(member):
                 await interaction.response.send_message(
-                    f"You are already signed up for **{focus['label']}** "
-                    f"(**{int(existing.get('completions', 0))}/{GOAL}**).",
+                    f"❌ This panel is for **{LIEUTENANT_ROLE}** and above.",
+                    ephemeral=True,
+                )
+                return
+        else:
+            if not is_tracked_officer(member):
+                await interaction.response.send_message(
+                    "❌ Only ARC officers can host directive events.",
                     ephemeral=True,
                 )
                 return
 
-            if existing:
-                # Switch focus — progress carries over.
-                old_focus = existing.get("focus")
-                existing["focus"] = focus_key
-                carried = int(existing.get("completions", 0))
-                reply = (
-                    f"🔁 Switched to **{focus['label']}**.\n"
-                    f"Your progress carried over: **{carried}/{GOAL}**."
-                )
-                log_line = (
-                    f"🔁 **{member.display_name}** switched focus "
-                    f"({FOCUSES.get(old_focus, {}).get('label', old_focus)} → "
-                    f"{focus['label']}) — carried **{carried}/{GOAL}**"
-                )
-            else:
-                officers[uid] = {"focus": focus_key, "completions": 0, "events": []}
-                reply = (
-                    f"✅ Signed up for **{focus['label']}**!\n"
-                    f"Goal: complete **{GOAL}** approved ops this week."
-                )
-                log_line = (
-                    f"✅ **{member.display_name}** signed up for {focus['label']}"
-                )
-
-            await save_data(data)
-
-        await interaction.response.send_message(reply, ephemeral=True)
-        await self._refresh_panels(interaction.guild, data)
-        await _log(interaction.guild, log_line)
-
-    async def handle_create_event(
-        self, interaction: discord.Interaction, focus_key: str
-    ) -> None:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message(
-                "Must be used in a server.", ephemeral=True
-            )
-            return
-
-        focus = FOCUSES[focus_key]
-        data = await load_data()
-        off = data.get("cycle", {}).get("officers", {}).get(str(interaction.user.id))
-
-        if not off or off.get("focus") != focus_key:
-            await interaction.response.send_message(
-                f"❌ You must **Sign Up** for {focus['label']} before creating "
-                "its events.",
-                ephemeral=True,
-            )
-            return
-
         await interaction.response.send_message(
-            f"Select the approved title for your **{focus['label']}** op:",
-            view=TitleSelectView(focus_key),
+            "Select the op title to create:",
+            view=TitleSelectView(titles),
             ephemeral=True,
         )
 
@@ -645,15 +761,11 @@ class DirectiveCog(commands.Cog):
         self, event: Dict[str, Any], *, force: bool = False
     ) -> str:
         """
-        Tick an officer's directive progress for a finalized event.
+        Tick an officer's weekly host count for a finalized event and award the
+        200-AP-per-3-events bonus when a new multiple of 3 is reached.
 
-        Normally called by the Event cog on finalize.  Pass ``force=True`` (used
-        by the /directive_credit admin command) to bypass the VC-attendance gate
-        and credit the op manually.
-
-        Returns a short status code describing the outcome:
-          "no_directive" | "not_qualified" | "wrong_cycle" |
-          "no_officer" | "already_credited" | "credited"
+        Returns one of:
+          "no_directive" | "not_qualified" | "wrong_cycle" | "credited"
         """
         officer_id = event.get("directive_officer_id")
         if not officer_id:
@@ -662,7 +774,7 @@ class DirectiveCog(commands.Cog):
         guild_id = event.get("guild_id")
         guild = self.bot.get_guild(int(guild_id)) if guild_id else None
 
-        # ── Minimum attendance: creator + at least 1 other (≥15 min in VC) ────
+        # Minimum attendance: creator + at least 1 other (≥15 min in VC).
         # Skipped when force=True (admin manually vouching for the op).
         if not force:
             qualified = [
@@ -683,40 +795,39 @@ class DirectiveCog(commands.Cog):
                 return "not_qualified"
 
         event_key = event.get("short_id") or event.get("message")
-        bonus_now = False
+        new_bonuses = 0
+        count = 0
         async with self._data_lock:
             data = await load_data()
-            _ensure_cycle(data)
 
-            # Ignore stragglers finalized after a reset started a new cycle.
-            if event.get("directive_cycle_start") != data["cycle"]["start"]:
+            # Ignore stragglers finalized after a Monday rollover.
+            if event.get("directive_cycle_start") != data.get("week_start"):
                 return "wrong_cycle"
 
-            off = data["cycle"]["officers"].get(str(officer_id))
-            if not off:
-                return "no_officer"  # officer withdrew / was cleared
+            rec = _host_record(data, int(officer_id))
 
-            # Don't double-count an event that was already credited.
+            # Don't double-count an already-credited event.
             already = any(
                 e.get("event_id") == event_key
-                for e in off.get("events", [])
+                for e in rec.get("events", [])
                 if isinstance(e, dict)
             )
             if event_key is not None and already:
-                return "already_credited"
+                return "credited"
 
-            off["completions"] = int(off.get("completions", 0)) + 1
-            off.setdefault("events", []).append({
+            rec["count"] = int(rec.get("count", 0)) + 1
+            rec.setdefault("events", []).append({
                 "title":        event.get("title"),
                 "event_id":     event_key,
                 "finalized_at": utcnow_iso(),
             })
-            completions = off["completions"]
+            count = rec["count"]
 
-            # Weekly-goal bonus — awarded exactly once per officer per cycle.
-            if completions >= GOAL and not off.get("goal_bonus_awarded"):
-                off["goal_bonus_awarded"] = True
-                bonus_now = True
+            # AP bonus: one 200-AP grant for every completed block of 3 events.
+            earned_blocks = count // AP_PER_EVENTS
+            new_bonuses = earned_blocks - int(rec.get("bonuses_awarded", 0))
+            if new_bonuses > 0:
+                rec["bonuses_awarded"] = earned_blocks
 
             await save_data(data)
 
@@ -724,73 +835,74 @@ class DirectiveCog(commands.Cog):
             await self._refresh_panels(guild, data)
             m = guild.get_member(int(officer_id))
             name = m.display_name if m else f"<@{officer_id}>"
-            done = " 🏆 **Goal met!**" if completions >= GOAL else ""
             await _log(
                 guild,
-                f"🏅 **{name}** finalized **{event.get('title')}** — "
-                f"**{completions}/{GOAL}** this week{done}",
+                f"🏅 **{name}** hosted **{event.get('title')}** — "
+                f"**{count}** event(s) this week.",
             )
-
-            if bonus_now:
-                awarded = await self._award_goal_bonus(guild, m) if m else False
+            if new_bonuses > 0 and m:
+                total = new_bonuses * AP_BONUS
+                awarded = await self._award_bonus(guild, m, total, count)
                 if awarded:
                     await _log(
                         guild,
-                        f"💰 **{name}** earned the **{GOAL_BONUS_AP} AP** weekly "
-                        f"directive goal bonus!",
+                        f"💰 **{name}** earned **{total} AP** for hosting "
+                        f"{count} events this week (3-event bonus).",
                     )
 
         return "credited"
 
-    async def _award_goal_bonus(
-        self, guild: discord.Guild, member: discord.Member
+    async def _award_bonus(
+        self, guild: discord.Guild, member: discord.Member, amount: int, count: int
     ) -> bool:
-        """Award the flat weekly-goal AP bonus via the AP system."""
+        """Award the flat 200-AP-per-3-events bonus via the AP system."""
         try:
             from cogs.ap_tracking import award_ap_with_bonuses
         except Exception as e:
-            print(f"[directive] goal bonus import failed: {e}")
+            print(f"[directive] bonus import failed: {e}")
             return False
         try:
             await award_ap_with_bonuses(
                 guild=guild,
                 earner=member,
-                base_amount=float(GOAL_BONUS_AP),
-                source="weekly directive goal",
-                reason=f"Completed the weekly directive goal ({GOAL}/{GOAL})",
+                base_amount=float(amount),
+                source="weekly directive activity",
+                reason=f"Hosted {count} events this week (3-event AP bonus)",
                 log=True,
                 actor=None,
                 distribution_embed=True,
-                distribution_title="Weekly Directive Goal Bonus",
+                distribution_title="Directive Activity Bonus",
             )
             return True
         except Exception as e:
-            print(f"[directive] goal bonus award failed: {e}")
+            print(f"[directive] bonus award failed: {e}")
             return False
 
     # ------------------------------------------------------------------
-    # Weekly reset loop
+    # Weekly rollover loop (Monday, UTC)
     # ------------------------------------------------------------------
 
     @tasks.loop(minutes=5)
     async def reset_check(self):
         async with self._data_lock:
             data = await load_data()
-            if _ensure_cycle(data):
-                await save_data(data)
-            if not _cycle_expired(data):
-                return
-            # Snapshot officers before clearing.
-            officers_snapshot = dict(data["cycle"]["officers"])
+            stored = data.get("week_start")
+            this_monday = current_monday()
+            if stored == this_monday:
+                return  # still the same week — nothing to do
+            # New week detected — snapshot last week's host counts.
+            hosts_snapshot = dict(data.get("hosts", {}))
 
-        # Post results to every guild's log channel.
+        # Post results + demotion prompts for every guild.
         for guild in self.bot.guilds:
-            await self._post_cycle_results(guild, officers_snapshot)
+            await self._post_week_results(guild, hosts_snapshot)
+            await self._post_demotion_prompts(guild, hosts_snapshot)
 
-        # Start a fresh cycle.
+        # Start the new week.
         async with self._data_lock:
             data = await load_data()
-            data["cycle"] = {"start": utcnow_iso(), "officers": {}}
+            data["week_start"] = current_monday()
+            data["hosts"] = {}
             await save_data(data)
 
         for guild in self.bot.guilds:
@@ -800,8 +912,8 @@ class DirectiveCog(commands.Cog):
     async def _before_reset_check(self):
         await self.bot.wait_until_ready()
 
-    async def _post_cycle_results(
-        self, guild: discord.Guild, officers: Dict[str, Any]
+    async def _post_week_results(
+        self, guild: discord.Guild, hosts: Dict[str, Any]
     ) -> None:
         ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL)
         if not ch:
@@ -811,84 +923,240 @@ class DirectiveCog(commands.Cog):
                 return
 
         embed = discord.Embed(
-            title="📊 Weekly Directive Results",
+            title="📊 Weekly Directive Activity",
             color=discord.Color.dark_blue(),
             timestamp=datetime.datetime.utcnow(),
         )
+        rows: List[Tuple[str, int, bool]] = []
+        for uid, rec in hosts.items():
+            m = guild.get_member(int(uid))
+            if not m or not is_tracked_officer(m):
+                continue
+            c = int(rec.get("count", 0))
+            rows.append((m.display_name, c, is_mandated(m)))
 
-        if not officers:
-            embed.description = "No officers signed up this cycle."
+        if not rows:
+            embed.description = "No officer events were hosted this week."
         else:
-            met = sum(
-                1 for off in officers.values()
-                if int(off.get("completions", 0)) >= GOAL
-            )
-            embed.description = (
-                f"**{len(officers)}** officer(s) participated — "
-                f"**{met}** met the {GOAL}-op goal. 🎯"
-            )
-            for fk, focus in FOCUSES.items():
-                members = [
-                    (uid, off) for uid, off in officers.items()
-                    if off.get("focus") == fk
-                ]
-                if not members:
-                    continue
-                lines = []
-                for uid, off in sorted(
-                    members, key=lambda kv: int(kv[1].get("completions", 0)),
-                    reverse=True,
-                ):
-                    m = guild.get_member(int(uid))
-                    name = m.display_name if m else f"<@{uid}>"
-                    c = int(off.get("completions", 0))
-                    status = "✅ Met goal" if c >= GOAL else "❌ Missed"
-                    lines.append(f"• {name} — **{c}/{GOAL}** — {status}")
-                embed.add_field(
-                    name=focus["label"], value="\n".join(lines), inline=False
-                )
-
+            rows.sort(key=lambda r: r[1], reverse=True)
+            lines = []
+            for name, c, mandated in rows:
+                if mandated:
+                    status = "✅" if c >= WEEKLY_QUOTA else "⚠️"
+                else:
+                    status = "🏅" if c >= AP_PER_EVENTS else "•"
+                lines.append(f"{status} {name} — **{c}** event(s)")
+            embed.description = "\n".join(lines)
         embed.set_footer(text="A new weekly cycle has begun.")
         try:
             await ch.send(embed=embed)
         except Exception:
             pass
 
+    async def _post_demotion_prompts(
+        self, guild: discord.Guild, hosts: Dict[str, Any]
+    ) -> None:
+        ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL)
+        if not ch:
+            return
+
+        tendeuse = discord.utils.get(guild.roles, name=TENDEUSE_ROLE)
+        ping = tendeuse.mention if tendeuse else f"@{TENDEUSE_ROLE}"
+
+        for member in guild.members:
+            if not is_mandated(member):
+                continue
+            rec = hosts.get(str(member.id))
+            count = int(rec.get("count", 0)) if isinstance(rec, dict) else 0
+            if count >= WEEKLY_QUOTA:
+                continue
+
+            rank = effective_rank_role(member) or "Officer"
+            embed = discord.Embed(
+                title="⚠️ Activity Shortfall — Action Required",
+                description=(
+                    f"{member.mention} (**{rank}**) hosted **{count}/"
+                    f"{WEEKLY_QUOTA}** events last week.\n\n"
+                    f"**{GENERAL_ROLE} or above:** press **Justify** if this is "
+                    "excused, or **Demote** to drop them one rank."
+                ),
+                color=discord.Color.red(),
+                timestamp=datetime.datetime.utcnow(),
+            )
+            embed.set_footer(text="Only ARC General or above may decide.")
+            try:
+                msg = await ch.send(
+                    content=ping,
+                    embed=embed,
+                    view=DemotionPromptView(member.id),
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
+            except Exception:
+                continue
+
+            async with self._data_lock:
+                data = await load_data()
+                pend = data.setdefault("pending_demotions", {})
+                gpend = pend.setdefault(str(guild.id), {})
+                gpend[str(member.id)] = msg.id
+                await save_data(data)
+
     # ------------------------------------------------------------------
-    # Admin slash command — repost / refresh the panels
+    # Demotion prompt button handler
+    # ------------------------------------------------------------------
+
+    async def handle_demotion_decision(
+        self, interaction: discord.Interaction, uid: int, *, demote: bool
+    ) -> None:
+        actor = interaction.user
+        guild = interaction.guild
+        if not guild or not isinstance(actor, discord.Member):
+            await interaction.response.send_message(
+                "Must be used in a server.", ephemeral=True
+            )
+            return
+
+        if not (is_general_or_above(actor) or has_role(actor, TENDEUSE_ROLE)):
+            await interaction.response.send_message(
+                f"❌ Only **{GENERAL_ROLE}** or above may decide this.",
+                ephemeral=True,
+            )
+            return
+
+        target = guild.get_member(int(uid))
+        target_name = target.display_name if target else f"<@{uid}>"
+
+        if not demote:
+            # Justified — clear the prompt.
+            await interaction.response.edit_message(
+                content=None,
+                embed=discord.Embed(
+                    title="✅ Justified",
+                    description=(
+                        f"{target_name}'s shortfall was **justified** by "
+                        f"{actor.mention}. No demotion."
+                    ),
+                    color=discord.Color.green(),
+                    timestamp=datetime.datetime.utcnow(),
+                ),
+                view=None,
+            )
+            await self._clear_pending(guild.id, uid)
+            await _log(
+                guild,
+                f"✅ {actor.display_name} justified {target_name}'s activity "
+                "shortfall — no demotion.",
+            )
+            return
+
+        # Demote one rank via the hierarchy cog.
+        if not target:
+            await interaction.response.edit_message(
+                content=None,
+                embed=discord.Embed(
+                    title="⚠️ Member Not Found",
+                    description=f"<@{uid}> is no longer in the server.",
+                    color=discord.Color.greyple(),
+                ),
+                view=None,
+            )
+            await self._clear_pending(guild.id, uid)
+            return
+
+        role_name = effective_rank_role(target)
+        rank_key = RANK_KEY_BY_ROLE.get(role_name)
+        if not rank_key:
+            await interaction.response.send_message(
+                f"❌ {target_name} is no longer at a demotable rank.",
+                ephemeral=True,
+            )
+            await self._clear_pending(guild.id, uid)
+            return
+
+        try:
+            from cogs.arc_hierarchy import (
+                apply_rank_change, update_flowchart, log_action, DEMOTE_TO,
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Hierarchy system unavailable: `{e}`", ephemeral=True
+            )
+            return
+
+        new_rank = DEMOTE_TO.get(rank_key)
+        if not new_rank:
+            await interaction.response.send_message(
+                f"❌ {target_name} cannot be demoted further.", ephemeral=True
+            )
+            await self._clear_pending(guild.id, uid)
+            return
+
+        await interaction.response.defer()
+        prev_rank, applied_rank = await apply_rank_change(target, new_rank)
+
+        await interaction.edit_original_response(
+            content=None,
+            embed=discord.Embed(
+                title="⬇️ Demoted",
+                description=(
+                    f"{target.mention} was demoted **{prev_rank} → {applied_rank}** "
+                    f"by {actor.mention} for an activity shortfall."
+                ),
+                color=discord.Color.dark_red(),
+                timestamp=datetime.datetime.utcnow(),
+            ),
+            view=None,
+        )
+        await self._clear_pending(guild.id, uid)
+        try:
+            await log_action(
+                guild,
+                f"Demotion (directive shortfall): {target.mention} "
+                f"**{prev_rank} → {applied_rank}** by {actor.mention}.",
+                mention_ids=[actor.id, target.id],
+            )
+            await update_flowchart(guild)
+        except Exception:
+            pass
+
+    async def _clear_pending(self, guild_id: int, uid: int) -> None:
+        async with self._data_lock:
+            data = await load_data()
+            gpend = data.get("pending_demotions", {}).get(str(guild_id))
+            if isinstance(gpend, dict):
+                gpend.pop(str(uid), None)
+                await save_data(data)
+
+    # ------------------------------------------------------------------
+    # Admin slash commands
     # ------------------------------------------------------------------
 
     @app_commands.command(
         name="directive_setup",
-        description="Re-post or refresh the three weekly Directive focus panels.",
+        description="Re-post or refresh the two Directive panels in #arc-directives.",
     )
     async def directive_setup(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not (
             interaction.user.guild_permissions.administrator
-            or has_eligible_role(interaction.user)
+            or is_lieutenant_or_above(interaction.user)
         ):
             await interaction.response.send_message(
-                "❌ Only admins, Lieutenants, and Commanders can use this.",
-                ephemeral=True,
+                "❌ Only admins or ARC Lieutenant+ can use this.", ephemeral=True
             )
             return
         await interaction.response.defer(ephemeral=True)
         await self._ensure_panels(interaction.guild)
         await interaction.followup.send(
-            f"✅ Directive focus panels refreshed in `#{DIRECTIVES_CHANNEL}`.",
+            f"✅ Directive panels refreshed in `#{DIRECTIVES_CHANNEL}`.",
             ephemeral=True,
         )
 
-    # ------------------------------------------------------------------
-    # Admin slash command — manually credit a directive op
-    # ------------------------------------------------------------------
-
     @app_commands.command(
         name="directive_credit",
-        description="Manually credit a directive op for its officer (bypasses the VC attendance check).",
+        description="Manually credit a hosted event toward an officer's weekly count.",
     )
     @app_commands.describe(
-        event_id="Event ID from the embed footer, e.g. EVT-A3F72B (the UUID prefix also works).",
+        event_id="Event ID from the embed footer, e.g. EVT-A3F72B (UUID prefix also works).",
     )
     async def directive_credit(
         self, interaction: discord.Interaction, event_id: str
@@ -897,7 +1165,7 @@ class DirectiveCog(commands.Cog):
             interaction.user.guild_permissions.administrator
         ):
             await interaction.response.send_message(
-                "❌ Only administrators can manually credit a directive op.",
+                "❌ Only administrators can manually credit an event.",
                 ephemeral=True,
             )
             return
@@ -912,7 +1180,6 @@ class DirectiveCog(commands.Cog):
             )
             return
 
-        # ── Find the event by short_id (or UUID prefix) ──────────────────────
         lookup = event_id.strip().upper()
         data   = await load_events()
         match_event: Optional[Dict[str, Any]] = None
@@ -926,18 +1193,14 @@ class DirectiveCog(commands.Cog):
 
         if match_event is None:
             await interaction.followup.send(
-                f"❌ No event found with ID **{event_id}**.\n"
-                "The Event ID is shown in the event embed footer, e.g. "
-                "`EVT-A3F72B`.",
-                ephemeral=True,
+                f"❌ No event found with ID **{event_id}**.", ephemeral=True
             )
             return
 
         if not match_event.get("directive_officer_id"):
             await interaction.followup.send(
                 f"❌ **{match_event.get('title', 'That event')}** is not a "
-                "directive op (no focus officer attached), so there's nothing "
-                "to credit.",
+                "directive op (no host attached), so there's nothing to credit.",
                 ephemeral=True,
             )
             return
@@ -949,18 +1212,12 @@ class DirectiveCog(commands.Cog):
         replies = {
             "credited":
                 f"✅ Credited **{title}** to <@{officer_id}> toward their weekly "
-                "directive goal.",
-            "already_credited":
-                f"ℹ️ **{title}** was already credited to <@{officer_id}> — "
-                "no change made.",
+                "host count.",
             "wrong_cycle":
-                f"⚠️ **{title}** belongs to a previous cycle (the week has since "
+                f"⚠️ **{title}** belongs to a previous week (the cycle has since "
                 "reset), so it can't be credited toward the current week.",
-            "no_officer":
-                f"⚠️ <@{officer_id}> isn't signed up for a focus this cycle, so "
-                "there's nothing to credit. They need to **Sign Up** first.",
             "no_directive":
-                f"❌ **{title}** has no directive officer attached.",
+                f"❌ **{title}** has no directive host attached.",
         }
         await interaction.followup.send(
             replies.get(status, f"⚠️ Unexpected result: `{status}`"),
