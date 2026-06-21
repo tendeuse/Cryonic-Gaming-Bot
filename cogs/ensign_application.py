@@ -1,14 +1,14 @@
-# cogs/lieutenant_application.py
+# cogs/ensign_application.py
 #
-# Lieutenant Role Application
-# ===========================
-# - Posts a persistent "Apply for Lieutenant" button panel in a channel.
+# Ensign Role Application
+# =======================
+# - Posts a persistent "Apply for Ensign" button panel in a channel.
 # - Clicking the button opens a DM with the applicant and asks the application
 #   questions ONE AT A TIME — the applicant answers each by replying in the DM.
 # - When finished, the bot builds a Q&A .txt file (named after the applicant)
 #   and delivers it BOTH:
 #       • as a DM to the configured recipient (RECIPIENT_USER_ID), and
-#       • to the #lieutenant-applications review channel (auto-created if missing).
+#       • to the #ensign-applications review channel (auto-created if missing).
 # - The panel survives restarts (stored message ID; no duplicate on reconnect).
 # - One active application per user at a time; "cancel" aborts; sessions time out.
 #
@@ -19,7 +19,7 @@
 #   unfinished applicant, and a background sweeper expires idle sessions.
 #
 # Manual command:
-#   /lieutenant_setup  — post / refresh the application panel (leadership only)
+#   /ensign_setup  — post / refresh the application panel (leadership only)
 
 import asyncio
 import io
@@ -39,19 +39,19 @@ from . import db
 # CONFIG
 # ============================================================
 
-# Channel where the "Apply for Lieutenant" panel is posted (members click here).
-PANEL_CHANNEL_NAME = "lieutenant-applications"
+# Channel where the "Apply for Ensign" panel is posted (members click here).
+PANEL_CHANNEL_NAME = "ensign-applications"
 
 # Separate, leadership-only channel where completed application transcripts
 # (the Q&A logs) are posted for review.
-REVIEW_CHANNEL_NAME = "lieutenant-app-review"
+REVIEW_CHANNEL_NAME = "ensign-app-review"
 
 # Discord user ID that receives the completed Q&A file via DM.
 # Leave as 0 to skip the DM (the review channel still gets the file).
-# Can also be overridden via the LIEUTENANT_APP_RECIPIENT_ID environment variable.
-RECIPIENT_USER_ID = int(os.getenv("LIEUTENANT_APP_RECIPIENT_ID", "306935804054208523"))
+# Can also be overridden via the ENSIGN_APP_RECIPIENT_ID environment variable.
+RECIPIENT_USER_ID = int(os.getenv("ENSIGN_APP_RECIPIENT_ID", "306935804054208523"))
 
-# Roles allowed to run /lieutenant_setup.
+# Roles allowed to run /ensign_setup.
 SETUP_ROLES: tuple[str, ...] = (
     "ARC Security Administration Council",
     "ARC Security Corporation Leader",
@@ -76,14 +76,14 @@ QUESTIONS: List[str] = [
     "How many hours per week can you realistically dedicate to server duties?",
     "Have you ever held a moderation/officer role on this or another server? "
     "If so, describe your experience.",
-    "Lieutenants are required to host a minimum of 3 events/classes per week. "
+    "Ensigns are required to host a minimum of 3 events/classes per week. "
     "Are you able to commit to this? If yes, what types of events/classes would "
     "you propose hosting?",
     "How would you approach training and onboarding new members so they feel "
     "welcomed and understand the rules?",
     "Describe a time you had to handle a conflict or disagreement between members. "
     "How did you resolve it?",
-    "What do you think makes a good Lieutenant/officer, and why do you think "
+    "What do you think makes a good Ensign/officer, and why do you think "
     "you'd be a good fit?",
     "Are there any times you're regularly unavailable (work, school, etc.) that "
     "we should know about?",
@@ -96,7 +96,7 @@ QUESTIONS: List[str] = [
 
 PERSIST_ROOT = Path(os.getenv("PERSIST_ROOT", "/data"))
 PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
-DATA_FILE = PERSIST_ROOT / "lieutenant_application.json"
+DATA_FILE = PERSIST_ROOT / "ensign_application.json"
 
 _file_lock: Optional[asyncio.Lock] = None
 
@@ -109,20 +109,20 @@ def _get_lock() -> asyncio.Lock:
 
 
 def _atomic_write(data: Dict[str, Any]) -> None:
-    db.kv_save("lieutenant_application", data)
+    db.kv_save("ensign_application", data)
 
 
 async def _load() -> Dict[str, Any]:
     async with _get_lock():
         try:
             data = await asyncio.to_thread(
-                db.kv_load, "lieutenant_application", {"panels": {}, "sessions": {}}
+                db.kv_load, "ensign_application", {"panels": {}, "sessions": {}}
             )
             data.setdefault("panels", {})
             data.setdefault("sessions", {})
             return data
         except Exception as e:
-            print(f"[lieutenant_application] Data load error: {e} — using defaults")
+            print(f"[ensign_application] Data load error: {e} — using defaults")
             return {"panels": {}, "sessions": {}}
 
 
@@ -151,7 +151,7 @@ def _safe_filename(name: str) -> str:
 def _build_transcript(applicant: discord.abc.User, answers: List[str]) -> str:
     lines: List[str] = [
         "=" * 60,
-        "  LIEUTENANT ROLE APPLICATION",
+        "  ENSIGN ROLE APPLICATION",
         f"  Applicant : {applicant} (ID: {applicant.id})",
         f"  Submitted : {_utcnow()}",
         "=" * 60,
@@ -173,12 +173,12 @@ def _build_transcript(applicant: discord.abc.User, answers: List[str]) -> str:
 
 def _build_panel_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="🎖️ Lieutenant Role Application",
+        title="🎖️ Ensign Role Application",
         description=(
-            "Interested in becoming a **Lieutenant**? Lieutenants organize and "
+            "Interested in becoming an **Ensign**? Ensigns organize and "
             "lead corporation activities and help train new pilots "
             "(minimum **3 events/classes per week**).\n\n"
-            "Click **Apply for Lieutenant** below and the bot will message you "
+            "Click **Apply for Ensign** below and the bot will message you "
             "the application questions **one at a time** here in your DMs — just "
             "reply to each.\n\n"
             f"You can type **`{CANCEL_WORD}`** at any time to stop.\n"
@@ -186,29 +186,29 @@ def _build_panel_embed() -> discord.Embed:
         ),
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text="Cryonic Gaming — Lieutenant Applications")
+    embed.set_footer(text="Cryonic Gaming — Ensign Applications")
     return embed
 
 
-class LieutenantPanelView(discord.ui.View):
+class EnsignPanelView(discord.ui.View):
     """Persistent panel view. Stable custom_id so it survives restarts."""
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Apply for Lieutenant",
+        label="Apply for Ensign",
         style=discord.ButtonStyle.primary,
         emoji="🎖️",
-        custom_id="lieutenant_application:apply",
+        custom_id="ensign_application:apply",
     )
     async def apply(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        cog: Optional["LieutenantApplicationCog"] = interaction.client.cogs.get(
-            "LieutenantApplicationCog"
+        cog: Optional["EnsignApplicationCog"] = interaction.client.cogs.get(
+            "EnsignApplicationCog"
         )  # type: ignore
         if cog is None:
             await interaction.response.send_message(
@@ -222,8 +222,8 @@ class LieutenantPanelView(discord.ui.View):
 # COG
 # ============================================================
 
-class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
-    """DM-based Lieutenant role application with a persistent button panel."""
+class EnsignApplicationCog(commands.Cog, name="EnsignApplicationCog"):
+    """DM-based Ensign role application with a persistent button panel."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -249,14 +249,14 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        self.bot.add_view(LieutenantPanelView())
+        self.bot.add_view(EnsignPanelView())
 
         data = await _load()
         for guild in self.bot.guilds:
             try:
                 await self._ensure_panel(guild, data)
             except Exception as e:
-                print(f"[lieutenant_application] Panel setup error in '{guild.name}': {e}")
+                print(f"[ensign_application] Panel setup error in '{guild.name}': {e}")
         await _save(data)
 
         if not self._resumed:
@@ -279,12 +279,12 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
                     continue
                 dm = user.dm_channel or await user.create_dm()
                 await dm.send(
-                    "👋 I'm back online — let's pick up your **Lieutenant "
+                    "👋 I'm back online — let's pick up your **Ensign "
                     "application** right where we left off."
                 )
                 await self._send_question(dm, idx)
             except Exception as e:
-                print(f"[lieutenant_application] Could not resume session {key}: {e}")
+                print(f"[ensign_application] Could not resume session {key}: {e}")
 
     # ----------------------------------------------------------------
     # Channel helpers
@@ -315,13 +315,13 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
             ch = await guild.create_text_channel(
                 PANEL_CHANNEL_NAME,
                 overwrites=overwrites,
-                reason="Lieutenant Application System — panel channel",
+                reason="Ensign Application System — panel channel",
             )
-            print(f"[lieutenant_application] Created #{PANEL_CHANNEL_NAME} in '{guild.name}'.")
+            print(f"[ensign_application] Created #{PANEL_CHANNEL_NAME} in '{guild.name}'.")
             return ch
         except discord.Forbidden:
             print(
-                f"[lieutenant_application] Cannot create #{PANEL_CHANNEL_NAME} "
+                f"[ensign_application] Cannot create #{PANEL_CHANNEL_NAME} "
                 f"in '{guild.name}' — missing permissions."
             )
             return None
@@ -354,13 +354,13 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
             ch = await guild.create_text_channel(
                 REVIEW_CHANNEL_NAME,
                 overwrites=overwrites,
-                reason="Lieutenant Application System — review channel",
+                reason="Ensign Application System — review channel",
             )
-            print(f"[lieutenant_application] Created #{REVIEW_CHANNEL_NAME} in '{guild.name}'.")
+            print(f"[ensign_application] Created #{REVIEW_CHANNEL_NAME} in '{guild.name}'.")
             return ch
         except discord.Forbidden:
             print(
-                f"[lieutenant_application] Cannot create #{REVIEW_CHANNEL_NAME} "
+                f"[ensign_application] Cannot create #{REVIEW_CHANNEL_NAME} "
                 f"in '{guild.name}' — missing permissions."
             )
             return None
@@ -380,7 +380,7 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
         msg_id = panel_rec.get("message_id")
 
         embed = _build_panel_embed()
-        view = LieutenantPanelView()
+        view = EnsignPanelView()
 
         if msg_id:
             try:
@@ -394,10 +394,10 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
             msg = await ch.send(embed=embed, view=view)
             panels[gkey] = {"channel_id": ch.id, "message_id": msg.id}
             data["panels"] = panels
-            print(f"[lieutenant_application] Panel posted in '{guild.name}' #{ch.name}.")
+            print(f"[ensign_application] Panel posted in '{guild.name}' #{ch.name}.")
         except discord.Forbidden:
             print(
-                f"[lieutenant_application] Cannot post panel in #{ch.name} "
+                f"[ensign_application] Cannot post panel in #{ch.name} "
                 f"in '{guild.name}' — missing permissions."
             )
 
@@ -435,7 +435,7 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
                 dm = user.dm_channel or await user.create_dm()
                 await dm.send(
                     embed=discord.Embed(
-                        title="🎖️ Lieutenant Role Application",
+                        title="🎖️ Ensign Role Application",
                         description=(
                             "Thanks for applying! I'll ask you a series of questions "
                             "**one at a time** — just reply to each one.\n\n"
@@ -469,7 +469,7 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
             await _save(data)
 
         await interaction.followup.send(
-            "📬 Check your DMs — I've started your Lieutenant application there.",
+            "📬 Check your DMs — I've started your Ensign application there.",
             ephemeral=True,
         )
         await self._send_question(dm, 0)
@@ -526,7 +526,7 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
             )
         except Exception as e:
             print(
-                f"[lieutenant_application] Delivery error for "
+                f"[ensign_application] Delivery error for "
                 f"{message.author} ({message.author.id}): {e}"
             )
             await message.channel.send(
@@ -564,7 +564,7 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
                 if user is not None:
                     dm = user.dm_channel or await user.create_dm()
                     await dm.send(
-                        "⏰ Your Lieutenant application timed out due to inactivity "
+                        "⏰ Your Ensign application timed out due to inactivity "
                         "and has been cancelled. Click the button again to restart."
                     )
             except Exception:
@@ -585,9 +585,9 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
         guild: Optional[discord.Guild],
     ) -> None:
         transcript = _build_transcript(user, answers)
-        filename = f"lieutenant_application_{_safe_filename(str(user))}.txt"
+        filename = f"ensign_application_{_safe_filename(str(user))}.txt"
         caption = (
-            f"🎖️ **New Lieutenant Application** — `{user}` (ID: `{user.id}`)"
+            f"🎖️ **New Ensign Application** — `{user}` (ID: `{user.id}`)"
         )
 
         def make_file() -> discord.File:
@@ -605,7 +605,7 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
                     await recipient.send(content=caption, file=make_file())
                     delivered = True
             except Exception as e:
-                print(f"[lieutenant_application] Could not DM recipient {RECIPIENT_USER_ID}: {e}")
+                print(f"[ensign_application] Could not DM recipient {RECIPIENT_USER_ID}: {e}")
 
         # 2) Post to the review channel.
         if guild is not None:
@@ -615,23 +615,23 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
                     await review.send(content=caption, file=make_file())
                     delivered = True
             except Exception as e:
-                print(f"[lieutenant_application] Could not post to review channel: {e}")
+                print(f"[ensign_application] Could not post to review channel: {e}")
 
         if not delivered:
             print(
-                f"[lieutenant_application] WARNING: application from {user} ({user.id}) "
+                f"[ensign_application] WARNING: application from {user} ({user.id}) "
                 "could not be delivered to a recipient DM or a review channel."
             )
 
     # ----------------------------------------------------------------
-    # /lieutenant_setup — post / refresh the panel
+    # /ensign_setup — post / refresh the panel
     # ----------------------------------------------------------------
 
     @app_commands.command(
-        name="lieutenant_setup",
-        description="Post or refresh the Lieutenant application panel (leadership only).",
+        name="ensign_setup",
+        description="Post or refresh the Ensign application panel (leadership only).",
     )
-    async def lieutenant_setup(self, interaction: discord.Interaction) -> None:
+    async def ensign_setup(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
                 "Must be used in a server.", ephemeral=True
@@ -655,7 +655,7 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
         await _save(data)
 
         await interaction.followup.send(
-            f"✅ Lieutenant application panel refreshed in `#{PANEL_CHANNEL_NAME}`.",
+            f"✅ Ensign application panel refreshed in `#{PANEL_CHANNEL_NAME}`.",
             ephemeral=True,
         )
 
@@ -665,4 +665,4 @@ class LieutenantApplicationCog(commands.Cog, name="LieutenantApplicationCog"):
 # ============================================================
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(LieutenantApplicationCog(bot))
+    await bot.add_cog(EnsignApplicationCog(bot))
