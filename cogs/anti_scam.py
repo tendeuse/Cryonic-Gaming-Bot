@@ -21,7 +21,7 @@
 #                              re-upload of the same screenshot is still caught.
 #                              Hashes persist in MySQL (kv_store) and survive
 #                              restarts. Teach new ones with the right-click
-#                              "Scam: purge + kick (learn images)" menu.
+#                              "Flag scam: purge + kick" message menu.
 # 3. Cross-channel duplicate – the SAME author posting the SAME payload
 #                              (normalised text + the set of attachment byte
 #                              sizes — no download needed) to 2+ different
@@ -181,7 +181,7 @@ class AntiScam(commands.Cog):
 
         # Right-click message command to teach the filter a new scam image.
         self._ctx_menu = app_commands.ContextMenu(
-            name="Scam: purge + kick (learn images)",
+            name="Flag scam: purge + kick",
             callback=self._ctx_flag_scam,
         )
 
