@@ -4,6 +4,8 @@
 # 1) If "EVE online" role is added for a NEW player -> add "ARC Subsidized" and ensure "ARC Security" is NOT present.
 # 2) On join -> immediately add "New Member".
 # 3) When "New Member" is removed -> add "Onboarding" + "Scheduling".
+#    EXCEPTION: members holding "World of Warcraft" are skipped (the Onboarding
+#    test is EVE-only); they get neither role but are still marked complete.
 # + /fix_roles (LEADERSHIP) -> remove Onboarding/Scheduling from anyone who still has New Member.
 #
 # CHANGE (YOUR REQUEST):
@@ -35,6 +37,7 @@ SCHEDULING_ROLE = "Scheduling"
 ONBOARDING_ROLE = "Onboarding"
 
 EVE_ROLE = "EVE online"
+WOW_ROLE = "World of Warcraft"          # WoW members skip the EVE-only onboarding flow
 
 GENESIS_ROLE = "ARC Genesis"
 DIRECTOR_ROLE = "ARC Security Administration Council"
@@ -412,6 +415,24 @@ class NewMemberRoles(commands.Cog):
                 already_rewarded = uid in data.get("rewarded", [])
 
             if already_rewarded:
+                return
+
+            # World of Warcraft members must NOT enter the onboarding flow: the
+            # Onboarding test is entirely EVE Online content. Skip both Onboarding
+            # and Scheduling for them, but still mark the cycle complete so this
+            # never re-triggers for the member.
+            if discord.utils.get(after.roles, name=WOW_ROLE):
+                await self.log(
+                    after.guild,
+                    f"⏭️ **Post-New Member skipped**: {after.mention} holds **{WOW_ROLE}** — "
+                    f"not granting **{ONBOARDING_ROLE}**/**{SCHEDULING_ROLE}** (EVE-only onboarding)."
+                )
+                async with self._data_lock:
+                    data = await asyncio.to_thread(load_data)
+                    data.setdefault("rewarded", [])
+                    if uid not in data["rewarded"]:
+                        data["rewarded"].append(uid)
+                        await asyncio.to_thread(save_data, data)
                 return
 
             sched = self.get_role(after.guild, SCHEDULING_ROLE)
