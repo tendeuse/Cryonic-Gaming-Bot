@@ -314,7 +314,9 @@ def _atomic_write(data: Dict[str, Any]) -> None:
 async def load_seat_data() -> Dict[str, Any]:
     async with _get_file_lock():
         try:
-            data = _db.kv_load("arc_seat", None)
+            # Offload the (potentially multi-MB) blocking MySQL read to a
+            # worker thread so the Discord event loop / heartbeat never stalls.
+            data = await asyncio.to_thread(_db.kv_load, "arc_seat", None)
             if not isinstance(data, dict):
                 return _default_data()
             # Back-fill any missing top-level keys
@@ -328,7 +330,9 @@ async def load_seat_data() -> Dict[str, Any]:
 
 async def save_seat_data(data: Dict[str, Any]) -> None:
     async with _get_file_lock():
-        _atomic_write(data)
+        # _atomic_write does a blocking (multi-MB) MySQL upsert; run it in a
+        # worker thread so the Discord event loop / heartbeat never stalls.
+        await asyncio.to_thread(_atomic_write, data)
 
 
 # ============================================================
