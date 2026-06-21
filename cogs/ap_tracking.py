@@ -74,6 +74,15 @@ CHAT_INTERVAL   = 1800    # 30 minutes
 CHAT_AP         = 15
 MIN_ACCOUNT_AGE_DAYS = 14  # Alt-account mitigation
 
+# ARC Genesis thread boost:
+# Chat messages posted in threads that stem from this parent channel earn
+# THREAD_BOOST_MULTIPLIER x the normal chat AP, but ONLY for members who hold
+# the ARC Genesis role. All other members earn the normal amount in these
+# threads, and ARC Genesis members earn the normal amount everywhere else.
+GENESIS_ROLE             = "ARC Genesis"
+BOOSTED_THREAD_PARENT_ID = 1463203696417706076
+THREAD_BOOST_MULTIPLIER  = 5
+
 # Roles that bypass the account-age block and trigger retroactive AP catch-up.
 # These are matched by role NAME exactly as they appear in Discord.
 BYPASS_ROLE_NAMES = {"1", "2", "3", "4", "5", "6"}
@@ -895,6 +904,10 @@ class APTracking(commands.Cog):
         # Replaces the old file-based "last_chat" field to avoid race conditions
         # where voice_loop / chat_loop save() would overwrite on_message updates.
         self._last_chat: Dict[int, datetime.datetime] = {}
+        # In-memory tracker of the last time a member posted in a thread that
+        # stems from BOOSTED_THREAD_PARENT_ID. Used by chat_loop to apply the
+        # ARC Genesis thread boost. Mirrors the _last_chat snapshot/clear cycle.
+        self._last_thread_boost: Dict[int, datetime.datetime] = {}
         # Prevents voice_loop and chat_loop from interleaving their
         # load-modify-save cycles, which caused the later save to
         # overwrite the earlier one and lose its AP changes.
@@ -1203,7 +1216,16 @@ class APTracking(commands.Cog):
         if is_alt_account(message.author):
             return
         # Track in memory — no file I/O, immune to save() race conditions
-        self._last_chat[message.author.id] = datetime.datetime.utcnow()
+        now = datetime.datetime.utcnow()
+        self._last_chat[message.author.id] = now
+        # Note thread activity for the ARC Genesis boost. parent_id only exists
+        # on Thread channels; normal text channels are ignored here.
+        channel = message.channel
+        if (
+            isinstance(channel, discord.Thread)
+            and channel.parent_id == BOOSTED_THREAD_PARENT_ID
+        ):
+            self._last_thread_boost[message.author.id] = now
 
     @tasks.loop(seconds=VOICE_INTERVAL)
     async def voice_loop(self):
@@ -1247,6 +1269,8 @@ class APTracking(commands.Cog):
         # is credited exactly once, regardless of how long processing takes.
         chat_snapshot = dict(self._last_chat)
         self._last_chat.clear()
+        thread_boost_snapshot = dict(self._last_thread_boost)
+        self._last_thread_boost.clear()
 
         async with self._data_cycle_lock:
             boosts: Dict[str, Any] = _load_boosts_file()
@@ -1264,8 +1288,20 @@ class APTracking(commands.Cog):
                     if not last:
                         continue
                     if (now - last).total_seconds() <= CHAT_INTERVAL:
+                        chat_ap     = float(CHAT_AP)
+                        chat_source = "chat"
+                        # ARC Genesis members active in a boosted thread this
+                        # window earn THREAD_BOOST_MULTIPLIER x the chat AP.
+                        boost_last = thread_boost_snapshot.get(m.id)
+                        if (
+                            boost_last
+                            and (now - boost_last).total_seconds() <= CHAT_INTERVAL
+                            and has_role_name(m, GENESIS_ROLE)
+                        ):
+                            chat_ap     = float(CHAT_AP * THREAD_BOOST_MULTIPLIER)
+                            chat_source = f"chat (ARC Genesis x{THREAD_BOOST_MULTIPLIER} thread boost)"
                         _, _, changed = _apply_ap_to_data(
-                            data, m, float(CHAT_AP), "chat", None,
+                            data, m, chat_ap, chat_source, None,
                             ceos, dirs, boosts,
                         )
                         if changed:
@@ -1485,6 +1521,7 @@ class APTracking(commands.Cog):
 
         await wipe_ap_in_data(data)
         self._last_chat.clear()   # clear in-memory chat tracker on wipe
+        self._last_thread_boost.clear()
         meta  = data.setdefault(META_KEY, {})
         gmeta = meta.setdefault(str(interaction.guild.id), {})
         gmeta[LAST_WIPE_KEY] = utcnow()
