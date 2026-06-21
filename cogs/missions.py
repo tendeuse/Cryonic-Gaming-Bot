@@ -21,6 +21,7 @@ Access control:
   - All members can assign themselves and complete their own missions.
 """
 
+import asyncio
 import traceback
 from datetime import datetime, timezone
 from typing import Optional, Any
@@ -206,14 +207,15 @@ class MissionCreateModal(discord.ui.Modal, title="✨ Create a New Mission"):
         self.feed_channel = feed_channel
 
     async def on_submit(self, interaction: discord.Interaction):
-        mid   = self.db.create_mission(
+        mid   = await asyncio.to_thread(
+            self.db.create_mission,
             title=self.mission_title.value.strip(),
             description=self.description.value.strip(),
             reward=self.reward.value.strip(),
             created_by=interaction.user.id,
             guild_id=interaction.guild.id,
         )
-        row   = self.db.get_mission(mid)
+        row   = await asyncio.to_thread(self.db.get_mission, mid)
         embed = mission_embed(row, interaction.guild)
         embed.set_author(name="✨ New mission created!")
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -250,7 +252,7 @@ class MissionIDModal(discord.ui.Modal):
             await interaction.response.send_message("❌ Please enter a valid numeric ID.", ephemeral=True)
             return
 
-        row    = self.db.get_mission(mid)
+        row    = await asyncio.to_thread(self.db.get_mission, mid)
         member = interaction.user
 
         if row is None:
@@ -259,13 +261,13 @@ class MissionIDModal(discord.ui.Modal):
 
         # ---- ASSIGN ------------------------------------------------
         if self.action == "assign":
-            ok = self.db.assign_mission(mid, member.id)
+            ok = await asyncio.to_thread(self.db.assign_mission, mid, member.id)
             if not ok:
                 await interaction.response.send_message(
                     f"❌ Mission `#{mid}` is **{row['status']}** and cannot be assigned.",
                     ephemeral=True)
                 return
-            row   = self.db.get_mission(mid)
+            row   = await asyncio.to_thread(self.db.get_mission, mid)
             embed = mission_embed(row, interaction.guild)
             embed.set_author(name=f"👤 {member.display_name} assigned to mission!")
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -281,13 +283,13 @@ class MissionIDModal(discord.ui.Modal):
                 await interaction.response.send_message(
                     "🔒 You can only complete missions assigned to you.", ephemeral=True)
                 return
-            ok = self.db.complete_mission(mid, member.id, force=is_manager)
+            ok = await asyncio.to_thread(self.db.complete_mission, mid, member.id, force=is_manager)
             if not ok:
                 await interaction.response.send_message(
                     f"❌ Mission `#{mid}` cannot be completed (status: **{row['status']}**).",
                     ephemeral=True)
                 return
-            row   = self.db.get_mission(mid)
+            row   = await asyncio.to_thread(self.db.get_mission, mid)
             embed = mission_embed(row, interaction.guild)
             embed.set_author(name="✅ Mission completed!")
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -303,12 +305,12 @@ class MissionIDModal(discord.ui.Modal):
                     "**ARC Security Corporation Leader** can cancel missions.",
                     ephemeral=True)
                 return
-            ok = self.db.cancel_mission(mid)
+            ok = await asyncio.to_thread(self.db.cancel_mission, mid)
             if not ok:
                 await interaction.response.send_message(
                     f"❌ Mission `#{mid}` is already **{row['status']}**.", ephemeral=True)
                 return
-            row   = self.db.get_mission(mid)
+            row   = await asyncio.to_thread(self.db.get_mission, mid)
             embed = mission_embed(row, interaction.guild)
             embed.set_author(name="❌ Mission cancelled.")
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -370,7 +372,7 @@ class MissionControlView(discord.ui.View):
                        custom_id="mc_list", row=0)
     async def btn_list(self, interaction: discord.Interaction, button: discord.ui.Button):
         cog  = self._cog(interaction)
-        rows = cog.db.list_missions(interaction.guild.id)
+        rows = await asyncio.to_thread(cog.db.list_missions, interaction.guild.id)
         if not rows:
             await interaction.response.send_message("📭 No active missions.", ephemeral=True)
             return

@@ -260,7 +260,7 @@ class NewMemberRoles(commands.Cog):
             return True
 
         async with self._data_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             if str(member.id) in data.get("pending", {}):
                 return True
 
@@ -327,7 +327,7 @@ class NewMemberRoles(commands.Cog):
         await self.bot.wait_until_ready()
 
         async with self._data_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             rewarded = set(data.get("rewarded", []))
             if not rewarded:
                 return
@@ -344,7 +344,7 @@ class NewMemberRoles(commands.Cog):
             stale = rewarded & holders
             if stale:
                 data["rewarded"] = [uid for uid in data["rewarded"] if uid not in stale]
-                save_data(data)
+                await asyncio.to_thread(save_data, data)
 
     # ---------- Member Join Handling (Rule 2) ----------
 
@@ -353,7 +353,7 @@ class NewMemberRoles(commands.Cog):
         uid = str(member.id)
 
         async with self._data_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             if uid in data.get("rewarded", []):
                 await self.log(
                     member.guild,
@@ -408,7 +408,7 @@ class NewMemberRoles(commands.Cog):
             uid = str(after.id)
 
             async with self._data_lock:
-                data = load_data()
+                data = await asyncio.to_thread(load_data)
                 already_rewarded = uid in data.get("rewarded", [])
 
             if already_rewarded:
@@ -440,11 +440,11 @@ class NewMemberRoles(commands.Cog):
                     return
 
             async with self._data_lock:
-                data = load_data()
+                data = await asyncio.to_thread(load_data)
                 data.setdefault("rewarded", [])
                 if uid not in data["rewarded"]:
                     data["rewarded"].append(uid)
-                    save_data(data)
+                    await asyncio.to_thread(save_data, data)
 
     # ---------- Permission Check (robust) ----------
 

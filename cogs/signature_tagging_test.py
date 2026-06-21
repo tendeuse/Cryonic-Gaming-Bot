@@ -8,6 +8,7 @@
 
 import discord
 from discord.ext import commands
+import asyncio
 import random
 from dataclasses import dataclass
 from typing import List, Dict
@@ -329,7 +330,7 @@ class StartTestView(discord.ui.View):
             return
 
         day = utc_day_key()
-        attempts = load_attempts()
+        attempts = await asyncio.to_thread(load_attempts)
         used = int(attempts.get(day, {}).get(str(interaction.user.id), 0))
 
         if used >= MAX_TRIES_PER_DAY:
@@ -349,7 +350,7 @@ class StartTestView(discord.ui.View):
         # consume attempt only after successful DM
         attempts.setdefault(day, {})
         attempts[day][str(interaction.user.id)] = used + 1
-        save_attempts(attempts)
+        await asyncio.to_thread(save_attempts, attempts)
 
         await safe_reply(interaction, f"Test sent. Attempts used today: **{used + 1}/{MAX_TRIES_PER_DAY}** (UTC).")
 

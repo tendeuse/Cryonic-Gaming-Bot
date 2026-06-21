@@ -880,7 +880,7 @@ class KillmailFeed(commands.Cog):
         self.km_time_cache[feed_key] = clamp_dict(self.km_time_cache[feed_key], MAX_KM_CACHE)
 
         d = self.diag[feed_key]
-        save_json(DATA_FILES[feed_key], {
+        await asyncio.to_thread(save_json, DATA_FILES[feed_key], {
             "posted_map":        self.posted_map[feed_key],
             "km_time_cache":     self.km_time_cache[feed_key],
             "name_cache":        self.name_cache,

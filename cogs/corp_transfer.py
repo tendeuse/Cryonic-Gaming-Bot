@@ -80,7 +80,9 @@ def _atomic_write(data: Dict[str, Any]) -> None:
 async def _load() -> Dict[str, Any]:
     async with _get_lock():
         try:
-            data = db.kv_load("corp_transfer_tickets", {"panels": {}, "tickets": {}})
+            data = await asyncio.to_thread(
+                db.kv_load, "corp_transfer_tickets", {"panels": {}, "tickets": {}}
+            )
             data.setdefault("panels", {})
             data.setdefault("tickets", {})
             return data
@@ -91,7 +93,7 @@ async def _load() -> Dict[str, Any]:
 
 async def _save(data: Dict[str, Any]) -> None:
     async with _get_lock():
-        _atomic_write(data)
+        await asyncio.to_thread(_atomic_write, data)
 
 
 # ============================================================
@@ -846,7 +848,7 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
         """
         # ── Test & Certification Status ───────────────────────────────────────
         try:
-            tests_embed = self._build_tests_embed(member)
+            tests_embed = await asyncio.to_thread(self._build_tests_embed, member)
             await channel.send(embed=tests_embed)
         except Exception as e:
             print(f"[corp_transfer] Failed to build tests embed: {e}")
@@ -856,7 +858,7 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
 
         # ── Event Participation History ───────────────────────────────────────
         try:
-            events_embed = self._build_events_embed(member.id)
+            events_embed = await asyncio.to_thread(self._build_events_embed, member.id)
             await channel.send(embed=events_embed)
         except Exception as e:
             print(f"[corp_transfer] Failed to build events embed: {e}")

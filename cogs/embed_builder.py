@@ -1,5 +1,6 @@
 import json
 import os
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -260,7 +261,7 @@ class EmbedPreviewView(discord.ui.View):
             "author_id": self.author.id,
             "channel_id": interaction.channel.id,
         }
-        save_sent_embeds()
+        await asyncio.to_thread(save_sent_embeds)
 
         # Close the ephemeral preview cleanly
         self.disable_all_items()
@@ -359,7 +360,7 @@ async def setup(bot: commands.Bot):
     global sent_embeds
 
     # 1. Load persisted records BEFORE registering the view
-    sent_embeds = load_sent_embeds()
+    sent_embeds = await asyncio.to_thread(load_sent_embeds)
     print(f"[EmbedBuilder] Loaded {len(sent_embeds)} sent embed record(s) from {DATA_FILE}.")
 
     # 2. Register the persistent view.

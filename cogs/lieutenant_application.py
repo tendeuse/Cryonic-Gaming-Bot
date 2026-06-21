@@ -115,7 +115,9 @@ def _atomic_write(data: Dict[str, Any]) -> None:
 async def _load() -> Dict[str, Any]:
     async with _get_lock():
         try:
-            data = db.kv_load("lieutenant_application", {"panels": {}, "sessions": {}})
+            data = await asyncio.to_thread(
+                db.kv_load, "lieutenant_application", {"panels": {}, "sessions": {}}
+            )
             data.setdefault("panels", {})
             data.setdefault("sessions", {})
             return data
@@ -126,7 +128,7 @@ async def _load() -> Dict[str, Any]:
 
 async def _save(data: Dict[str, Any]) -> None:
     async with _get_lock():
-        _atomic_write(data)
+        await asyncio.to_thread(_atomic_write, data)
 
 
 # ============================================================

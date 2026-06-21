@@ -127,7 +127,7 @@ def _atomic_write(path: str, data: Any) -> None:
 async def _load_meetings() -> Dict[str, Any]:
     async with _get_lock():
         try:
-            data = db.kv_load("meetings", {})
+            data = await asyncio.to_thread(db.kv_load, "meetings", {})
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
@@ -135,7 +135,7 @@ async def _load_meetings() -> Dict[str, Any]:
 
 async def _save_meetings(data: Dict[str, Any]) -> None:
     async with _get_lock():
-        _atomic_write(MEETINGS_PATH, data)
+        await asyncio.to_thread(_atomic_write, MEETINGS_PATH, data)
 
 
 # ============================================================

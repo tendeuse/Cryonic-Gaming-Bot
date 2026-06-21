@@ -119,7 +119,7 @@ def _atomic_write(path: str, data: Any) -> None:
 async def load_events() -> Dict[str, Any]:
     async with _get_lock():
         try:
-            data = db.kv_load(_key(DATA_PATH), {})
+            data = await asyncio.to_thread(db.kv_load, _key(DATA_PATH), {})
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
@@ -127,7 +127,7 @@ async def load_events() -> Dict[str, Any]:
 
 async def save_events(data: Dict[str, Any]) -> None:
     async with _get_lock():
-        _atomic_write(DATA_PATH, data)
+        await asyncio.to_thread(_atomic_write, DATA_PATH, data)
 
 
 async def save_event(event_id: str, event: Dict[str, Any]) -> None:
@@ -140,19 +140,19 @@ async def save_event(event_id: str, event: Dict[str, Any]) -> None:
     """
     async with _get_lock():
         try:
-            data: Dict[str, Any] = db.kv_load(_key(DATA_PATH), {})
+            data: Dict[str, Any] = await asyncio.to_thread(db.kv_load, _key(DATA_PATH), {})
             if not isinstance(data, dict):
                 data = {}
         except Exception:
             data = {}
         data[event_id] = event
-        _atomic_write(DATA_PATH, data)
+        await asyncio.to_thread(_atomic_write, DATA_PATH, data)
 
 
 async def load_boosts() -> Dict[str, Any]:
     async with _get_lock():
         try:
-            data = db.kv_load(_key(BOOSTS_PATH), {"participants": {}})
+            data = await asyncio.to_thread(db.kv_load, _key(BOOSTS_PATH), {"participants": {}})
             if not isinstance(data, dict):
                 return {"participants": {}}
             data.setdefault("participants", {})
@@ -163,7 +163,7 @@ async def load_boosts() -> Dict[str, Any]:
 
 async def save_boosts(data: Dict[str, Any]) -> None:
     async with _get_lock():
-        _atomic_write(BOOSTS_PATH, data)
+        await asyncio.to_thread(_atomic_write, BOOSTS_PATH, data)
 
 
 # ============================================================

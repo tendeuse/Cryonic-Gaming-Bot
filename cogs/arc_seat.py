@@ -521,7 +521,8 @@ class ESIClient:
             if not access:
                 return None
 
-            _seat_save_token(
+            await asyncio.to_thread(
+                _seat_save_token,
                 discord_user_id, character_id, character_name,
                 access, refresh, expires,
             )
@@ -1341,7 +1342,7 @@ class ArcSeatCog(commands.Cog, name="ArcSeat"):
         # Migration
         members = data.get("members", {})
         if not members:
-            migrated = migrate_from_ign_registry()
+            migrated = await asyncio.to_thread(migrate_from_ign_registry)
             if migrated:
                 data["members"] = migrated
                 await save_seat_data(data)
@@ -1563,7 +1564,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         members = data.setdefault("members", {})
         changed = False
 
-        for row in _seat_get_all_tokens_global():
+        for row in await asyncio.to_thread(_seat_get_all_tokens_global):
             disc_id = row["discord_user_id"]
             key     = str(disc_id)
 
@@ -1605,7 +1606,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         Reads from arc_seat.db (seat_tokens table) only — no overlay dependency.
         Refreshes automatically and writes the new token back to arc_seat.db.
         """
-        row = _seat_get_token(discord_id, char_id)
+        row = await asyncio.to_thread(_seat_get_token, discord_id, char_id)
         if row is None:
             return None
 
@@ -1744,7 +1745,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             cache["industry_jobs"] = jobs
 
         char["last_esi_pull"] = _now_iso()
-        char["has_tokens"]    = (_seat_get_token(discord_id, char_id) is not None)
+        char["has_tokens"]    = (await asyncio.to_thread(_seat_get_token, discord_id, char_id) is not None)
         data["members"][key]  = member
         await save_seat_data(data)
         print(f"[ARC-SEAT] ESI pull complete: {char.get('character_name')} ({char_id})")
@@ -2219,7 +2220,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         # ── Tests & Certifications follow-up (edit existing or send once) ────
         if isinstance(existing_thread, discord.Thread):
             try:
-                tests_embed = self._build_tests_embed(discord_member)
+                tests_embed = await asyncio.to_thread(self._build_tests_embed, discord_member)
                 tests_msg_id = member_rec.get("tests_embed_msg_id")
                 tests_msg: Optional[discord.Message] = None
 
@@ -2243,7 +2244,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         # ── Event participation follow-up (edit existing or send once) ────────
         if isinstance(existing_thread, discord.Thread):
             try:
-                events_embed = self._build_events_embed(discord_member.id)
+                events_embed = await asyncio.to_thread(self._build_events_embed, discord_member.id)
                 events_msg_id = member_rec.get("events_embed_msg_id")
                 events_msg: Optional[discord.Message] = None
 
@@ -2589,7 +2590,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         Reads from and writes to arc_seat.db only — no overlay dependency.
         """
         soon = time.time() + 300
-        for row in _seat_get_all_tokens_global():
+        for row in await asyncio.to_thread(_seat_get_all_tokens_global):
             if row.get("expires_at", 0) > soon:
                 continue
             await self._esi.refresh_token(
@@ -2720,7 +2721,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         """
         await interaction.response.defer(ephemeral=True)
 
-        rows = _seat_get_all_tokens(interaction.user.id)
+        rows = await asyncio.to_thread(_seat_get_all_tokens, interaction.user.id)
         if not rows:
             await interaction.followup.send(
                 "You have no EVE characters registered with ARC-SEAT.\n\n"
@@ -2886,7 +2887,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         )
 
         for char in member.get("characters", []):
-            row        = _seat_get_token(interaction.user.id, char["character_id"])
+            row        = await asyncio.to_thread(_seat_get_token, interaction.user.id, char["character_id"])
             corp       = char.get("corporation_name") or str(char.get("corporation_id", "Unknown"))
             alliance   = char.get("alliance_name")
             in_corp    = "✅ In ARC" if char.get("in_arc_corp") else f"❌ {corp}"
@@ -3275,7 +3276,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         await save_seat_data(data)
 
         # Remove from seat_tokens if present (does NOT touch overlay eve_tokens)
-        _seat_delete_token(interaction.user.id, char_id)
+        await asyncio.to_thread(_seat_delete_token, interaction.user.id, char_id)
 
         await interaction.followup.send(
             f"✅ `{character_name}` removed from your ARC-SEAT profile.\n"

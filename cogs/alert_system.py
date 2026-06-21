@@ -135,7 +135,7 @@ def _atomic_write_json(p: Path, d: Dict[str, Any]) -> None:
 
 async def load_state() -> Dict[str, Any]:
     async with _file_lock:
-        s = _safe_read_json(DATA_FILE)
+        s = await asyncio.to_thread(_safe_read_json, DATA_FILE)
         if not isinstance(s, dict) or not s:
             return _default_state()
 
@@ -166,7 +166,7 @@ async def load_state() -> Dict[str, Any]:
 
 async def save_state(state: Dict[str, Any]) -> None:
     async with _file_lock:
-        _atomic_write_json(DATA_FILE, state)
+        await asyncio.to_thread(_atomic_write_json, DATA_FILE, state)
 
 def has_any_role(member: discord.Member, role_names: set) -> bool:
     return any(r.name in role_names for r in getattr(member, "roles", []))

@@ -837,7 +837,7 @@ class BuybackContracts(commands.Cog):
                         finally:
                             conn.close()
 
-                        discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
+                        discord_user_id = (await asyncio.to_thread(self._discord_user_id_for_character_id, issuer_id)) if issuer_id else None
 
                         payload, _total = await self._appraise_contract(session, token, cid)
                         await self._post_appraisal(
@@ -908,7 +908,7 @@ class BuybackContracts(commands.Cog):
                     finally:
                         conn.close()
 
-                    discord_user_id = self._discord_user_id_for_character_id(issuer_id) if issuer_id else None
+                    discord_user_id = (await asyncio.to_thread(self._discord_user_id_for_character_id, issuer_id)) if issuer_id else None
 
                     payload, _total = await self._appraise_contract(session, token, int(contract_id))
                     await self._post_appraisal(

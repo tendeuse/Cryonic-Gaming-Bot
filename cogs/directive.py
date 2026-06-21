@@ -123,7 +123,7 @@ def _empty_data() -> Dict[str, Any]:
 async def load_data() -> Dict[str, Any]:
     async with _file_lock:
         try:
-            data = db.kv_load("directives", None)
+            data = await asyncio.to_thread(db.kv_load, "directives", None)
             if not isinstance(data, dict) or not data:
                 return _empty_data()
             data.setdefault("cycle", {"start": utcnow_iso(), "officers": {}})
@@ -136,7 +136,7 @@ async def load_data() -> Dict[str, Any]:
 
 async def save_data(data: Dict[str, Any]) -> None:
     async with _file_lock:
-        _atomic_write(DATA_FILE, data)
+        await asyncio.to_thread(_atomic_write, DATA_FILE, data)
 
 
 def utcnow_iso() -> str:

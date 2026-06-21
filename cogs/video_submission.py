@@ -116,12 +116,12 @@ def _atomic_write_json(p: Path, d) -> None:
 
 async def load(p: Path):
     async with file_lock:
-        return _load_file(p)
+        return await asyncio.to_thread(_load_file, p)
 
 
 async def save(p: Path, d):
     async with file_lock:
-        _atomic_write_json(p, d)
+        await asyncio.to_thread(_atomic_write_json, p, d)
 
 
 def now_iso():

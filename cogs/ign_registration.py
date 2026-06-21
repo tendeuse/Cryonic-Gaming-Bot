@@ -2,6 +2,7 @@ import os
 import json
 import datetime
 import asyncio
+import threading
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -87,8 +88,34 @@ def load_state() -> Dict[str, Any]:
     s.setdefault("corp_watch", {})
     return s
 
+_save_lock = threading.Lock()
+
+
 def save_state(state: Dict[str, Any]) -> None:
-    db.kv_save("ign_registry", state)
+    # save_state is called from many sync helper methods that run on the Discord
+    # event loop. db.kv_save is a blocking MySQL round-trip, so calling it inline
+    # stalls the loop (and times out any in-flight interaction). Instead, take a
+    # consistent snapshot here (cheap, on the loop) and offload the actual write
+    # to a worker thread. _save_lock serializes writes so they can't overlap;
+    # since every save persists the full document, eventual consistency holds.
+    payload = json.loads(json.dumps(state, default=str))
+
+    def _write() -> None:
+        try:
+            with _save_lock:
+                db.kv_save("ign_registry", payload)
+        except Exception as e:
+            print(f"[ign_registration] save_state write error: {e}")
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        # Not on the event loop (e.g. startup / a worker thread): write directly.
+        _write()
+    else:
+        loop.run_in_executor(None, _write)
 
 def normalize_ign(s: str) -> str:
     return " ".join((s or "").strip().split())

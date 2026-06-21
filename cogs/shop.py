@@ -980,7 +980,7 @@ class ShopCog(commands.Cog):
         for shop_key in SHOPS:
             self.bot.add_view(ShopManagementView(self, shop_key))
 
-        self.restore_order_views()
+        await self.restore_order_views()
 
         # Each guild is a separate task — they no longer stall each other
         for guild in self.bot.guilds:
@@ -1111,8 +1111,9 @@ class ShopCog(commands.Cog):
     # ----------------------------
     # Order persistence
     # ----------------------------
-    def restore_order_views(self):
-        data = load_orders()
+    async def restore_order_views(self):
+        # Offload the blocking read; keep bot.add_view() on the event loop.
+        data = await asyncio.to_thread(load_orders)
         for order_id in (data.get("orders", {}) or {}).keys():
             self.register_order_view(order_id)
 

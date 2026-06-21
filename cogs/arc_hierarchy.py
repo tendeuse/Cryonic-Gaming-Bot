@@ -395,7 +395,7 @@ async def bootstrap_fixed_corps(guild: discord.Guild) -> None:
             subsidized_role = None
 
     async with file_lock:
-        data = load_data()
+        data = await asyncio.to_thread(load_data)
         corps = data.setdefault("corporations", {})
         corps.setdefault(CORP_UNASSIGNED_KEY, {"name": "Unassigned", "role_id": None})
         corps.setdefault(CORP_SECURITY_KEY, {"name": "ARC Security", "role_id": None})
@@ -409,7 +409,7 @@ async def bootstrap_fixed_corps(guild: discord.Guild) -> None:
         if subsidized_role is not None:
             corps[CORP_SUBSIDIZED_KEY]["role_id"] = subsidized_role.id
 
-        save_data(data)
+        await asyncio.to_thread(save_data, data)
 
 async def bootstrap_rank_roles(guild: discord.Guild) -> None:
     """
@@ -440,13 +440,13 @@ async def bootstrap_rank_roles(guild: discord.Guild) -> None:
 
 async def sync_member_corp_from_roles(member: discord.Member, *, reason: str) -> Tuple[str, str]:
     async with file_lock:
-        data = load_data()
+        data = await asyncio.to_thread(load_data)
         rec = ensure_member_record(data, member.id)
         old_key = rec.get("corp_key", CORP_UNASSIGNED_KEY)
         new_key = detect_corp_key_from_member(member)
         if old_key != new_key:
             rec["corp_key"] = new_key
-            save_data(data)
+            await asyncio.to_thread(save_data, data)
         return old_key, new_key
 
 # =====================
@@ -500,7 +500,7 @@ async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str,
     """
     guild = member.guild
     async with file_lock:
-        data = load_data()
+        data = await asyncio.to_thread(load_data)
         rec = ensure_member_record(data, member.id)
 
         old_rank = rec.get("rank", RANK_SECURITY)
@@ -528,7 +528,7 @@ async def apply_rank_change(member: discord.Member, new_rank: str) -> Tuple[str,
                 except (discord.Forbidden, discord.HTTPException):
                     pass
 
-        save_data(data)
+        await asyncio.to_thread(save_data, data)
         return old_rank, new_rank
 
 # =====================
@@ -649,7 +649,7 @@ async def update_flowchart(guild: discord.Guild) -> None:
             return
 
     async with file_lock:
-        data = load_data()
+        data = await asyncio.to_thread(load_data)
         flow = data.setdefault("flowchart", {})
         stored_message_id = flow.get("message_id")
 
@@ -669,11 +669,11 @@ async def update_flowchart(guild: discord.Guild) -> None:
         else:
             msg = await ch.send(parts[0])
             async with file_lock:
-                data = load_data()
+                data = await asyncio.to_thread(load_data)
                 flow = data.setdefault("flowchart", {})
                 flow["channel_id"] = ch.id
                 flow["message_id"] = msg.id
-                save_data(data)
+                await asyncio.to_thread(save_data, data)
 
         for p in parts[1:]:
             try:
@@ -738,7 +738,7 @@ class ARCHierarchyCog(commands.Cog):
         await self.sync_all_members(interaction.guild, actor_id=interaction.user.id, log=False)
 
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
 
         corp_name = corp_display_name_by_key(corp_key)
 
@@ -843,7 +843,7 @@ class ARCHierarchyCog(commands.Cog):
         await sync_member_corp_from_roles(member, reason="promote: pre-sync")
 
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             rec = ensure_member_record(data, member.id)
             old_rank = rec.get("rank", RANK_SECURITY)
 
@@ -869,11 +869,11 @@ class ARCHierarchyCog(commands.Cog):
         prev_rank, new_rank = await apply_rank_change(member, nxt)
 
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             corp_key = detect_corp_key_from_member(member)
             rec = ensure_member_record(data, member.id)
             rec["corp_key"] = corp_key
-            save_data(data)
+            await asyncio.to_thread(save_data, data)
 
         await log_action(
             interaction.guild,
@@ -900,7 +900,7 @@ class ARCHierarchyCog(commands.Cog):
         await sync_member_corp_from_roles(member, reason="demote: pre-sync")
 
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             rec = ensure_member_record(data, member.id)
             old_rank = rec.get("rank", RANK_SECURITY)
             nxt = DEMOTE_TO.get(old_rank)
@@ -914,11 +914,11 @@ class ARCHierarchyCog(commands.Cog):
         prev_rank, new_rank = await apply_rank_change(member, nxt)
 
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             corp_key = detect_corp_key_from_member(member)
             rec = ensure_member_record(data, member.id)
             rec["corp_key"] = corp_key
-            save_data(data)
+            await asyncio.to_thread(save_data, data)
 
         await log_action(
             interaction.guild,
@@ -956,7 +956,7 @@ class ARCHierarchyCog(commands.Cog):
         directive_id = str(int(discord.utils.utcnow().timestamp() * 1000))
 
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             data.setdefault("directives", {})[directive_id] = {
                 "title": title,
                 "body": body,
@@ -964,7 +964,7 @@ class ARCHierarchyCog(commands.Cog):
                 "created_by": actor.id,
                 "created_at": int(discord.utils.utcnow().timestamp()),
             }
-            save_data(data)
+            await asyncio.to_thread(save_data, data)
 
         ch = await ensure_directives_channel(interaction.guild)
         if ch:
@@ -989,7 +989,7 @@ class ARCHierarchyCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             directives = data.get("directives", {})
 
         open_items: List[Tuple[str, Dict[str, Any]]] = []
@@ -1019,13 +1019,13 @@ class ARCHierarchyCog(commands.Cog):
 
         directive_id = (directive_id or "").strip()
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             d = data.get("directives", {}).get(directive_id)
             if not isinstance(d, dict):
                 await interaction.followup.send("Directive not found.", ephemeral=True)
                 return
             d["status"] = "done"
-            save_data(data)
+            await asyncio.to_thread(save_data, data)
 
         ch = await ensure_directives_channel(interaction.guild)
         if ch:
@@ -1047,7 +1047,7 @@ class ARCHierarchyCog(commands.Cog):
     async def sync_all_members(self, guild: discord.Guild, *, actor_id: Optional[int], log: bool) -> int:
         changed = 0
         async with file_lock:
-            data = load_data()
+            data = await asyncio.to_thread(load_data)
             for m in guild.members:
                 rec = ensure_member_record(data, m.id)
                 old_key = rec.get("corp_key", CORP_UNASSIGNED_KEY)
@@ -1055,7 +1055,7 @@ class ARCHierarchyCog(commands.Cog):
                 if old_key != new_key:
                     rec["corp_key"] = new_key
                     changed += 1
-            save_data(data)
+            await asyncio.to_thread(save_data, data)
 
         if log and changed:
             await log_action(guild, f"Corp sync: updated **{changed}** member record(s) from role detection.", mention_ids=[actor_id] if actor_id else [])

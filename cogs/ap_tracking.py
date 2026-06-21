@@ -153,7 +153,10 @@ def _atomic_write_json(p: Path, data: Dict[str, Any]) -> None:
 async def load() -> Dict[str, Any]:
     async with file_lock:
         try:
-            data = db.kv_load("ap_data", None)
+            # Blocking MySQL read — offload to a worker thread so the Discord
+            # event loop / heartbeat never stalls (a stalled loop times out any
+            # in-flight interaction with "Something went wrong").
+            data = await asyncio.to_thread(db.kv_load, "ap_data", None)
             if not isinstance(data, dict):
                 return _default_ap_data()
             return data
@@ -162,7 +165,8 @@ async def load() -> Dict[str, Any]:
 
 async def save(data: Dict[str, Any]) -> None:
     async with file_lock:
-        _atomic_write_json(DATA_FILE, data)
+        # Blocking MySQL upsert — offload to a worker thread (see load()).
+        await asyncio.to_thread(_atomic_write_json, DATA_FILE, data)
 
 def has_role_name(member: discord.Member, role_name: str) -> bool:
     return any(r.name == role_name for r in member.roles)
@@ -458,11 +462,31 @@ def append_audit(
     """
     # Audit entries live in the ap_audit MySQL table (not inside ap_data) so the
     # AP document stays small. `data` is accepted for signature compatibility.
-    db.execute(
-        "INSERT INTO ap_audit (user_id, ts, delta, source, reason, actor_id) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
-        (int(member_id), utcnow(), round(delta, 4), source, reason or None, actor_id),
-    )
+    #
+    # This is pure I/O (no in-memory mutation), so to keep the blocking INSERT
+    # off the Discord event loop we capture the row now and run the write on a
+    # worker thread. The audit log is append-only and each row carries its own
+    # timestamp, so fire-and-forget ordering is fine.
+    params = (int(member_id), utcnow(), round(delta, 4), source, reason or None, actor_id)
+
+    def _write() -> None:
+        try:
+            db.execute(
+                "INSERT INTO ap_audit (user_id, ts, delta, source, reason, actor_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                params,
+            )
+        except Exception as e:
+            print(f"[ap_tracking] append_audit write error: {e}")
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        _write()
+    else:
+        loop.run_in_executor(None, _write)
 
 
 def build_audit_csv(entries: List[Dict[str, Any]], member_display: str) -> bytes:
@@ -518,7 +542,7 @@ async def award_ap_with_bonuses(
     if base_amount <= 0:
         return
 
-    _ = load_hierarchy()   # kept for compatibility / future use
+    _ = await asyncio.to_thread(load_hierarchy)   # kept for compatibility / future use
     data = await load()
 
     actor_id = actor.id if actor else None
@@ -562,7 +586,7 @@ async def award_ap_with_bonuses(
             mention_ids.extend(directors_targets)
 
     # 3) Event presence boosts (participant -> creator % for 24h)
-    boosts = _load_boosts_file()
+    boosts = await asyncio.to_thread(_load_boosts_file)
     boost_awards, boosts_changed = _apply_participant_boosts(
         boosts,
         participant_id=earner.id,
@@ -578,7 +602,7 @@ async def award_ap_with_bonuses(
             )
             mention_ids.append(beneficiary_id)
         if boosts_changed:
-            _save_boosts_file(boosts)
+            await asyncio.to_thread(_save_boosts_file, boosts)
 
     await save(data)
 
@@ -724,7 +748,7 @@ async def wipe_ap_in_data(data: Dict[str, Any]) -> None:
     for _, rec in iter_member_records(data):
         rec["ap"] = 0
     # Audit lives in MySQL now; clear it so the next cycle starts fresh.
-    db.execute("DELETE FROM ap_audit")
+    await asyncio.to_thread(db.execute, "DELETE FROM ap_audit")
 
 # -------------------------
 # Persistent View
@@ -1230,7 +1254,7 @@ class APTracking(commands.Cog):
     @tasks.loop(seconds=VOICE_INTERVAL)
     async def voice_loop(self):
         async with self._data_cycle_lock:
-            boosts: Dict[str, Any] = _load_boosts_file()
+            boosts: Dict[str, Any] = await asyncio.to_thread(_load_boosts_file)
             boosts_changed = False
             data = await load()
 
@@ -1259,7 +1283,7 @@ class APTracking(commands.Cog):
 
             await save(data)
             if boosts_changed:
-                _save_boosts_file(boosts)
+                await asyncio.to_thread(_save_boosts_file, boosts)
 
     @tasks.loop(seconds=CHAT_INTERVAL)
     async def chat_loop(self):
@@ -1273,7 +1297,7 @@ class APTracking(commands.Cog):
         self._last_thread_boost.clear()
 
         async with self._data_cycle_lock:
-            boosts: Dict[str, Any] = _load_boosts_file()
+            boosts: Dict[str, Any] = await asyncio.to_thread(_load_boosts_file)
             boosts_changed = False
             data   = await load()
 
@@ -1312,7 +1336,7 @@ class APTracking(commands.Cog):
 
             await save(data)
             if boosts_changed:
-                _save_boosts_file(boosts)
+                await asyncio.to_thread(_save_boosts_file, boosts)
 
     # -------------------------
     # Slash Commands
@@ -1515,7 +1539,7 @@ class APTracking(commands.Cog):
         # Store the JSON backup in MySQL (capped per guild) instead of the
         # Railway volume. The CSV is delivered as a Discord attachment below.
         try:
-            add_ap_backup(interaction.guild.id, f"ap_backup_{interaction.guild.id}_{ts}.json", data)
+            await asyncio.to_thread(add_ap_backup, interaction.guild.id, f"ap_backup_{interaction.guild.id}_{ts}.json", data)
         except Exception:
             pass
 
@@ -2000,7 +2024,7 @@ class APTracking(commands.Cog):
         # ── 3. Award the difference ───────────────────────────────────────────
         data = await load()   # re-load fresh to avoid stale snapshot
         ceos, dirs = self._get_leadership_ids(guild)
-        boosts: Dict[str, Any] = _load_boosts_file()
+        boosts: Dict[str, Any] = await asyncio.to_thread(_load_boosts_file)
         boosts_changed = False
 
         corrected_members = 0
@@ -2013,7 +2037,7 @@ class APTracking(commands.Cog):
                 continue
 
             expected_windows = len(buckets)
-            already_credited = _count_credited_chat_entries(member_id)
+            already_credited = await asyncio.to_thread(_count_credited_chat_entries, member_id)
 
             missing = expected_windows - already_credited
             if missing <= 0:
@@ -2038,7 +2062,7 @@ class APTracking(commands.Cog):
 
         await save(data)
         if boosts_changed:
-            _save_boosts_file(boosts)
+            await asyncio.to_thread(_save_boosts_file, boosts)
 
         # ── 4. Log to hierarchy channel ───────────────────────────────────────
         try:
