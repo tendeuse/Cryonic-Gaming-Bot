@@ -80,7 +80,7 @@ IMMUNE_ROLES: Set[str] = {
 }
 
 # Cross-channel duplicate detection.
-DUP_WINDOW_SECONDS = 90        # look-back window for "same message, many channels"
+DUP_WINDOW_SECONDS = 2         # look-back window for "same message, many channels"
 DUP_MIN_CHANNELS = 2           # posting identical payload to >= this many channels
 RECENT_BUFFER_SECONDS = 120    # how long we keep messages for cross-channel cleanup
 
@@ -341,11 +341,16 @@ class AntiScam(commands.Cog):
             reason = f"scam keywords matched (score {score})"
 
         # ── Signal 3: cross-channel duplicate flood ─────────────────────
+        # Only count copies posted within DUP_WINDOW_SECONDS of *now*: a real
+        # member won't fire the same message+images into several channels in a
+        # 2s burst, but a spam bot does. (The buffer itself is kept longer, for
+        # post-action cleanup — see RECENT_BUFFER_SECONDS.)
         if reason is None:
+            now = time.monotonic()
             same_fp_channels = {
                 m.channel.id
                 for (m, f, _ts) in self._recent[key]
-                if f == fp
+                if f == fp and now - _ts <= DUP_WINDOW_SECONDS
             }
             has_payload = bool(message.attachments) or len(message.content) >= 8
             if has_payload and len(same_fp_channels) >= DUP_MIN_CHANNELS:
