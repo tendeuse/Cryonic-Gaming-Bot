@@ -10,7 +10,7 @@
 #     • The applicant
 #     • ARC Security Administration Council
 #     • ARC Security Corporation Leader
-#     • ARC General                          ← added vs appeal_ticket.py
+#     • ARC Lieutenant and above (Lieutenant, Commander, General)
 # - The ticket auto-posts the applicant's event-participation history and
 #   test/certification status by reading the same data files arc_seat.py
 #   writes to (roles on the member, signature_tagging_attempts.json,
@@ -47,6 +47,8 @@ STAFF_ROLES: tuple[str, ...] = (
     "ARC Security Administration Council",
     "ARC Security Corporation Leader",
     "ARC General",
+    "ARC Commander",
+    "ARC Lieutenant",
 )
 
 # Roles allowed to run /transfer_setup
@@ -225,7 +227,7 @@ def _build_ticket_embeds(
             f"Application submitted by {creator.mention}.\n\n"
             "**ARC Security Administration Council**, "
             "**ARC Security Corporation Leader**, and "
-            "**ARC General** will review this application and respond "
+            "**ARC Lieutenant and above** will review this application and respond "
             "as soon as possible.\n\n"
             "When the review is complete, press **Close Ticket** to close this ticket."
         ),
@@ -738,7 +740,7 @@ class CorpTransferCog(commands.Cog, name="CorpTransferCog"):
             attach_files=True,
         )
 
-        # Staff roles (Admin Council + Corp Leader + ARC General)
+        # Staff roles (Admin Council + Corp Leader + ARC Lieutenant and above)
         for role in _staff_roles(guild):
             overwrites[role] = discord.PermissionOverwrite(
                 view_channel=True,

@@ -79,6 +79,7 @@ QUESTIONS: List[str] = [
     "Ensigns are required to host a minimum of 3 events/classes per week. "
     "Are you able to commit to this? If yes, what types of events/classes would "
     "you propose hosting?",
+    "What type of event would you most like to run, and how would you organize it?",
     "How would you approach training and onboarding new members so they feel "
     "welcomed and understand the rules?",
     "Describe a time you had to handle a conflict or disagreement between members. "
