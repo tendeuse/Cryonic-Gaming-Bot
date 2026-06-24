@@ -2560,15 +2560,15 @@ class EventCreator(commands.Cog):
         await refresh(self.bot, event_id)
 
         # ── Directive credit ──────────────────────────────────────────────────
-        # If this event was created from a weekly Directive focus, notify the
-        # Directive cog so the officer's progress ticks up by one.
-        if event.get("directive_officer_id"):
-            dcog = self.bot.cogs.get("DirectiveCog")
-            if dcog:
-                try:
-                    await dcog.credit_directive_completion(event)
-                except Exception as e:
-                    print(f"[event_creator] directive credit failed for {event_id}: {e}")
+        # Notify the Directive cog on every finalize. It credits the op when the
+        # event carries a directive tag OR its title matches a directive op name
+        # (crediting the creator); it returns "no_directive" cheaply otherwise.
+        dcog = self.bot.cogs.get("DirectiveCog")
+        if dcog:
+            try:
+                await dcog.credit_directive_completion(event)
+            except Exception as e:
+                print(f"[event_creator] directive credit failed for {event_id}: {e}")
 
         # Clean up in-memory state
         self._vc_event_map.pop(vc_id, None)

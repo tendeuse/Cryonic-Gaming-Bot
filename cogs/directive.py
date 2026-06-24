@@ -779,12 +779,29 @@ class DirectiveCog(commands.Cog):
         Returns one of:
           "no_directive" | "not_qualified" | "wrong_cycle" | "credited"
         """
-        officer_id = event.get("directive_officer_id")
+        # Two ways an event counts toward an officer's weekly total:
+        #   1. It carries the directive_officer_id tag set by the panel flow.
+        #   2. Name fallback — its title matches one of the directive op names
+        #      (ALL_TITLES), in which case it is credited to its creator. This
+        #      makes correctly-named ops count even when they were created
+        #      outside the #arc-directives panels.
+        officer_id   = event.get("directive_officer_id")
+        name_matched = False
+        if not officer_id and event.get("title") in ALL_TITLES:
+            officer_id   = event.get("creator")
+            name_matched = True
         if not officer_id:
             return "no_directive"
 
         guild_id = event.get("guild_id")
         guild = self.bot.get_guild(int(guild_id)) if guild_id else None
+
+        # The name fallback only credits genuine tracked ARC officers — a random
+        # member naming their event "PVP Hunt" must not earn directive progress.
+        if name_matched:
+            m = guild.get_member(int(officer_id)) if guild else None
+            if not m or not is_tracked_officer(m):
+                return "no_directive"
 
         # Minimum attendance: creator + at least 1 other (≥15 min in VC).
         # Skipped when force=True (admin manually vouching for the op).
@@ -812,8 +829,13 @@ class DirectiveCog(commands.Cog):
         async with self._data_lock:
             data = await load_data()
 
-            # Ignore stragglers finalized after a Monday rollover.
-            if event.get("directive_cycle_start") != data.get("week_start"):
+            # Ignore stragglers finalized after a Monday rollover. Name-matched
+            # ops carry no stored cycle; they are finalized now, so they always
+            # belong to the current week.
+            if (
+                not name_matched
+                and event.get("directive_cycle_start") != data.get("week_start")
+            ):
                 return "wrong_cycle"
 
             rec = _host_record(data, int(officer_id))
@@ -1175,9 +1197,11 @@ class DirectiveCog(commands.Cog):
     ):
         if not isinstance(interaction.user, discord.Member) or not (
             interaction.user.guild_permissions.administrator
+            or has_role(interaction.user, CEO_ROLE)
         ):
             await interaction.response.send_message(
-                "❌ Only administrators can manually credit an event.",
+                f"❌ Only administrators or **{CEO_ROLE}** can manually credit "
+                "an event.",
                 ephemeral=True,
             )
             return
@@ -1209,16 +1233,21 @@ class DirectiveCog(commands.Cog):
             )
             return
 
-        if not match_event.get("directive_officer_id"):
+        if not match_event.get("directive_officer_id") and (
+            match_event.get("title") not in ALL_TITLES
+        ):
             await interaction.followup.send(
                 f"❌ **{match_event.get('title', 'That event')}** is not a "
-                "directive op (no host attached), so there's nothing to credit.",
+                "directive op (no host attached and its name isn't a directive "
+                "op title), so there's nothing to credit.",
                 ephemeral=True,
             )
             return
 
         status     = await self.credit_directive_completion(match_event, force=True)
-        officer_id = match_event.get("directive_officer_id")
+        officer_id = (
+            match_event.get("directive_officer_id") or match_event.get("creator")
+        )
         title      = match_event.get("title", "the op")
 
         replies = {
