@@ -109,6 +109,19 @@ def is_restricted_title(title: str) -> bool:
     return title in RESTRICTED_TITLES
 
 
+def matched_directive_title(title: Optional[str]) -> Optional[str]:
+    """Return the canonical directive op name matching `title`
+    case-insensitively (ignoring surrounding whitespace), or None if `title`
+    is not a directive op name."""
+    if not title:
+        return None
+    norm = title.strip().casefold()
+    for t in ALL_TITLES:
+        if t.casefold() == norm:
+            return t
+    return None
+
+
 # =====================
 # PERSISTENCE
 # =====================
@@ -787,7 +800,7 @@ class DirectiveCog(commands.Cog):
         #      outside the #arc-directives panels.
         officer_id   = event.get("directive_officer_id")
         name_matched = False
-        if not officer_id and event.get("title") in ALL_TITLES:
+        if not officer_id and matched_directive_title(event.get("title")):
             officer_id   = event.get("creator")
             name_matched = True
         if not officer_id:
@@ -1234,7 +1247,7 @@ class DirectiveCog(commands.Cog):
             return
 
         if not match_event.get("directive_officer_id") and (
-            match_event.get("title") not in ALL_TITLES
+            not matched_directive_title(match_event.get("title"))
         ):
             await interaction.followup.send(
                 f"❌ **{match_event.get('title', 'That event')}** is not a "
