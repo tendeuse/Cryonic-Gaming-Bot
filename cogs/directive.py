@@ -800,9 +800,15 @@ class DirectiveCog(commands.Cog):
         #      outside the #arc-directives panels.
         officer_id   = event.get("directive_officer_id")
         name_matched = False
-        if not officer_id and matched_directive_title(event.get("title")):
-            officer_id   = event.get("creator")
-            name_matched = True
+        if not officer_id:
+            if matched_directive_title(event.get("title")):
+                officer_id   = event.get("creator")
+                name_matched = True
+            elif force:
+                # Manual credit by an admin/CEO — they are vouching for the op,
+                # so credit its creator regardless of the event's name.
+                officer_id   = event.get("creator")
+                name_matched = True
         if not officer_id:
             return "no_directive"
 
@@ -811,7 +817,8 @@ class DirectiveCog(commands.Cog):
 
         # The name fallback only credits genuine tracked ARC officers — a random
         # member naming their event "PVP Hunt" must not earn directive progress.
-        if name_matched:
+        # Skipped under force, where an admin is manually vouching for the op.
+        if name_matched and not force:
             m = guild.get_member(int(officer_id)) if guild else None
             if not m or not is_tracked_officer(m):
                 return "no_directive"
@@ -1246,13 +1253,14 @@ class DirectiveCog(commands.Cog):
             )
             return
 
+        # Manual credit doesn't care about the event's name — an admin/CEO is
+        # vouching for it. Only require that the event has a host to credit.
         if not match_event.get("directive_officer_id") and (
-            not matched_directive_title(match_event.get("title"))
+            not match_event.get("creator")
         ):
             await interaction.followup.send(
-                f"❌ **{match_event.get('title', 'That event')}** is not a "
-                "directive op (no host attached and its name isn't a directive "
-                "op title), so there's nothing to credit.",
+                f"❌ **{match_event.get('title', 'That event')}** has no host or "
+                "creator attached, so there's nothing to credit.",
                 ephemeral=True,
             )
             return
