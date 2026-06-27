@@ -69,9 +69,14 @@ BOOSTS_FILE = PERSIST_ROOT / "ap_boosts.json"
 # CONFIG
 # =====================
 VOICE_INTERVAL  = 180     # 3 minutes
-VOICE_AP        = 1
-CHAT_INTERVAL   = 1800    # 30 minutes
-CHAT_AP         = 15
+# Voice AP is expressed as an hourly rate and converted to a per-tick amount,
+# so the loop cadence can change without altering the effective earn rate.
+VOICE_AP_PER_HOUR       = 10   # normal voice activity        -> 10 AP / hour
+EVENT_VOICE_AP_PER_HOUR = 40   # members in an active event VC -> 40 AP / hour
+VOICE_AP        = VOICE_AP_PER_HOUR       * VOICE_INTERVAL / 3600   # 0.5 per 3-min tick
+EVENT_VOICE_AP  = EVENT_VOICE_AP_PER_HOUR * VOICE_INTERVAL / 3600   # 2.0 per 3-min tick
+CHAT_INTERVAL   = 3600    # 60 minutes
+CHAT_AP         = 15      # 15 AP per hour-long chat window
 MIN_ACCOUNT_AGE_DAYS = 14  # Alt-account mitigation
 
 # ARC Genesis thread boost:
@@ -1258,11 +1263,18 @@ class APTracking(commands.Cog):
             boosts_changed = False
             data = await load()
 
+            # VC ids that belong to an active event (participating/hosting earns
+            # the elevated event voice rate). Pulled from the event cog's live
+            # tracking map; empty/absent if the cog isn't loaded.
+            event_cog = self.bot.get_cog("EventCreator")
+            event_vc_ids = set(getattr(event_cog, "_vc_event_map", {}) or {})
+
             for guild in self.bot.guilds:
                 ceos, dirs = self._get_leadership_ids(guild)
                 for vc in guild.voice_channels:
                     if vc == guild.afk_channel:
                         continue
+                    is_event_vc = vc.id in event_vc_ids
                     members = [
                         m for m in vc.members
                         if isinstance(m, discord.Member)
@@ -1274,9 +1286,11 @@ class APTracking(commands.Cog):
                     ]
                     if len(members) < 2:
                         continue
+                    voice_ap     = EVENT_VOICE_AP if is_event_vc else VOICE_AP
+                    voice_source = "voice (event)" if is_event_vc else "voice"
                     for m in members:
                         _apply_ap_to_data(
-                            data, m, float(VOICE_AP), "voice", None,
+                            data, m, float(voice_ap), voice_source, None,
                             ceos, dirs, boosts,
                         )
                         await asyncio.sleep(0)

@@ -2332,11 +2332,22 @@ class EventCreator(commands.Cog):
     @tasks.loop(seconds=120)
     async def _vc_save_loop(self):
         """
-        Saves in-memory cumulative VC times to disk so that a bot restart
-        mid-event does not lose all attendance progress.
+        Banks in-memory cumulative VC times to disk so attendance is cumulative
+        across leaves/rejoins and survives a bot restart mid-event.
 
-        For members currently inside the event VC, their ongoing session time
-        is estimated and added to their persisted cumulative total.
+        This loop is the source of truth for time and is self-healing: rather
+        than trusting that every join/leave fired an on_voice_state_update, it
+        reconciles against who is *actually* in the event VC right now. Each
+        tick it banks every present member's elapsed time into their cumulative
+        total and re-baselines their join timestamp, so:
+
+          • A missed join event can't make a whole session vanish — anyone
+            physically in the VC is picked up and credited from here on.
+          • A missed leave event (or a restart while the member was away) can't
+            keep counting — members no longer in the VC have their pending
+            session folded in and their timer stopped.
+          • Time already banked is never re-counted, so leaving and rejoining
+            the same event keeps adding up instead of resetting.
         """
         if not self._vc_event_map:
             return
@@ -2350,13 +2361,39 @@ class EventCreator(commands.Cog):
             if not isinstance(event, dict):
                 continue
 
-            cum       = dict(self._vc_cumulative.get(event_id, {}))
-            join_times = self._vc_join_times.get(event_id, {})
+            # Mutate the live in-memory stores directly (not copies) so banked
+            # time and re-baselined timers persist for the next tick/finalize.
+            cum   = self._vc_cumulative.setdefault(event_id, {})
+            joins = self._vc_join_times.setdefault(event_id, {})
 
-            # Credit ongoing sessions (estimate only — not finalised yet)
-            for uid, join_ts in join_times.items():
-                elapsed      = max(0, now - join_ts)
-                cum[uid]     = cum.get(uid, 0) + elapsed
+            # Resolve the actual VC so we can reconcile against real presence.
+            guild = self.bot.get_guild(event.get("guild_id")) if isinstance(event.get("guild_id"), int) else None
+            vc    = guild.get_channel(vc_id) if guild else None
+
+            if isinstance(vc, discord.VoiceChannel):
+                present_ids = {m.id for m in vc.members if not m.bot}
+
+                # Bank + re-baseline everyone currently present (self-healing:
+                # seeds anyone whose join event was missed).
+                for uid in present_ids:
+                    join_ts = joins.get(uid)
+                    if join_ts is not None:
+                        cum[uid] = cum.get(uid, 0) + max(0, now - join_ts)
+                    joins[uid] = now
+
+                # Fold + stop the timer for anyone we were tracking who is no
+                # longer in the VC (self-healing: catches missed leave events).
+                for uid in list(joins.keys()):
+                    if uid not in present_ids:
+                        join_ts = joins.pop(uid)
+                        cum[uid] = cum.get(uid, 0) + max(0, now - join_ts)
+            else:
+                # VC not resolvable (e.g. guild not cached yet) — fall back to a
+                # non-destructive estimate so we never lose progress, without
+                # touching the live timers.
+                for uid, join_ts in list(joins.items()):
+                    cum[uid] = cum.get(uid, 0) + max(0, now - join_ts)
+                    joins[uid] = now
 
             event["vc_cumulative_times"] = {str(k): v for k, v in cum.items()}
             data[event_id]               = event
