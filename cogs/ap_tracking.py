@@ -86,7 +86,7 @@ MIN_ACCOUNT_AGE_DAYS = 14  # Alt-account mitigation
 # threads, and ARC Genesis members earn the normal amount everywhere else.
 GENESIS_ROLE             = "ARC Genesis"
 BOOSTED_THREAD_PARENT_ID = 1463203696417706076
-THREAD_BOOST_MULTIPLIER  = 5
+THREAD_BOOST_MULTIPLIER  = 10
 
 # Roles that bypass the account-age block and trigger retroactive AP catch-up.
 # These are matched by role NAME exactly as they appear in Discord.
