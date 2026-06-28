@@ -257,8 +257,22 @@ _KV_COMPRESS_THRESHOLD = 1_000_000          # ~1 MB of JSON text
 _KV_GZIP_PREFIX = "gzip:b64:"               # marker for a compressed document
 
 
-def _decode_kv(raw: Any) -> Any:
-    """Decode a ``kv_store.data`` column value into a Python object,
+def encode_doc(obj: Any) -> str:
+    """Serialise a JSON document for storage in a ``data`` column.
+
+    Documents larger than ``_KV_COMPRESS_THRESHOLD`` are gzip+base64 compressed
+    and wrapped as a JSON string scalar (prefixed with ``_KV_GZIP_PREFIX``);
+    :func:`decode_doc` reverses this. Used by both the kv_store and the
+    seat_members table so large rows fit hosts that cap a single row (TiDB)."""
+    payload = json.dumps(obj, ensure_ascii=False)
+    if len(payload) > _KV_COMPRESS_THRESHOLD:
+        blob = base64.b64encode(gzip.compress(payload.encode("utf-8"), 6)).decode("ascii")
+        payload = json.dumps(_KV_GZIP_PREFIX + blob)
+    return payload
+
+
+def decode_doc(raw: Any) -> Any:
+    """Decode a stored ``data`` column value into a Python object,
     transparently inflating gzip-compressed documents."""
     if isinstance(raw, (dict, list)):  # driver auto-decoded a JSON object/array
         return raw
@@ -267,6 +281,10 @@ def _decode_kv(raw: Any) -> Any:
         blob = base64.b64decode(val[len(_KV_GZIP_PREFIX):])
         return json.loads(gzip.decompress(blob).decode("utf-8"))
     return val
+
+
+# Back-compat alias (used by the migration/restore scripts).
+_decode_kv = decode_doc
 
 
 def kv_load(name: str, default: Any = None) -> Any:
@@ -291,14 +309,10 @@ def kv_save(name: str, obj: Any) -> None:
     and stored as a JSON string scalar (prefixed with ``_KV_GZIP_PREFIX``);
     :func:`_decode_kv` reverses this on read. This is transparent to callers.
     """
-    payload = json.dumps(obj, ensure_ascii=False)
-    if len(payload) > _KV_COMPRESS_THRESHOLD:
-        blob = base64.b64encode(gzip.compress(payload.encode("utf-8"), 6)).decode("ascii")
-        payload = json.dumps(_KV_GZIP_PREFIX + blob)
     execute(
         "INSERT INTO kv_store (name, data) VALUES (%s, %s) "
         "ON DUPLICATE KEY UPDATE data=VALUES(data), updated_at=CURRENT_TIMESTAMP",
-        (name, payload),
+        (name, encode_doc(obj)),
     )
 
 
@@ -308,6 +322,47 @@ async def akv_load(name: str, default: Any = None) -> Any:
 
 async def akv_save(name: str, obj: Any) -> None:
     await asyncio.to_thread(kv_save, name, obj)
+
+
+# ---------------------------------------------------------------------------
+# arc_seat members (one row per member instead of one giant kv document)
+# ---------------------------------------------------------------------------
+# arc_seat used to embed every member (with multi-MB ESI caches) in a single
+# kv_store document, which grows toward host row-size caps. These helpers store
+# each member as its own row in ``seat_members`` (per-row compression via
+# encode_doc), so no single row carries the whole corp. cogs/arc_seat.py keeps
+# the same in-memory ``data["members"]`` dict — only the persistence is split.
+
+def seat_members_load() -> dict:
+    """Return ``{discord_id_str: member_record}`` from the seat_members table."""
+    rows = fetchall("SELECT discord_id, data FROM seat_members")
+    return {r["discord_id"]: decode_doc(r["data"]) for r in rows}
+
+
+def seat_members_save(members: dict) -> None:
+    """Replace the seat_members table with ``members`` (whole-collection sync).
+
+    Upserts every member in one batch, then deletes any rows no longer present.
+    Raises on failure so the caller can avoid stripping the legacy embedded copy
+    before the table write has succeeded (no-loss migration)."""
+    members = members or {}
+    if not members:
+        # Refuse to wipe the whole table on an empty set — for this corp that is
+        # almost always a transient upstream load failure, not a real "no
+        # members" state. Leaving stale rows is harmless; deleting all is not.
+        print("[db] seat_members_save: empty members set — refusing to wipe table.")
+        return
+    executemany(
+        "INSERT INTO seat_members (discord_id, data) VALUES (%s, %s) "
+        "ON DUPLICATE KEY UPDATE data=VALUES(data), updated_at=CURRENT_TIMESTAMP",
+        [(str(k), encode_doc(v)) for k, v in members.items()],
+    )
+    keys = [str(k) for k in members.keys()]
+    placeholders = ",".join(["%s"] * len(keys))
+    execute(
+        f"DELETE FROM seat_members WHERE discord_id NOT IN ({placeholders})",
+        tuple(keys),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +494,17 @@ _SCHEMA: tuple[str, ...] = (
         PRIMARY KEY (discord_user_id, character_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+    # --- arc_seat members: one row per Discord member (was embedded in the
+    #     arc_seat kv document). data is a JSON document, gzip-compressed by
+    #     encode_doc when large so no single member row hits a host row cap. ---
+    """
+    CREATE TABLE IF NOT EXISTS seat_members (
+        discord_id VARCHAR(32) PRIMARY KEY,
+        data       JSON NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                   ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
     # --- buyback_contracts.db: type_cache (Buyback.py) ---
     """
     CREATE TABLE IF NOT EXISTS type_cache (
@@ -511,6 +577,7 @@ def init_db() -> None:
 RELATIONAL_TABLES: tuple[str, ...] = (
     "ap_audit",
     "missions", "ap_ledger", "char_discord_map", "eve_tokens", "seat_tokens",
+    "seat_members",
     "type_cache", "price_cache", "char_name_cache", "buyback_paid",
     "tickets", "invites",
 )

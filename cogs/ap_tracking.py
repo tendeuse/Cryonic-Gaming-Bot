@@ -922,6 +922,11 @@ def _apply_ap_to_data(
 # -------------------------
 # Cog
 # -------------------------
+# Audit rows older than this are pruned daily so the append-only ap_audit
+# table (grows ~30k rows/day) does not grow without bound.
+AP_AUDIT_RETENTION_DAYS = 120
+
+
 class APTracking(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -945,6 +950,46 @@ class APTracking(commands.Cog):
             self.voice_loop.start()
         if not self.chat_loop.is_running():
             self.chat_loop.start()
+        if not self.ap_audit_retention_loop.is_running():
+            self.ap_audit_retention_loop.start()
+
+    @tasks.loop(hours=24)
+    async def ap_audit_retention_loop(self):
+        """Prune ap_audit rows older than AP_AUDIT_RETENTION_DAYS days.
+
+        The audit log is append-only and grows ~30k rows/day; without this it
+        would grow without bound. ``ts`` is a naive-UTC isoformat string, so a
+        lexicographic ``ts < cutoff`` comparison is chronological. Deletes are
+        batched (LIMIT) so a large first prune cannot exceed the destination's
+        transaction-size limit (e.g. TiDB).
+        """
+        cutoff = (
+            datetime.datetime.utcnow()
+            - datetime.timedelta(days=AP_AUDIT_RETENTION_DAYS)
+        ).isoformat()
+        total = 0
+        try:
+            while True:
+                _, n = await asyncio.to_thread(
+                    db.execute,
+                    "DELETE FROM ap_audit WHERE ts < %s LIMIT 5000",
+                    (cutoff,),
+                )
+                total += n
+                if n < 5000:
+                    break
+                await asyncio.sleep(0.5)  # be gentle on the DB between batches
+            if total:
+                print(
+                    f"[ap_tracking] ap_audit retention: pruned {total} row(s) "
+                    f"older than {AP_AUDIT_RETENTION_DAYS}d (ts < {cutoff})."
+                )
+        except Exception as e:
+            print(f"[ap_tracking] ap_audit retention error: {e}")
+
+    @ap_audit_retention_loop.before_loop
+    async def _before_ap_audit_retention(self):
+        await self.bot.wait_until_ready()
 
     # -------------------------
     # Leadership ID cache helpers

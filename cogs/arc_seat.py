@@ -308,22 +308,58 @@ def _get_file_lock() -> asyncio.Lock:
 
 
 def _atomic_write(data: Dict[str, Any]) -> None:
-    # default=str preserved the original JSON coercion of non-serialisable values.
-    _db.kv_save("arc_seat", json.loads(json.dumps(data, default=str)))
+    # Members are persisted one row per member in the seat_members table; the
+    # rest of the document (config, oauth_states, skill_snapshots) stays in the
+    # arc_seat kv document. Members are written FIRST so a failure there never
+    # strips the embedded copy before the table is populated (no-loss migration
+    # from the old single-document layout). default=str keeps the original JSON
+    # coercion of non-serialisable values.
+    coerced = json.loads(json.dumps(data, default=str))
+    members = coerced.pop("members", {}) or {}
+    _db.seat_members_save(members)
+    _db.kv_save("arc_seat", coerced)
+
+
+def _assemble_seat_data(doc: Any) -> Dict[str, Any]:
+    """Combine the arc_seat kv document with the seat_members table into the
+    in-memory shape the cog expects (``data['members']`` populated).
+
+    Members now live one row per member in seat_members. If that table is empty
+    but the kv document still carries a legacy embedded ``members`` dict (data
+    written before the split), use that — it migrates to the table on the next
+    save. A seat_members read error falls back to the embedded copy rather than
+    dropping members."""
+    data = doc if isinstance(doc, dict) else _default_data()
+    try:
+        members = _db.seat_members_load()
+    except Exception as e:
+        print(f"[ARC-SEAT] seat_members load error: {e} — using embedded copy")
+        members = {}
+    if not members and isinstance(data.get("members"), dict):
+        members = data["members"]
+    data["members"] = members
+    # Back-fill any missing top-level keys
+    for k, v in _default_data().items():
+        data.setdefault(k, v)
+    return data
+
+
+def _load_seat_data_sync() -> Dict[str, Any]:
+    """Synchronous loader for the FastAPI OAuth-callback thread (no event loop)."""
+    try:
+        return _assemble_seat_data(_db.kv_load("arc_seat", None))
+    except Exception as e:
+        print(f"[ARC-SEAT] sync data load error: {e} — starting fresh")
+        return _default_data()
 
 
 async def load_seat_data() -> Dict[str, Any]:
     async with _get_file_lock():
         try:
-            # Offload the (potentially multi-MB) blocking MySQL read to a
+            # Offload the (potentially multi-MB) blocking MySQL reads to a
             # worker thread so the Discord event loop / heartbeat never stalls.
-            data = await asyncio.to_thread(_db.kv_load, "arc_seat", None)
-            if not isinstance(data, dict):
-                return _default_data()
-            # Back-fill any missing top-level keys
-            for k, v in _default_data().items():
-                data.setdefault(k, v)
-            return data
+            doc = await asyncio.to_thread(_db.kv_load, "arc_seat", None)
+            return await asyncio.to_thread(_assemble_seat_data, doc)
         except Exception as e:
             print(f"[ARC-SEAT] Data load error: {e} — starting fresh")
             return _default_data()
@@ -1501,12 +1537,10 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         )
 
         # ── 2. Update arc_seat doc  (sync write — no asyncio lock) ───
-        try:
-            data = _db.kv_load("arc_seat", None)
-            if not isinstance(data, dict):
-                data = _default_data()
-        except Exception:
-            data = _default_data()
+        # Use the sync loader so members come from the seat_members table, not
+        # just the (members-less) kv document — otherwise saving here would drop
+        # every other member.
+        data = _load_seat_data_sync()
 
         key     = str(discord_id)
         members = data.setdefault("members", {})
