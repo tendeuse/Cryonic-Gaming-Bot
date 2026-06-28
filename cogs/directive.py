@@ -843,9 +843,26 @@ class DirectiveCog(commands.Cog):
                     )
                 return "not_qualified"
 
-        event_key = event.get("short_id") or event.get("message")
+        # Dedup key: prefer the globally-unique event UUID, then the short id,
+        # then the announcement message id. Two events with the SAME NAME each
+        # get their own key, so both count — only the *same* event (e.g. a
+        # reopen + re-finalize) is ever skipped as a duplicate.
+        candidate_ids = {
+            str(x) for x in (
+                event.get("uuid"),
+                event.get("short_id"),
+                event.get("message"),
+            )
+            if x
+        }
+        event_key = (
+            event.get("uuid")
+            or event.get("short_id")
+            or event.get("message")
+        )
         new_bonuses = 0
         count = 0
+        status = "credited"
         async with self._data_lock:
             data = await load_data()
 
@@ -856,55 +873,74 @@ class DirectiveCog(commands.Cog):
                 not name_matched
                 and event.get("directive_cycle_start") != data.get("week_start")
             ):
-                return "wrong_cycle"
+                status = "wrong_cycle"
+            else:
+                rec = _host_record(data, int(officer_id))
 
-            rec = _host_record(data, int(officer_id))
+                # Skip only if THIS exact event was already credited this week —
+                # matched on any of its identifiers so a key-format change can
+                # never cause a re-credit, and distinct same-named events never
+                # collide.
+                already = any(
+                    str(e.get("event_id")) in candidate_ids
+                    for e in rec.get("events", [])
+                    if isinstance(e, dict)
+                )
+                if candidate_ids and already:
+                    status = "already_counted"
+                else:
+                    rec["count"] = int(rec.get("count", 0)) + 1
+                    rec.setdefault("events", []).append({
+                        "title":        event.get("title"),
+                        "event_id":     event_key,
+                        "finalized_at": utcnow_iso(),
+                    })
+                    count = rec["count"]
 
-            # Don't double-count an already-credited event.
-            already = any(
-                e.get("event_id") == event_key
-                for e in rec.get("events", [])
-                if isinstance(e, dict)
-            )
-            if event_key is not None and already:
-                return "credited"
+                    # AP bonus: one 200-AP grant per completed block of 3 events.
+                    earned_blocks = count // AP_PER_EVENTS
+                    new_bonuses = earned_blocks - int(rec.get("bonuses_awarded", 0))
+                    if new_bonuses > 0:
+                        rec["bonuses_awarded"] = earned_blocks
 
-            rec["count"] = int(rec.get("count", 0)) + 1
-            rec.setdefault("events", []).append({
-                "title":        event.get("title"),
-                "event_id":     event_key,
-                "finalized_at": utcnow_iso(),
-            })
-            count = rec["count"]
+                    await save_data(data)
 
-            # AP bonus: one 200-AP grant for every completed block of 3 events.
-            earned_blocks = count // AP_PER_EVENTS
-            new_bonuses = earned_blocks - int(rec.get("bonuses_awarded", 0))
-            if new_bonuses > 0:
-                rec["bonuses_awarded"] = earned_blocks
-
-            await save_data(data)
-
+        # All logging happens outside the data lock so an outcome is never
+        # silent — every finalize now states whether it counted, and why not.
         if guild:
-            await self._refresh_panels(guild, data)
             m = guild.get_member(int(officer_id))
             name = m.display_name if m else f"<@{officer_id}>"
-            await _log(
-                guild,
-                f"🏅 **{name}** hosted **{event.get('title')}** — "
-                f"**{count}** event(s) this week.",
-            )
-            if new_bonuses > 0 and m:
-                total = new_bonuses * AP_BONUS
-                awarded = await self._award_bonus(guild, m, total, count)
-                if awarded:
-                    await _log(
-                        guild,
-                        f"💰 **{name}** earned **{total} AP** for hosting "
-                        f"{count} events this week (3-event bonus).",
-                    )
+            title = event.get("title")
+            if status == "credited":
+                await self._refresh_panels(guild, data)
+                await _log(
+                    guild,
+                    f"🏅 **{name}** hosted **{title}** — "
+                    f"**{count}** event(s) this week.",
+                )
+                if new_bonuses > 0 and m:
+                    total = new_bonuses * AP_BONUS
+                    awarded = await self._award_bonus(guild, m, total, count)
+                    if awarded:
+                        await _log(
+                            guild,
+                            f"💰 **{name}** earned **{total} AP** for hosting "
+                            f"{count} events this week (3-event bonus).",
+                        )
+            elif status == "already_counted":
+                await _log(
+                    guild,
+                    f"ℹ️ **{name}**'s op **{title}** was already counted this "
+                    "week (duplicate finalize) — not counted again.",
+                )
+            elif status == "wrong_cycle":
+                await _log(
+                    guild,
+                    f"⚠️ **{name}**'s op **{title}** belongs to a previous week "
+                    "(cycle already reset) — not counted.",
+                )
 
-        return "credited"
+        return status
 
     async def _award_bonus(
         self, guild: discord.Guild, member: discord.Member, amount: int, count: int
@@ -1275,6 +1311,9 @@ class DirectiveCog(commands.Cog):
             "credited":
                 f"✅ Credited **{title}** to <@{officer_id}> toward their weekly "
                 "host count.",
+            "already_counted":
+                f"ℹ️ **{title}** was already counted toward <@{officer_id}>'s "
+                "weekly host total this week.",
             "wrong_cycle":
                 f"⚠️ **{title}** belongs to a previous week (the cycle has since "
                 "reset), so it can't be credited toward the current week.",

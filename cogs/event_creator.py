@@ -2603,7 +2603,11 @@ class EventCreator(commands.Cog):
         dcog = self.bot.cogs.get("DirectiveCog")
         if dcog:
             try:
-                await dcog.credit_directive_completion(event)
+                # Stamp the globally-unique event UUID so the directive dedup
+                # keys on it — distinct same-named ops can never collide.
+                event.setdefault("uuid", event_id)
+                status = await dcog.credit_directive_completion(event)
+                print(f"[event_creator] directive credit for {event_id}: {status}")
             except Exception as e:
                 print(f"[event_creator] directive credit failed for {event_id}: {e}")
 
