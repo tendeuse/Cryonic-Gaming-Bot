@@ -135,7 +135,10 @@ def get_pool() -> PooledDB:
         ssl_cfg = _ssl_config()
         _pool = PooledDB(
             creator=pymysql,
-            maxconnections=10,
+            # Keep the pool small: each pooled connection can retain a multi-MB
+            # read buffer that Python won't always return to the OS, which inflates
+            # RSS. The bot rarely needs many concurrent DB ops, so cap low.
+            maxconnections=4,
             mincached=0,         # don't eagerly connect at pool creation (see wait_until_ready)
             blocking=True,
             ping=4,              # ping a connection before handing it out (reconnect if dropped)
@@ -143,10 +146,12 @@ def get_pool() -> PooledDB:
             charset="utf8mb4",
             cursorclass=DictCursor,
             connect_timeout=10,
-            # Some kv documents (e.g. arc_seat) are tens of MB; raise the client
-            # packet ceiling well above PyMySQL's 16MB default. The server's own
-            # max_allowed_packet (64MB on MySQL 8) still applies.
-            max_allowed_packet=128 * 1024 * 1024,
+            # No single row is large anymore (arc_seat members were split into
+            # their own rows and big kv docs are gzip-compressed), so the old
+            # 128 MB ceiling — which let connections buffer the giant arc_seat
+            # blob and balloon memory — is no longer needed. 16 MB is PyMySQL's
+            # default and far more than any current row.
+            max_allowed_packet=16 * 1024 * 1024,
             **({"ssl": ssl_cfg} if ssl_cfg is not None else {}),
             **cfg,
         )
