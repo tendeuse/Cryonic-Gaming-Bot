@@ -972,7 +972,8 @@ class APTracking(commands.Cog):
             while True:
                 _, n = await asyncio.to_thread(
                     db.execute,
-                    "DELETE FROM ap_audit WHERE ts < %s LIMIT 5000",
+                    "DELETE FROM ap_audit WHERE id IN "
+                    "(SELECT id FROM ap_audit WHERE ts < %s ORDER BY id LIMIT 5000)",
                     (cutoff,),
                 )
                 total += n

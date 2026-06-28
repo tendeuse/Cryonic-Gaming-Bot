@@ -99,7 +99,7 @@ def init_db() -> None:
 def _register_ticket_sync(ticket_id: str, name: str, open_time: str, end_time: str) -> bool:
     """Insert a ticket. Returns True if newly inserted, False if it already existed."""
     _, rowcount = dbm.execute(
-        "INSERT IGNORE INTO tickets (ticket_id, name, open_time, end_time) VALUES (%s, %s, %s, %s)",
+        "INSERT OR IGNORE INTO tickets (ticket_id, name, open_time, end_time) VALUES (%s, %s, %s, %s)",
         (ticket_id, name, open_time, end_time),
     )
     return rowcount > 0

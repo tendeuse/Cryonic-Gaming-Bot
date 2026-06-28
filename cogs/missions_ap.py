@@ -143,7 +143,7 @@ class MissionsAP(commands.Cog):
         await asyncio.to_thread(
             db.execute,
             "INSERT INTO char_discord_map(character_name, discord_id) VALUES(%s,%s) "
-            "ON DUPLICATE KEY UPDATE discord_id=VALUES(discord_id)",
+            "ON CONFLICT(character_name) DO UPDATE SET discord_id=excluded.discord_id",
             (character_name, str(interaction.user.id)),
         )
         await interaction.followup.send(

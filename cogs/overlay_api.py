@@ -704,12 +704,12 @@ def _save_eve_token(db_path, discord_user_id: int, character_id: int,
             (discord_user_id, character_id, character_name,
              access_token, refresh_token, expires_at)
         VALUES (%s,%s,%s,%s,%s,%s)
-        ON DUPLICATE KEY UPDATE
-            character_id=VALUES(character_id),
-            character_name=VALUES(character_name),
-            access_token=VALUES(access_token),
-            refresh_token=VALUES(refresh_token),
-            expires_at=VALUES(expires_at)
+        ON CONFLICT(discord_user_id) DO UPDATE SET
+            character_id=excluded.character_id,
+            character_name=excluded.character_name,
+            access_token=excluded.access_token,
+            refresh_token=excluded.refresh_token,
+            expires_at=excluded.expires_at
     """, (discord_user_id, character_id, character_name,
             access_token, refresh_token, _time.time() + expires_in))
 
