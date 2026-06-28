@@ -21,7 +21,15 @@ ADMIN_SYNC_ROLE_NAMES = {
     # "ARC Security Administration Council",
 }
 
-intents = discord.Intents.all()
+# Explicit intents instead of Intents.all(). Dropping `presences` (which the
+# bot never reads — no member.status/activity usage anywhere) stops discord.py
+# from caching presence state for every member, a large and needless RAM cost.
+# Keep the privileged members + message_content intents (member tracking,
+# anti-scam, AP-from-chat) plus the default set (guilds, messages, reactions,
+# voice_states, ...).
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
 
 
 def is_admin_or_allowed_role(member: discord.Member) -> bool:
