@@ -31,6 +31,8 @@ Connection settings come from the Railway MySQL plugin env vars
 from __future__ import annotations
 
 import asyncio
+import base64
+import gzip
 import json
 import os
 import time
@@ -97,11 +99,40 @@ def _config() -> dict:
     )
 
 
+def _truthy(val: Optional[str]) -> bool:
+    return (val or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ssl_config() -> Optional[dict]:
+    """Return a PyMySQL ``ssl`` dict when TLS is requested, else ``None``.
+
+    External managed MySQL (TiDB Cloud Serverless, Aiven, PlanetScale, etc.)
+    require TLS. Enable it by setting ``MYSQL_SSL=1``. Provide ``MYSQL_SSL_CA``
+    with a path to a CA bundle if your provider hands you one (Aiven does);
+    otherwise we fall back to certifi's public CA bundle, which validates
+    TiDB Serverless out of the box (its cert chains to a public root).
+
+    Railway's internal/private MySQL does NOT speak TLS, so leave ``MYSQL_SSL``
+    unset there.
+    """
+    if not _truthy(os.getenv("MYSQL_SSL")):
+        return None
+    ca = os.getenv("MYSQL_SSL_CA")
+    if not ca:
+        try:
+            import certifi
+            ca = certifi.where()
+        except Exception:
+            ca = None
+    return {"ca": ca} if ca else {}
+
+
 def get_pool() -> PooledDB:
     """Return the process-wide connection pool, creating it on first use."""
     global _pool
     if _pool is None:
         cfg = _config()
+        ssl_cfg = _ssl_config()
         _pool = PooledDB(
             creator=pymysql,
             maxconnections=10,
@@ -116,9 +147,13 @@ def get_pool() -> PooledDB:
             # packet ceiling well above PyMySQL's 16MB default. The server's own
             # max_allowed_packet (64MB on MySQL 8) still applies.
             max_allowed_packet=128 * 1024 * 1024,
+            **({"ssl": ssl_cfg} if ssl_cfg is not None else {}),
             **cfg,
         )
-        print(f"[DB] MySQL pool configured -> {cfg['host']}:{cfg['port']}/{cfg['database']}")
+        print(
+            f"[DB] MySQL pool configured -> {cfg['host']}:{cfg['port']}/{cfg['database']}"
+            f"{' (TLS)' if ssl_cfg is not None else ''}"
+        )
     return _pool
 
 
@@ -213,6 +248,27 @@ def executemany(sql: str, seq_of_params) -> int:
 # Key-value document store (replacement for the per-cog JSON files)
 # ---------------------------------------------------------------------------
 
+# Documents whose serialised JSON exceeds this are gzip-compressed before
+# storage. A few kv docs (notably ``arc_seat``, ~24MB of embedded ESI data)
+# are far too big for hosts that cap a single row — e.g. TiDB's 6MB entry
+# limit. Compression (~10x on this data) keeps them well under such caps and
+# also trims the bytes shipped over the wire. Small docs stay as readable JSON.
+_KV_COMPRESS_THRESHOLD = 1_000_000          # ~1 MB of JSON text
+_KV_GZIP_PREFIX = "gzip:b64:"               # marker for a compressed document
+
+
+def _decode_kv(raw: Any) -> Any:
+    """Decode a ``kv_store.data`` column value into a Python object,
+    transparently inflating gzip-compressed documents."""
+    if isinstance(raw, (dict, list)):  # driver auto-decoded a JSON object/array
+        return raw
+    val = json.loads(raw)
+    if isinstance(val, str) and val.startswith(_KV_GZIP_PREFIX):
+        blob = base64.b64decode(val[len(_KV_GZIP_PREFIX):])
+        return json.loads(gzip.decompress(blob).decode("utf-8"))
+    return val
+
+
 def kv_load(name: str, default: Any = None) -> Any:
     """Load a JSON document by key. Returns ``default`` if the key is absent.
 
@@ -222,18 +278,23 @@ def kv_load(name: str, default: Any = None) -> Any:
     row = fetchone("SELECT data FROM kv_store WHERE name=%s", (name,))
     if not row:
         return default
-    raw = row["data"]
-    if isinstance(raw, (dict, list)):  # some drivers/configs auto-decode JSON
-        return raw
     try:
-        return json.loads(raw)
+        return _decode_kv(row["data"])
     except (TypeError, ValueError):
         return default
 
 
 def kv_save(name: str, obj: Any) -> None:
-    """Upsert a JSON document by key (whole-document replace)."""
+    """Upsert a JSON document by key (whole-document replace).
+
+    Documents larger than ``_KV_COMPRESS_THRESHOLD`` are gzip+base64 compressed
+    and stored as a JSON string scalar (prefixed with ``_KV_GZIP_PREFIX``);
+    :func:`_decode_kv` reverses this on read. This is transparent to callers.
+    """
     payload = json.dumps(obj, ensure_ascii=False)
+    if len(payload) > _KV_COMPRESS_THRESHOLD:
+        blob = base64.b64encode(gzip.compress(payload.encode("utf-8"), 6)).decode("ascii")
+        payload = json.dumps(_KV_GZIP_PREFIX + blob)
     execute(
         "INSERT INTO kv_store (name, data) VALUES (%s, %s) "
         "ON DUPLICATE KEY UPDATE data=VALUES(data), updated_at=CURRENT_TIMESTAMP",
@@ -461,10 +522,7 @@ def export_all() -> dict:
     Used by the /export_volume owner command as a full backup."""
     out: dict = {"kv_store": {}, "tables": {}}
     for row in fetchall("SELECT name, data FROM kv_store"):
-        raw = row["data"]
-        out["kv_store"][row["name"]] = (
-            raw if isinstance(raw, (dict, list)) else json.loads(raw)
-        )
+        out["kv_store"][row["name"]] = _decode_kv(row["data"])
     for table in RELATIONAL_TABLES:
         out["tables"][table] = fetchall(f"SELECT * FROM {table}")
     return out
