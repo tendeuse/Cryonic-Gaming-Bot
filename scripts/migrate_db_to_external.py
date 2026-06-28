@@ -167,7 +167,11 @@ def main() -> None:
             for name, data in kv_rows:
                 if data is None:
                     continue
-                obj = data if isinstance(data, (dict, list)) else json.loads(data)
+                # Decode through db._decode_kv so a source value that is ALREADY
+                # gzip-compressed (e.g. arc_seat written by a newer bot build) is
+                # inflated first — otherwise kv_save would compress it a second
+                # time and the document becomes unreadable on load.
+                obj = db._decode_kv(data)
                 db.kv_save(name, obj)
             counts[t] = len(kv_rows)
             print(f"[migrate]   {t}: {len(kv_rows)} doc(s) copied (compressed if large)")
