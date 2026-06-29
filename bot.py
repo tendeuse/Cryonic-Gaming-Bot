@@ -1,3 +1,5 @@
+import asyncio
+import gc
 import os
 import traceback
 from pathlib import Path
@@ -5,6 +7,40 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 from discord import app_commands
+
+
+# ---------------------------------------------------------------------------
+# Optional memory probe (set MEM_PROBE=1 to enable). Logs RSS + the top object
+# types every 2 min so we can tell a leak (objects/RSS climb forever) from a
+# transient spike, and see WHAT is accumulating. Off by default — zero overhead.
+# ---------------------------------------------------------------------------
+def _rss_mb() -> int:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return -1
+
+
+async def _mem_probe(bot: commands.Bot) -> None:
+    import collections
+    while True:
+        try:
+            objs = gc.get_objects()
+            by_type = collections.Counter(type(o).__name__ for o in objs).most_common(8)
+            members = sum((g.member_count or 0) for g in bot.guilds)
+            cached = len(getattr(bot, "cached_messages", []) or [])
+            top = ", ".join(f"{n}={c}" for n, c in by_type)
+            print(
+                f"[MEMPROBE] rss={_rss_mb()}MB objs={len(objs)} guilds={len(bot.guilds)} "
+                f"members~{members} cached_msgs={cached} | top: {top}"
+            )
+        except Exception as e:
+            print(f"[MEMPROBE] error: {e}")
+        await asyncio.sleep(120)
 
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -217,6 +253,10 @@ bot = MyBot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"[READY] Logged in as {bot.user} (ID: {bot.user.id})")
+    if os.getenv("MEM_PROBE") and not getattr(bot, "_memprobe_started", False):
+        bot._memprobe_started = True
+        bot.loop.create_task(_mem_probe(bot))
+        print("[MEMPROBE] enabled (logging every 120s).")
 
 
 @bot.tree.error
