@@ -1661,11 +1661,17 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         self,
         discord_id: int,
         char_id:    int,
+        member:     Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Pull all ESI endpoints for a single character."""
-        data   = await load_seat_data()
+        """Pull all ESI endpoints for a single character.
+
+        Operates on a SINGLE member row (loaded here if not supplied) and saves
+        only that row — no full-corp load/save, so memory/cost stay flat as the
+        corp grows. Pass ``member`` to reuse an already-loaded record (the ESI
+        loop does); omit it for standalone calls (e.g. the SSO callback)."""
         key    = str(discord_id)
-        member = data.get("members", {}).get(key)
+        if member is None:
+            member = await asyncio.to_thread(_db.seat_member_load, key)
         if not member:
             return
 
@@ -1701,9 +1707,13 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                 if all_info:
                     char["alliance_name"] = all_info.get("name", str(alliance_id))
 
-            # Check in-ARC-corp — only when we got fresh data from ESI
-            cfg = data.get("config", {})
-            char["in_arc_corp"] = _is_approved_corp(char.get("corporation_id"), cfg)
+            # Check in-ARC-corp — only when we got fresh data from ESI.
+            # Approved corp IDs come from the module env constant, so we don't
+            # need to load the kv config doc here (keeps this per-member).
+            char["in_arc_corp"] = _is_approved_corp(
+                char.get("corporation_id"),
+                {"arc_approved_corp_ids": ARC_APPROVED_CORP_IDS},
+            )
 
         # Corp history — public
         corp_history = await self._esi.get(
@@ -1720,8 +1730,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         if not token:
             # Can't pull authenticated endpoints without a token
             char["last_esi_pull"] = _now_iso()
-            data["members"][key]  = member
-            await save_seat_data(data)
+            await asyncio.to_thread(_db.seat_member_save, key, member)
             return
 
         # ── Authenticated endpoints ───────────────────────────────────────────
@@ -1781,8 +1790,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
 
         char["last_esi_pull"] = _now_iso()
         char["has_tokens"]    = (await asyncio.to_thread(_seat_get_token, discord_id, char_id) is not None)
-        data["members"][key]  = member
-        await save_seat_data(data)
+        await asyncio.to_thread(_db.seat_member_save, key, member)
         print(f"[ARC-SEAT] ESI pull complete: {char.get('character_name')} ({char_id})")
 
         # Run spy scan after ESI pull
@@ -1795,9 +1803,8 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         if not self._spy_engine:
             return
 
-        data   = await load_seat_data()
         key    = str(discord_id)
-        member = data.get("members", {}).get(key)
+        member = await asyncio.to_thread(_db.seat_member_load, key)
         if not member:
             return
 
@@ -1805,11 +1812,12 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         member["flags"]      = flags
         member["risk_score"] = score
         member["risk_level"] = risk_level
-        data["members"][key] = member
-        await save_seat_data(data)
+        await asyncio.to_thread(_db.seat_member_save, key, member)
 
         if flags:
-            # Find the guild and post to watch-list
+            # Rare path (flagged member): the watch-list update needs the kv doc
+            # for its channel config, so load the full state only here.
+            data = await load_seat_data()
             for guild in self.bot.guilds:
                 discord_member = guild.get_member(discord_id)
                 if discord_member:
@@ -2673,11 +2681,17 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         last_esi_pull is less than 30 days old keeps API usage flat regardless
         of how many members the corp grows to.
         """
-        data = await load_seat_data()
         now_ts = time.time()
 
-        for key, member in list(data.get("members", {}).items()):
-            for char in member.get("characters", []):
+        # Iterate members ONE ROW AT A TIME (not the whole corp at once) so memory
+        # stays flat as the corp grows. Each member is loaded, its stale chars
+        # pulled (reusing the loaded record), and saved per character inside
+        # _pull_character_esi.
+        for key in await asyncio.to_thread(_db.seat_member_keys):
+            member = await asyncio.to_thread(_db.seat_member_load, key)
+            if not member:
+                continue
+            for char in list(member.get("characters", [])):
                 # ── Staleness guard — skip if pulled within the last 30 days ──
                 last_pull_iso = char.get("last_esi_pull")
                 if last_pull_iso:
@@ -2695,7 +2709,9 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                         pass   # malformed timestamp — fall through and pull anyway
 
                 try:
-                    await self._pull_character_esi(int(key), char["character_id"])
+                    await self._pull_character_esi(
+                        int(key), char["character_id"], member=member
+                    )
                 except Exception as e:
                     print(
                         f"[ARC-SEAT] ESI pull error for "

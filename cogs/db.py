@@ -203,6 +203,28 @@ def seat_members_load() -> dict:
     return {r["discord_id"]: decode_doc(r["data"]) for r in rows}
 
 
+def seat_member_keys() -> list[str]:
+    """Return just the discord_id keys — cheap, for iterating members lazily
+    (one row at a time) without loading the whole corp into memory."""
+    return [r["discord_id"] for r in fetchall("SELECT discord_id FROM seat_members")]
+
+
+def seat_member_load(discord_id) -> Optional[dict]:
+    """Load a single member record by discord_id, or None if absent."""
+    row = fetchone("SELECT data FROM seat_members WHERE discord_id=%s", (str(discord_id),))
+    return decode_doc(row["data"]) if row else None
+
+
+def seat_member_save(discord_id, record: dict) -> None:
+    """Upsert a single member record (one row) — the scalable per-member write."""
+    execute(
+        "INSERT INTO seat_members (discord_id, data, updated_at) "
+        "VALUES (%s, %s, datetime('now')) "
+        "ON CONFLICT(discord_id) DO UPDATE SET data=excluded.data, updated_at=datetime('now')",
+        (str(discord_id), encode_doc(record)),
+    )
+
+
 def seat_members_save(members: dict) -> None:
     """Replace the seat_members table with ``members`` (whole-collection sync).
 
