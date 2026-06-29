@@ -25,6 +25,26 @@ def _rss_mb() -> int:
     return -1
 
 
+def _tune_glibc_malloc() -> None:
+    """Reduce glibc heap retention so RSS tracks the live working set.
+
+    Python's many small transient allocations (e.g. json.loads of a big ESI
+    assets response) fragment glibc's per-arena heaps; the freed memory isn't
+    returned, inflating RSS. Cap arenas and lower the trim threshold so free()
+    hands memory back. Best-effort; no-op off glibc. (MALLOC_ARENA_MAX=2 as an
+    env var is even more effective since it applies before libc init.)"""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt(-8, 2)        # M_ARENA_MAX = 2
+        libc.mallopt(-1, 131072)   # M_TRIM_THRESHOLD = 128 KB
+    except Exception:
+        pass
+
+
+_tune_glibc_malloc()
+
+
 def _malloc_trim() -> None:
     """Return freed heap memory to the OS. Python frees large transient
     allocations (e.g. a character's full ESI assets/killmails parsed during the
