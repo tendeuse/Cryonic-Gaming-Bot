@@ -69,7 +69,11 @@ IMAGE_BASE = "https://images.evetech.net"
 MAX_NAME_CACHE   = 10_000
 MAX_SYSTEM_CACHE = 5_000
 MAX_TYPE_CACHE   = 10_000
-MAX_KM_CACHE     = 200_000
+MAX_KM_CACHE     = 50_000
+# Dedup map of posted killmail ids. Was previously UNBOUNDED — it grew by one
+# entry per posted kill forever, leaking memory and bloating the persisted doc.
+# 50k recent ids is far more than the real-time feed + catchup window ever need.
+MAX_POSTED       = 50_000
 
 # ---------------------
 # PERSISTENCE (Railway)
@@ -878,6 +882,8 @@ class KillmailFeed(commands.Cog):
         self.system_cache = clamp_dict(self.system_cache, MAX_SYSTEM_CACHE)
         self.type_cache   = clamp_dict(self.type_cache,   MAX_TYPE_CACHE)
         self.km_time_cache[feed_key] = clamp_dict(self.km_time_cache[feed_key], MAX_KM_CACHE)
+        # Bound the dedup map too (previously unbounded — the steady leak).
+        self.posted_map[feed_key] = clamp_dict(self.posted_map[feed_key], MAX_POSTED)
 
         d = self.diag[feed_key]
         await asyncio.to_thread(save_json, DATA_FILES[feed_key], {

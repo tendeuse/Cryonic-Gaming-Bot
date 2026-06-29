@@ -247,6 +247,12 @@ class EmbedPreviewView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button
     ):
+        # Acknowledge the click IMMEDIATELY. channel.send below can take >3s when
+        # the bot is being rate-limited, which would blow the interaction's 3s
+        # response window and surface as "This interaction failed". Deferring
+        # first reserves the response (15 min) so the slow send is safe.
+        await interaction.response.defer()
+
         # Post the embed to the channel with the persistent Edit button attached
         sent_message = await interaction.channel.send(
             content=self.build_send_content(),
@@ -265,7 +271,7 @@ class EmbedPreviewView(discord.ui.View):
 
         # Close the ephemeral preview cleanly
         self.disable_all_items()
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=(
                 f"✅ Embed sent!\n"
                 f"The **✏️ Edit Embed** button is attached to the message.\n"
