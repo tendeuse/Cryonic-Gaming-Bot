@@ -25,6 +25,25 @@ def _rss_mb() -> int:
     return -1
 
 
+def _malloc_trim() -> None:
+    """Return freed heap memory to the OS. Python frees large transient
+    allocations (e.g. a character's full ESI assets/killmails parsed during the
+    arc_seat ESI pull) but glibc retains the heap, inflating RSS — the probe
+    showed ~1.3 GB of RSS with only ~tens of MB of live objects. malloc_trim
+    hands that back. No-op off glibc (e.g. local Windows)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+async def _malloc_trim_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        _malloc_trim()
+
+
 async def _mem_probe(bot: commands.Bot) -> None:
     import collections
     while True:
@@ -253,6 +272,10 @@ bot = MyBot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"[READY] Logged in as {bot.user} (ID: {bot.user.id})")
+    if not getattr(bot, "_trim_started", False):
+        bot._trim_started = True
+        bot.loop.create_task(_malloc_trim_loop())
+        print("[BOOT] malloc_trim loop started (returns freed heap to the OS every 60s).")
     if os.getenv("MEM_PROBE") and not getattr(bot, "_memprobe_started", False):
         bot._memprobe_started = True
         bot.loop.create_task(_mem_probe(bot))
