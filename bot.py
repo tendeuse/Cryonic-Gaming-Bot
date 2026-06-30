@@ -1,6 +1,8 @@
 import asyncio
 import gc
+import logging
 import os
+import time
 import traceback
 from pathlib import Path
 
@@ -10,10 +12,46 @@ from discord import app_commands
 
 
 # ---------------------------------------------------------------------------
-# Optional memory probe (set MEM_PROBE=1 to enable). Logs RSS + the top object
-# types every 2 min so we can tell a leak (objects/RSS climb forever) from a
-# transient spike, and see WHAT is accumulating. Off by default — zero overhead.
+# Optional diagnostics — both off by default, zero overhead unless enabled.
+#   MEM_PROBE=1       — log RSS + top object types every 2 min.
+#   RL_ORIGIN_PROBE=1 — pinpoint which cog/line triggers each new 429 source.
 # ---------------------------------------------------------------------------
+class _RateLimitOriginLogger(logging.Handler):
+    """Pinpoint which cog/line triggers each 429, by capturing the live call
+    stack at the moment discord.py logs 'We are being rate limited'. Throttled
+    to once per 30s per originating frame so it doesn't add to the log spam
+    it's diagnosing. Enable with RL_ORIGIN_PROBE=1."""
+
+    def __init__(self):
+        super().__init__()
+        self._last_seen: dict[str, float] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            if "rate limited" not in msg:
+                return
+            frames = [
+                f for f in traceback.extract_stack()
+                if ("\\cogs\\" in f.filename or "/cogs/" in f.filename or f.filename.endswith("bot.py"))
+                and "uiutil.py" not in f.filename
+            ]
+            if not frames:
+                return
+            origin = frames[-1]
+            key = f"{origin.filename}:{origin.lineno}"
+            now = time.monotonic()
+            if now - self._last_seen.get(key, 0) < 30:
+                return
+            self._last_seen[key] = now
+            chain = " <- ".join(
+                f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in frames[-4:][::-1]
+            )
+            print(f"[RLORIGIN] {msg.split(chr(10))[0][:140]} | call chain: {chain}")
+        except Exception:
+            pass
+
+
 def _rss_mb() -> int:
     try:
         with open("/proc/self/status") as f:
@@ -97,6 +135,10 @@ async def _mem_probe(bot: commands.Bot) -> None:
             print(f"[MEMPROBE] error: {e}")
         await asyncio.sleep(120)
 
+
+if os.getenv("RL_ORIGIN_PROBE"):
+    logging.getLogger("discord.http").addHandler(_RateLimitOriginLogger())
+    print("[RLORIGIN] enabled — will print the calling cog/line for each new 429 source.")
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
