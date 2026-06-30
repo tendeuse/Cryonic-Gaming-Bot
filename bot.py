@@ -203,7 +203,7 @@ class MyBot(commands.Bot):
 
             # Shared helper modules in cogs/ that are NOT Discord cogs
             # (imported via `from . import db`, no setup() entry point).
-            NON_COG_MODULES = {"db"}
+            NON_COG_MODULES = {"db", "uiutil"}
 
             for filename in sorted(os.listdir(cogs_dir)):
                 if not filename.endswith(".py") or filename.startswith("__"):

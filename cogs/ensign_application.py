@@ -34,6 +34,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 
 from . import db
+from .uiutil import edit_if_changed
 
 # ============================================================
 # CONFIG
@@ -386,7 +387,7 @@ class EnsignApplicationCog(commands.Cog, name="EnsignApplicationCog"):
         if msg_id:
             try:
                 existing = await ch.fetch_message(int(msg_id))
-                await existing.edit(embed=embed, view=view)
+                await edit_if_changed(existing, embed=embed, view=view)
                 return
             except (discord.NotFound, discord.HTTPException):
                 pass  # deleted — post a fresh one

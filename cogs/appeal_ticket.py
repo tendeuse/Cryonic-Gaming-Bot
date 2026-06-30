@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 import discord
 from discord.ext import commands
 from discord import app_commands
+from .uiutil import edit_if_changed
 
 from . import db
 
@@ -413,7 +414,7 @@ class AppealTicketCog(commands.Cog, name="AppealTicketCog"):
         if msg_id:
             try:
                 existing = await ch.fetch_message(int(msg_id))
-                await existing.edit(embed=embed, view=view)
+                await edit_if_changed(existing, embed=embed, view=view)
                 return
             except (discord.NotFound, discord.HTTPException):
                 # Message was deleted — fall through to post a fresh one

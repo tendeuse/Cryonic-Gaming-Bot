@@ -36,6 +36,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 
 from . import db
+from .uiutil import edit_if_changed
 
 # =====================
 # CHANNELS
@@ -699,7 +700,7 @@ class DirectiveCog(commands.Cog):
                 if msg_id:
                     try:
                         existing = await ch.fetch_message(int(msg_id))
-                        await existing.edit(embed=embed, view=view)
+                        await edit_if_changed(existing, embed=embed, view=view)
                         continue
                     except Exception:
                         pass  # message gone — repost
@@ -735,7 +736,7 @@ class DirectiveCog(commands.Cog):
                 continue
             try:
                 msg = await ch.fetch_message(int(msg_id))
-                await msg.edit(embed=embed, view=view)
+                await edit_if_changed(msg, embed=embed, view=view)
             except Exception:
                 pass
 

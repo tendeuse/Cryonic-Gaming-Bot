@@ -57,6 +57,7 @@ from discord.ext import commands
 from discord import app_commands
 
 from . import db
+from .uiutil import edit_if_changed
 
 # =====================
 # PERSISTENCE (Railway Volume)
@@ -678,7 +679,7 @@ async def update_flowchart(guild: discord.Guild) -> None:
 
     try:
         if msg:
-            await msg.edit(content=parts[0])
+            await edit_if_changed(msg, content=parts[0])
         else:
             msg = await ch.send(parts[0])
             async with file_lock:
