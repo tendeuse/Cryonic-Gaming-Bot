@@ -73,9 +73,25 @@ async def _mem_probe(bot: commands.Bot) -> None:
             members = sum((g.member_count or 0) for g in bot.guilds)
             cached = len(getattr(bot, "cached_messages", []) or [])
             top = ", ".join(f"{n}={c}" for n, c in by_type)
+            # Pending asyncio tasks + their coroutine names: if a loop spawns
+            # edit/fetch tasks faster than Discord's rate limit lets them finish,
+            # they pile up here — that backlog is the leak driving the OOM.
+            try:
+                tasks = asyncio.all_tasks()
+                tcoros = collections.Counter()
+                for t in tasks:
+                    try:
+                        tcoros[t.get_coro().__qualname__] += 1
+                    except Exception:
+                        pass
+                ttop = ", ".join(f"{n}={c}" for n, c in tcoros.most_common(6))
+            except Exception:
+                tasks, ttop = [], "?"
             print(
-                f"[MEMPROBE] rss={_rss_mb()}MB objs={len(objs)} guilds={len(bot.guilds)} "
-                f"members~{members} cached_msgs={cached} | top: {top}"
+                f"[MEMPROBE] rss={_rss_mb()}MB objs={len(objs)} tasks={len(tasks)} "
+                f"guilds={len(bot.guilds)} members~{members} cached_msgs={cached}\n"
+                f"           top_tasks: {ttop}\n"
+                f"           top_objs:  {top}"
             )
         except Exception as e:
             print(f"[MEMPROBE] error: {e}")
