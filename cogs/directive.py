@@ -51,7 +51,10 @@ AP_PER_EVENTS = 3             # every N hosted events …
 AP_BONUS      = 200           # … grants this much AP (repeatable per week)
 RESTRICT_ROLE = "ARC Security"  # RSVP gate for the restricted class events
 MIN_ATTENDEES = 2             # an op counts only with creator + 1 other (≥15 min)
-TENDEUSE_ROLE = "ARC Tendeuse"  # pinged on every demotion prompt
+# Pinged on every demotion prompt. Intentionally NOT named with a `_ROLE`
+# suffix so server_setup's scanner does not auto-create this role — it is
+# expected to be created/managed by hand if used at all.
+TENDEUSE_PING = "ARC Tendeuse"
 
 # =====================
 # RANK LADDER (low → high)
@@ -1050,8 +1053,8 @@ class DirectiveCog(commands.Cog):
         if not ch:
             return
 
-        tendeuse = discord.utils.get(guild.roles, name=TENDEUSE_ROLE)
-        ping = tendeuse.mention if tendeuse else f"@{TENDEUSE_ROLE}"
+        tendeuse = discord.utils.get(guild.roles, name=TENDEUSE_PING)
+        ping = tendeuse.mention if tendeuse else f"@{TENDEUSE_PING}"
 
         for member in guild.members:
             if not is_mandated(member):
@@ -1106,7 +1109,7 @@ class DirectiveCog(commands.Cog):
             )
             return
 
-        if not (is_general_or_above(actor) or has_role(actor, TENDEUSE_ROLE)):
+        if not (is_general_or_above(actor) or has_role(actor, TENDEUSE_PING)):
             await interaction.response.send_message(
                 f"❌ Only **{GENERAL_ROLE}** or above may decide this.",
                 ephemeral=True,
