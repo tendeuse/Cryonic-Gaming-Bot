@@ -1398,7 +1398,7 @@ class ArcSeatCog(commands.Cog, name="ArcSeat"):
         print(
             f"[ARC-SEAT] Ready. {len(data.get('members', {}))} member(s) tracked. "
             f"Approved corp IDs: {ARC_APPROVED_CORP_IDS}. "
-            "Tokens stored in arc_seat.db."
+            "Tokens stored in the seat_tokens table."
         )
 
     def _register_callback_route(self) -> None:

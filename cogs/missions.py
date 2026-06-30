@@ -78,7 +78,7 @@ def can_manage_missions(member: discord.Member) -> bool:
 # ---------------------------------------------------------------------------
 
 class MissionDB:
-    """Thin wrapper over the shared MySQL pool (cogs/db.py).
+    """Thin wrapper over the shared SQLite database (cogs/db.py).
 
     The ``missions`` table is created centrally by ``db.init_db()`` at startup.
     The optional ``path`` arg is ignored — kept so existing construction
@@ -437,7 +437,7 @@ class MissionCog(commands.Cog, name="Missions"):
         self.db  = MissionDB()
         # Register persistent view so buttons survive restarts
         bot.add_view(MissionControlView())
-        print("[MissionCog] DB ready (MySQL).")
+        print("[MissionCog] DB ready (SQLite).")
 
     # ------------------------------------------------------------------
     # Channel helper — find by exact name, create if missing

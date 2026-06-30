@@ -166,16 +166,16 @@ class MyBot(commands.Bot):
         print("[BOOT] setup_hook() start")
 
         try:
-            # ---- Initialise the MySQL schema BEFORE loading cogs ----
-            # All persisted state lives in Railway MySQL now (not the /data
-            # volume). Create every table up front so no cog races to do it.
+            # ---- Initialise the SQLite schema BEFORE loading cogs ----
+            # All persisted state lives in the SQLite DB on the /data volume.
+            # Create every table up front so no cog races to do it.
             try:
                 from cogs import db
                 db.init_db()
-                print("[BOOT] MySQL schema initialised.")
+                print("[BOOT] SQLite schema initialised.")
             except Exception as e:
-                print("[BOOT] FATAL: could not initialise MySQL. "
-                      "Check the MYSQL* env vars are linked to this service.")
+                print("[BOOT] FATAL: could not initialise the database. "
+                      "Check the /data volume is mounted and writable.")
                 traceback.print_exception(type(e), e, e.__traceback__)
                 raise
 

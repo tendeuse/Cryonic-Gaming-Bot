@@ -188,8 +188,8 @@ ORE_TO_COMPRESSED_NAME: Dict[str, str] = {
 # =========================
 def db_connect():
     # Tables (type_cache, price_cache, char_name_cache, buyback_paid) are
-    # created centrally by db.init_db(). This returns a sqlite3-style adapter
-    # over the shared MySQL pool so the existing call sites work unchanged.
+    # created centrally by db.init_db(). This returns a standalone sqlite3
+    # connection to the shared database so the existing call sites work unchanged.
     return _db.legacy_conn()
 
 def _utc_iso(ts: int) -> str:
