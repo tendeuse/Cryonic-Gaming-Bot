@@ -83,6 +83,15 @@ JITA_REGION_ID   = int(os.getenv("JITA_REGION_ID", "10000002"))
 JITA_LOCATION_ID = int(os.getenv("JITA_LOCATION_ID", "60003760"))
 PAYOUT_MULTIPLIER = float(os.getenv("PAYOUT_MULTIPLIER", "0.8"))
 
+# Per-item payout overrides (keyed by EVE type name). Items listed here pay out
+# at their own multiplier instead of the global PAYOUT_MULTIPLIER.
+ITEM_PAYOUT_MULTIPLIER_BY_NAME: Dict[str, float] = {
+    "Helium Fuel Block":   0.9,
+    "Hydrogen Fuel Block": 0.9,
+    "Nitrogen Fuel Block": 0.9,
+    "Oxygen Fuel Block":   0.9,
+}
+
 # Discord output
 BUYBACK_CHANNEL_NAME = os.getenv("BUYBACK_CHANNEL_NAME", "buyback-payout")
 
@@ -627,7 +636,8 @@ class BuybackContracts(commands.Cog):
                     jita_buy = await self.esi.get_jita_buy_price(session, token, conn, price_type_id)
                     price_mem[price_type_id] = jita_buy
 
-                unit_payout = jita_buy * PAYOUT_MULTIPLIER
+                item_mult   = ITEM_PAYOUT_MULTIPLIER_BY_NAME.get(priced_name, PAYOUT_MULTIPLIER)
+                unit_payout = jita_buy * item_mult
                 line_total  = unit_payout * qty
 
                 lines.append({
@@ -636,6 +646,7 @@ class BuybackContracts(commands.Cog):
                     "jita_buy":    jita_buy,
                     "payout_unit": unit_payout,
                     "line_total":  line_total,
+                    "multiplier":  item_mult,
                 })
                 total += line_total
 
@@ -704,9 +715,10 @@ class BuybackContracts(commands.Cog):
         # ── Step 1: build all item row strings ────────────────────────────
         item_rows: List[str] = []
         for ln in payload["lines"]:
+            ln_mult = ln.get("multiplier", mult)
             item_rows.append(
                 f"• **{ln['name']}** × {ln['qty']}\n"
-                f"  Jita Buy: {ln['jita_buy']:.2f} ISK | Payout/unit: {ln['payout_unit']:.2f} ISK\n"
+                f"  Jita Buy: {ln['jita_buy']:.2f} ISK | Payout/unit: {ln['payout_unit']:.2f} ISK ({int(ln_mult*100)}%)\n"
                 f"  Line: **{ln['line_total']:.2f} ISK**\n"
             )
 
@@ -717,7 +729,8 @@ class BuybackContracts(commands.Cog):
         title_str = f"✅ Buyback Appraisal — Contract {cid}"
         desc_str  = (
             f"**Issuer:** {issuer_line}\n"
-            f"Pricing = **{int(mult*100)}%** of **Jita 4-4 BUY** orders (location `{JITA_LOCATION_ID}`)."
+            f"Pricing = **{int(mult*100)}%** of **Jita 4-4 BUY** orders (location `{JITA_LOCATION_ID}`).\n"
+            f"_Some items use a custom rate — see the % shown on each line._"
         )
 
         embed1 = discord.Embed(title=title_str, description=desc_str, color=0x2ecc71)
