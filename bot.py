@@ -3,6 +3,7 @@ import gc
 import logging
 import os
 import time
+import tracemalloc
 import traceback
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from discord import app_commands
 
 # ---------------------------------------------------------------------------
 # Optional diagnostics — both off by default, zero overhead unless enabled.
-#   MEM_PROBE=1       — log RSS + top object types every 2 min.
+#   MEM_PROBE=1       — log RSS + top object types every 2 min, plus (after a
+#                       10-min warm-up baseline) the top allocating file:line
+#                       by growth since baseline — names the leak's source.
 #   RL_ORIGIN_PROBE=1 — pinpoint which cog/line triggers each new 429 source.
 # ---------------------------------------------------------------------------
 class _RateLimitOriginLogger(logging.Handler):
@@ -104,6 +107,12 @@ async def _malloc_trim_loop() -> None:
 
 async def _mem_probe(bot: commands.Bot) -> None:
     import collections
+
+    tracemalloc.start(10)  # 10 frames of traceback per allocation
+    baseline = None
+    elapsed = 0
+    BASELINE_AT = 600  # snapshot a baseline 10 min in, after startup settles
+
     while True:
         try:
             objs = gc.get_objects()
@@ -131,9 +140,24 @@ async def _mem_probe(bot: commands.Bot) -> None:
                 f"           top_tasks: {ttop}\n"
                 f"           top_objs:  {top}"
             )
+
+            # Once warmed up, snapshot a baseline; every cycle after that, diff
+            # against it and print the file:line whose allocations grew the
+            # most — that names the leak's source directly (unlike the
+            # gc-by-type counts above, which show WHAT is growing but not
+            # WHERE it's allocated).
+            if baseline is None and elapsed >= BASELINE_AT:
+                baseline = tracemalloc.take_snapshot()
+                print("[MEMPROBE] tracemalloc baseline captured.")
+            elif baseline is not None:
+                snap = tracemalloc.take_snapshot()
+                diffs = snap.compare_to(baseline, "lineno")
+                lines = "\n           ".join(str(d) for d in diffs[:8])
+                print(f"[MEMPROBE] tracemalloc growth since baseline:\n           {lines}")
         except Exception as e:
             print(f"[MEMPROBE] error: {e}")
         await asyncio.sleep(120)
+        elapsed += 120
 
 
 if os.getenv("RL_ORIGIN_PROBE"):
