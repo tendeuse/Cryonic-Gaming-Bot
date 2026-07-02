@@ -556,6 +556,17 @@ class KillmailFeed(commands.Cog):
     @catchup_poll.before_loop
     async def _before_catchup(self):
         await self.bot.wait_until_ready()
+        # tasks.loop fires its first iteration immediately once this resolves.
+        # That put every boot's first catchup pass right in the middle of the
+        # rest of the startup burst (websocket backlog, member bootstrap, shop
+        # sync all running concurrently on the same event loop) — and RSS was
+        # measured to jump 230-400MB across that pass even when it found zero
+        # new kills. The posted-state was just persisted seconds ago by the
+        # previous instance, so there's no urgency to catch up immediately;
+        # delaying the first run past the volatile early-boot window both
+        # avoids piling onto it and isolates whether catchup_poll itself (vs.
+        # everything else running concurrently) is driving the RSS spike.
+        await asyncio.sleep(CATCHUP_POLL_MINUTES * 60)
 
     async def _catchup_feed(self, feed_key: str, cfg: Dict[str, Any]):
         # Use more pages only once WS is CONFIRMED down (disconnected past the
