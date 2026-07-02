@@ -36,6 +36,7 @@ import aiohttp
 import asyncio
 import json
 import datetime
+import time
 from typing import Dict, Any, List, Optional, Tuple
 
 # =====================
@@ -54,7 +55,16 @@ WS_HEARTBEAT        = 30    # seconds between pings to keep connection alive
 CATCHUP_POLL_MINUTES     = 5     # was 10 — tighter safety net
 CATCHUP_PAGES            = 3     # pages when WS is healthy
 CATCHUP_PAGES_WS_DOWN    = 10    # pages when WS is disconnected (more ground to cover)
+# Grace window after boot before "WS not connected yet" is treated as
+# "WS is down" for catchup sizing — the WS takes a few seconds to connect
+# after on_ready fires, and without this the first catchup run on every
+# boot wrongly used the wider WS-down scan.
+WS_STARTUP_GRACE_SECONDS = 30
 ZKILL_REQUEST_DELAY      = 0.15
+# Cap how many candidate kills are ESI-enriched (and held fully in memory)
+# at once during a catchup pass. See the comment at the enrichment gather
+# in _catchup_feed for why this exists.
+CATCHUP_ENRICH_BATCH     = 25
 
 # ESI
 ESI_CONCURRENCY         = 8
@@ -110,6 +120,19 @@ LYCAN_ROLE   = "Lycan King"
 # =====================
 # UTILITIES
 # =====================
+
+def _rss_mb() -> int:
+    """Best-effort current RSS in MB; -1 off Linux. Used to log the memory
+    footprint of the catchup pass without depending on bot.py's probe."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return -1
+
 
 def utcnow() -> datetime.datetime:
     return datetime.datetime.utcnow()
@@ -253,6 +276,13 @@ class KillmailFeed(commands.Cog):
         self._ws_connected:         bool                   = False
         self._ws_last_message_utc:  Optional[str]          = None
         self._ws_total_received:    int                    = 0
+        # catchup_poll.start() fires on the same on_ready as _start_websocket(),
+        # before the WS has actually finished connecting (that takes a few
+        # seconds). Without a grace window, the very first catchup run on every
+        # single boot sees _ws_connected=False and scans CATCHUP_PAGES_WS_DOWN
+        # pages instead of CATCHUP_PAGES — a 3x+ heavier fetch/enrich burst on
+        # every restart, not just genuine outages.
+        self._boot_monotonic:       float                  = time.monotonic()
 
         # Catchup lock (prevents overlapping scans)
         self._catchup_lock = asyncio.Lock()
@@ -512,26 +542,37 @@ class KillmailFeed(commands.Cog):
         """
         if self._catchup_lock.locked():
             return
+        rss_before = _rss_mb()
         async with self._catchup_lock:
             for feed_key, cfg in FEEDS.items():
                 try:
                     await self._catchup_feed(feed_key, cfg)
                 except Exception as e:
                     print(f"[killmail_catchup] {feed_key} error: {type(e).__name__}: {e}")
+        rss_after = _rss_mb()
+        if rss_before >= 0 and rss_after >= 0:
+            print(f"[killmail_catchup] pass complete. rss {rss_before}MB -> {rss_after}MB")
 
     @catchup_poll.before_loop
     async def _before_catchup(self):
         await self.bot.wait_until_ready()
 
     async def _catchup_feed(self, feed_key: str, cfg: Dict[str, Any]):
-        # Use more pages when the WebSocket is down so we don't miss kills
-        # that accumulated while the connection was failing.
-        pages = CATCHUP_PAGES if self._ws_connected else CATCHUP_PAGES_WS_DOWN
+        # Use more pages only once WS is CONFIRMED down (disconnected past the
+        # startup grace window) — not merely "hasn't connected yet since boot",
+        # which is true for the first several seconds of every single restart.
+        ws_confirmed_down = (
+            not self._ws_connected
+            and (time.monotonic() - self._boot_monotonic) >= WS_STARTUP_GRACE_SECONDS
+        )
+        pages = CATCHUP_PAGES_WS_DOWN if ws_confirmed_down else CATCHUP_PAGES
         new_kills = await self._fetch_zkill_frontier(
             int(cfg["corp_id"]), feed_key, max_pages=pages
         )
         if not new_kills:
             return
+        print(f"[killmail_catchup] {feed_key}: {len(new_kills)} candidate kill(s), "
+              f"pages={pages} ws_confirmed_down={ws_confirmed_down}")
 
         # Parallel ESI enrichment
         sem = asyncio.Semaphore(ESI_CONCURRENCY)
@@ -558,13 +599,22 @@ class KillmailFeed(commands.Cog):
                 except Exception:
                     return None
 
-        results = await asyncio.gather(
-            *[one(kmid, zkm) for kmid, zkm in new_kills],
-            return_exceptions=True,
-        )
-        for r in results:
-            if isinstance(r, ESIHTTPError) and r.status in (420, 429):
-                raise r
+        # Enrich in batches instead of gathering every candidate at once —
+        # a wide catchup scan (e.g. after a real WS outage) can turn up
+        # hundreds of candidates, and holding every fully-enriched ESI
+        # killmail dict in memory simultaneously is exactly the kind of
+        # burst that spiked RSS by 300-500MB right before a crash.
+        results: List[Any] = []
+        for i in range(0, len(new_kills), CATCHUP_ENRICH_BATCH):
+            batch = new_kills[i:i + CATCHUP_ENRICH_BATCH]
+            batch_results = await asyncio.gather(
+                *[one(kmid, zkm) for kmid, zkm in batch],
+                return_exceptions=True,
+            )
+            for r in batch_results:
+                if isinstance(r, ESIHTTPError) and r.status in (420, 429):
+                    raise r
+            results.extend(batch_results)
 
         enriched = sorted(
             [r for r in results if isinstance(r, tuple)],
