@@ -109,6 +109,52 @@ async def _malloc_trim_loop() -> None:
         _malloc_trim()
 
 
+def _mem_probe_sync(baseline, take_baseline: bool):
+    """All the heavy, synchronous introspection for one probe tick.
+
+    MUST run off the event loop thread (via asyncio.to_thread). An earlier
+    version ran this inline and it bit us hard: once tracked allocations hit
+    ~2.2M (a runaway tuple explosion), tracemalloc's own snap.compare_to()
+    took 30+ seconds to run, and discord.py's watchdog caught it red-handed —
+    "Loop thread traceback ... bot.py:170 diffs = snap.compare_to(...)" —
+    blocking the gateway heartbeat and forcing a reconnect. The diagnostic
+    was compounding the very crash it was meant to observe.
+    """
+    import collections
+    objs = gc.get_objects()
+    counts = collections.Counter(type(o).__name__ for o in objs)
+    by_type = counts.most_common(8)
+    tuple_count = counts.get("tuple", 0)
+
+    # tracemalloc's line-level diff broke down under 2M+ tracked allocations
+    # (its top result was +18MB against an ~800MB actual jump — noise, not
+    # signal). If tuple count is far past the normal ~18-20k baseline,
+    # sample a few live tuples directly and print their contents — that
+    # reveals the source (a header, a DNS record, a cache key, ...)
+    # regardless of whether tracemalloc can attribute it to a line.
+    tuple_samples = []
+    if tuple_count > 100_000:
+        for o in objs:
+            if type(o) is tuple and 1 <= len(o) <= 6:
+                try:
+                    tuple_samples.append(repr(o)[:200])
+                except Exception:
+                    continue
+                if len(tuple_samples) >= 6:
+                    break
+
+    tracemalloc_lines = None
+    new_baseline = baseline
+    if take_baseline:
+        new_baseline = tracemalloc.take_snapshot()
+    elif baseline is not None:
+        snap = tracemalloc.take_snapshot()
+        diffs = snap.compare_to(baseline, "lineno")
+        tracemalloc_lines = "\n           ".join(str(d) for d in diffs[:8])
+
+    return len(objs), by_type, tuple_count, tuple_samples, tracemalloc_lines, new_baseline
+
+
 async def _mem_probe(bot: commands.Bot) -> None:
     import collections
 
@@ -131,11 +177,8 @@ async def _mem_probe(bot: commands.Bot) -> None:
 
     while True:
         try:
-            objs = gc.get_objects()
-            by_type = collections.Counter(type(o).__name__ for o in objs).most_common(8)
             members = sum((g.member_count or 0) for g in bot.guilds)
             cached = len(getattr(bot, "cached_messages", []) or [])
-            top = ", ".join(f"{n}={c}" for n, c in by_type)
             # Pending asyncio tasks + their coroutine names: if a loop spawns
             # edit/fetch tasks faster than Discord's rate limit lets them finish,
             # they pile up here — that backlog is the leak driving the OOM.
@@ -150,8 +193,15 @@ async def _mem_probe(bot: commands.Bot) -> None:
                 ttop = ", ".join(f"{n}={c}" for n, c in tcoros.most_common(6))
             except Exception:
                 tasks, ttop = [], "?"
+
+            take_baseline = baseline is None and elapsed >= BASELINE_AT
+            objs_len, by_type, tuple_count, tuple_samples, tracemalloc_lines, baseline = (
+                await asyncio.to_thread(_mem_probe_sync, baseline, take_baseline)
+            )
+            top = ", ".join(f"{n}={c}" for n, c in by_type)
+
             print(
-                f"[MEMPROBE] rss={_rss_mb()}MB objs={len(objs)} tasks={len(tasks)} "
+                f"[MEMPROBE] rss={_rss_mb()}MB objs={objs_len} tasks={len(tasks)} "
                 f"guilds={len(bot.guilds)} members~{members} cached_msgs={cached}\n"
                 f"           top_tasks: {ttop}\n"
                 f"           top_objs:  {top}"
@@ -162,14 +212,17 @@ async def _mem_probe(bot: commands.Bot) -> None:
             # most — that names the leak's source directly (unlike the
             # gc-by-type counts above, which show WHAT is growing but not
             # WHERE it's allocated).
-            if baseline is None and elapsed >= BASELINE_AT:
-                baseline = tracemalloc.take_snapshot()
+            if take_baseline:
                 print("[MEMPROBE] tracemalloc baseline captured.")
-            elif baseline is not None:
-                snap = tracemalloc.take_snapshot()
-                diffs = snap.compare_to(baseline, "lineno")
-                lines = "\n           ".join(str(d) for d in diffs[:8])
-                print(f"[MEMPROBE] tracemalloc growth since baseline:\n           {lines}")
+            elif tracemalloc_lines:
+                print(f"[MEMPROBE] tracemalloc growth since baseline:\n           {tracemalloc_lines}")
+
+            if tuple_samples:
+                sample_block = "\n           ".join(tuple_samples)
+                print(
+                    f"[MEMPROBE] tuple count {tuple_count} is far above the "
+                    f"~18-20k baseline — sample live tuples:\n           {sample_block}"
+                )
         except Exception as e:
             print(f"[MEMPROBE] error: {e}")
         interval = FAST_INTERVAL if elapsed < FAST_WINDOW else SLOW_INTERVAL
