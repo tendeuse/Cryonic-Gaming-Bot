@@ -115,7 +115,13 @@ async def _mem_probe(bot: commands.Bot) -> None:
     tracemalloc.start(10)  # 10 frames of traceback per allocation
     baseline = None
     elapsed = 0
-    BASELINE_AT = 600  # snapshot a baseline 10 min in, after startup settles
+    # Was 600 (10 min) — the process has never once survived that long. Tight
+    # 10s sampling identified a runaway dict/list allocation that reliably
+    # starts ~120s after boot and crashes the process by ~180-190s. Baseline
+    # at 90s sits safely before that onset, so the next few 10s-interval
+    # diffs land squarely inside the growth window and name the exact
+    # file:line responsible instead of inferring it from task names.
+    BASELINE_AT = 90
     # The crash-loop restarts every ~2-3 min, well inside the old 120s sample
     # gap — a SIGKILL leaves no log line, so a spike between two samples was
     # invisible. Sample tightly through the danger window, then back off.
