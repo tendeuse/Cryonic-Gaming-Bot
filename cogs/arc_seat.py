@@ -1838,15 +1838,25 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         If no character is in ARC:
           - Remove ARC Security role only
           - Flag ARC Subsidized + rank roles for manual review in watch-list
+
+        Loads/saves only this member's row (not the whole corp document).
+        This used to call load_seat_data()/save_seat_data() — the whole-doc
+        loader/saver — once per member inside _corp_sync_loop's per-member
+        loop. With N members that's N full serialize+deserialize round trips
+        of a document containing every member's complete ESI cache each
+        cycle: O(n^2) JSON work. At 39 members that produced millions of
+        json.decoder/encoder allocations and a multi-hundred-MB RSS spike
+        within about a minute, confirmed via tracemalloc in production. The
+        downstream calls below (_update_watchlist_thread etc.) take a `data`
+        parameter but never actually read it (verified — it's only threaded
+        through to _ensure_watchlist_channel, which ignores it too), so no
+        replacement load is needed even for the flagged-member branch.
         """
-        data   = await load_seat_data()
-        key    = str(discord_id)
-        member = data.get("members", {}).get(key)
+        member = await asyncio.to_thread(_db.seat_member_load, discord_id)
         if not member:
             return
 
-        cfg         = data.get("config", {})
-        arc_corp_id = cfg.get("arc_corp_id")
+        arc_corp_id = ARC_CORP_ID_ENV
         if not arc_corp_id:
             return
 
@@ -1861,7 +1871,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                 any_esi_success = True
                 new_corp_id            = pub.get("corporation_id")
                 char["corporation_id"] = new_corp_id
-                char["in_arc_corp"]    = _is_approved_corp(new_corp_id, cfg)
+                char["in_arc_corp"]    = new_corp_id in ARC_APPROVED_CORP_IDS
                 if char["in_arc_corp"]:
                     any_in_corp = True
 
@@ -1876,8 +1886,8 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
                     any_in_corp = True
 
         member["last_corp_check"] = _now_iso()
-        data["members"][key]      = member
-        await save_seat_data(data)
+        await asyncio.to_thread(_db.seat_member_save, discord_id, member)
+        data = {}  # vestigial param for the calls below — see docstring
 
         # If every ESI call failed, don't act on stale/missing data — skip this cycle
         if not any_esi_success:
@@ -2650,11 +2660,19 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
 
     @tasks.loop(seconds=CORP_SYNC_INTERVAL)
     async def _corp_sync_loop(self) -> None:
-        """Check corp membership for every registered member."""
-        data = await load_seat_data()
+        """Check corp membership for every registered member.
+
+        Key-only lookup — the old load_seat_data() call here loaded every
+        member's full ESI cache just to enumerate who to check, and
+        _sync_corp_for_member then repeated that same full-document load
+        (and a full-document save) once per member. O(n^2) JSON work per
+        cycle; at 39 members it produced a multi-hundred-MB RSS spike
+        within about a minute of this loop's first run (120s after boot).
+        """
+        keys = await asyncio.to_thread(_db.seat_member_keys)
 
         for guild in self.bot.guilds:
-            for key in list(data.get("members", {}).keys()):
+            for key in keys:
                 try:
                     await self._sync_corp_for_member(guild, int(key))
                 except Exception as e:
@@ -3210,8 +3228,10 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
             )
             return
 
-        data  = await load_seat_data()
-        count = len(data.get("members", {}))
+        # Key-only lookup — avoids loading every member's full ESI cache just
+        # to enumerate who to sync (same fix as _corp_sync_loop's O(n^2)).
+        keys  = await asyncio.to_thread(_db.seat_member_keys)
+        count = len(keys)
         await interaction.followup.send(
             f"⏳ Running corp sync + scan for **{count}** member(s). "
             "This runs in the background — check #arc-hierarchy-log for results.",
@@ -3219,7 +3239,7 @@ h1{{color:{colour}}}p{{color:#8a99aa}}</style></head>
         )
 
         for guild in self.bot.guilds:
-            for key in list(data.get("members", {}).keys()):
+            for key in keys:
                 try:
                     await self._sync_corp_for_member(guild, int(key))
                     await asyncio.sleep(3)
