@@ -14,9 +14,13 @@ from discord import app_commands
 
 # ---------------------------------------------------------------------------
 # Optional diagnostics — both off by default, zero overhead unless enabled.
-#   MEM_PROBE=1       — log RSS + top object types every 2 min, plus (after a
-#                       10-min warm-up baseline) the top allocating file:line
-#                       by growth since baseline — names the leak's source.
+#   MEM_PROBE=1       — log RSS + top object types every 10s for the first 3
+#                       min after boot (to catch a fast startup spike that a
+#                       120s-interval probe would miss entirely if the process
+#                       gets killed between samples), then every 2 min after
+#                       that, plus (after a 10-min warm-up baseline) the top
+#                       allocating file:line by growth since baseline — names
+#                       the leak's source.
 #   RL_ORIGIN_PROBE=1 — pinpoint which cog/line triggers each new 429 source.
 # ---------------------------------------------------------------------------
 class _RateLimitOriginLogger(logging.Handler):
@@ -112,6 +116,12 @@ async def _mem_probe(bot: commands.Bot) -> None:
     baseline = None
     elapsed = 0
     BASELINE_AT = 600  # snapshot a baseline 10 min in, after startup settles
+    # The crash-loop restarts every ~2-3 min, well inside the old 120s sample
+    # gap — a SIGKILL leaves no log line, so a spike between two samples was
+    # invisible. Sample tightly through the danger window, then back off.
+    FAST_WINDOW = 180
+    FAST_INTERVAL = 10
+    SLOW_INTERVAL = 120
 
     while True:
         try:
@@ -156,8 +166,9 @@ async def _mem_probe(bot: commands.Bot) -> None:
                 print(f"[MEMPROBE] tracemalloc growth since baseline:\n           {lines}")
         except Exception as e:
             print(f"[MEMPROBE] error: {e}")
-        await asyncio.sleep(120)
-        elapsed += 120
+        interval = FAST_INTERVAL if elapsed < FAST_WINDOW else SLOW_INTERVAL
+        await asyncio.sleep(interval)
+        elapsed += interval
 
 
 if os.getenv("RL_ORIGIN_PROBE"):
@@ -381,7 +392,7 @@ async def on_ready():
     if os.getenv("MEM_PROBE") and not getattr(bot, "_memprobe_started", False):
         bot._memprobe_started = True
         bot.loop.create_task(_mem_probe(bot))
-        print("[MEMPROBE] enabled (logging every 120s).")
+        print("[MEMPROBE] enabled (logging every 10s for the first 3 min, then every 120s).")
 
 
 @bot.tree.error

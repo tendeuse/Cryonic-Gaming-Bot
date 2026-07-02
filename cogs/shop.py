@@ -100,9 +100,16 @@ ALLOWED_ROLES = {"Shop Steward", "ARC Security Administration Council"}
 SHOP_LOCK = asyncio.Lock()
 
 # OPT-1: replaces the old 2.5 s-per-edit serial lock.
-#         10 concurrent Discord API calls is well within Discord's global limit
-#         (50 req/s); discord.py handles any 429s automatically.
-_EDIT_SEMAPHORE = asyncio.Semaphore(10)
+# Kept low (not the global 50 req/s cap) because message edit/fetch is limited
+# per-channel-route, not globally — a fresh boot with an empty message cache
+# fires a fetch_message() PLUS an edit() for every shop/access item at once
+# (sync_shop_messages gathers every item concurrently). At 10 concurrent that
+# burst sustained a 429 retry storm for the entire life of the process instead
+# of settling in seconds, which starved the event loop (observed gateway
+# "can't keep up" warnings) right before a restart. Fetches now share this
+# same gate (see _get_cached_message) so the true concurrent-request count is
+# bounded, not just edits.
+_EDIT_SEMAPHORE = asyncio.Semaphore(3)
 
 
 # ----------------------------
@@ -908,10 +915,16 @@ class ShopCog(commands.Cog):
     # OPT-2: Cache helpers
     # ----------------------------
     async def _get_cached_message(self, channel: discord.TextChannel, msg_id: int) -> discord.Message:
-        """Return a cached Message, fetching from Discord only on a cache miss."""
+        """Return a cached Message, fetching from Discord only on a cache miss.
+
+        Gated by _EDIT_SEMAPHORE (shared with edits/sends) so a cold boot —
+        where every item is a cache miss — can't fire dozens of concurrent
+        fetch_message() calls on top of the edit burst.
+        """
         if msg_id in self._msg_cache:
             return self._msg_cache[msg_id]
-        msg = await channel.fetch_message(msg_id)
+        async with _EDIT_SEMAPHORE:
+            msg = await channel.fetch_message(msg_id)
         self._msg_cache[msg_id] = msg
         return msg
 
